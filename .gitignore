@@ -3,3 +3,11 @@ models/
 tools/
 __pycache__/
 *.wav
+.env
+tmp/
+data/
+logs/
+*.db
+*.webm
+*.part
+.pytest_cache/

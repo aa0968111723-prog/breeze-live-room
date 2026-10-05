@@ -1,12 +1,53 @@
 # breeze-live-room
 
-桌面軟體：本機 Breeze ASR 25 聽中文，穩定句再英譯，手機平板掃 QR 看英文字幕。
+桌面軟體：本機 Breeze ASR 25 聽中文，穩定句再英譯，手機平板掃 QR 看字幕。
 
 專案：https://github.com/aa0968111723-prog/breeze-live-room
 
-這不是 Qwen 那種 2.3 秒同傳。聽寫留在這台電腦，英譯才會出去（若有設 OpenAI 金鑰）。
+這不是 Qwen 那種 2.3 秒同傳。聽寫留在這台電腦，英譯才會出去（若有設 OpenAI 金鑰）。沒有金鑰就只出中文，不會改走雲端辨識。
 
-## 這台暫時機能不能跑
+## 版本狀態
+
+- 分支：`fix/round2-continue`
+- 程式提交：`cb21186d35a50690b7f012f35b4423b88b7ff6d4`
+- 已快轉推上 `fix/field-ready-core`。程式本體在 `cb21186`。`97d0c77` 的 GitHub Actions（run `37261737041`）是 `34 passed in 7.05s` 與 `recorder machine ok`。`tests/room_client.test.mjs` 不在工作流程裡，CI 沒跑它。
+- 本文件寫於 2026-10-05。這台是 Linux 查核機，直譯器是倉庫 venv 的 CPython 3.11.17（`/root/breeze-live-room/.venv`），不是 Ryzen 5 5600H / 16GB / Windows 11 主持機。這裡沒有麥克風、Breeze 權重、whisper-cli、`whisper-cli.exe`、OpenAI 金鑰。
+
+## 已修
+
+以提交 `cb21186` 的程式為準。尚未合併，也不能當成 GitHub Actions 已通過：
+
+- 主持權杖只發給 loopback，而且 Host／Origin 要對上允許的 scheme、host 與確切埠。權杖不進 QR、聽眾網址、`/api/setup`。
+- `/api/push` 在解析表單前先做准入。同一段 single-flight。中文先廣播，英譯失敗只更新同一段。
+- RoomBus 依 `room_id` 分開。缺段會標 `missing` 或對聽眾回 gap。匿名 WebSocket 不開房。
+- `ResidentAsr` 的 ready 旗標不是推論。`.env` 不覆蓋已存在的行程環境。`start.bat` 與 `app.run` 共用 `BREEZE_PORT`。
+
+## 仍未完成
+
+- 工作樹沒提交，CI 還看不到這輪差分。
+- 模型 SHA256 沒有在這裡計算，所以沒有釘選。
+- 預設仍是每次重開 whisper-cli。常駐模型「只載入一次」沒有實機證據。
+- 不是單一 exe／MSI。捷徑腳本沒在這裡執行。Windows DLL、防火牆、埠佔用、含中文或空白的路徑都沒驗證。
+- 標點只對以「嗎／呢」結尾且尚無句末符號的句子補問號，不是完整標點還原。
+- 預設字幕在記憶體。SQLite 要另設 `BREEZE_DATA_PATH`，沒有完整 migration，不存音檔。仍是單一 Uvicorn process。
+- 不能把 6–15 秒、RTF、p50／p95、RAM、CPU 或「模型已在實機只載入一次」寫成量測結果。這裡沒有這些數字。
+
+## 自動測試已通過
+
+2026-10-05，Linux，倉庫 venv 的 CPython 3.11.17（`/root/breeze-live-room/.venv`），Node v26.3.1。工作樹、不是 GitHub Actions 結果。沒有下載模型，沒有付費金鑰。
+
+- rebase 後的權威結果：`cd /root/breeze-live-room && .venv/bin/python -m pytest -q --tb=line` 印出 `34 passed in 14.78s`（exit 0）。
+- 同一批測試較早也通過：`34 passed in 11.49s`（rebase 前）、`32 passed`、`31 passed in 10.88s`、`31 passed in 10.24s`、`31 passed in 9.74s`。
+- socket `__aexit__` 與顯示順序（display-order）測試修正之前的乾淨複製是 `25 passed, 6 failed`，不能當成目前結果。
+- `node tests/recorder_machine.test.mjs` 印出 `recorder machine ok`；`node tests/room_client.test.mjs` 印出 `room client ok`。
+
+CI 工作流程指定 Node 22，這台沒有用 Node 22 重跑。GitHub Actions 還沒在這個工作樹上跑。Copilot review 成功不等於測試通過。
+
+## 實機驗證沒有通過
+
+30 分鐘講話、2 小時連續跑、3 台手機，以及 Ryzen 5 5600H / 16GB / Windows 11 主持機上的檢查都沒有通過。具體阻塞：這台環境跑不了該測試。不要編 RTF 或延遲。阻塞清單在 `docs/TEST-REPORT.md`。
+
+## 主持機紀錄（不是這次量測）
 
 2026-10-05 看過的主持機（DESKTOP-P8RGA3A，暫時用）：
 
@@ -16,52 +57,16 @@
 - 碟 477GB，當時已用 255GB
 - Windows 11 Pro 25H2
 
-結論：能跑 q5，不能走 CUDA。字幕大概晚 6–15 秒。換電腦也用同一套；有 6–8GB NVIDIA 或 M 系列 16GB 會更跟得上。
+結論：規格上能跑 q5，不能走 CUDA。延遲沒有在這台查核機上量過。這段只是看過的規格，不是實機驗證通過。
 
 ## 安裝
 
-1. 安裝 Python 3.11，勾選 Add to PATH。
-2. 克隆此專案。
-3. 雙擊 `install.bat`。它會建虛擬環境、裝套件、下載約 1.1GB 的 q5 模型，並在桌面建「禪譯聽眾房」捷徑。
-4. 從 https://github.com/ggml-org/whisper.cpp/releases 下載 Windows 的 `whisper-cli.exe`，放到 `tools\whisper-cli.exe`。
-5. 安裝 ffmpeg，或把 `ffmpeg.exe` 放進 `tools\`。瀏覽器送出的是 webm，要先轉 16 kHz 單聲道 wav。
-6. 英譯：設定環境變數 `OPENAI_API_KEY`。沒設也能開房，聽眾只看中文。
-7. 雙擊桌面捷徑或 `start.bat`。瀏覽器開 http://127.0.0.1:8780 ，按開始聽。
-8. 手機平板連同一個 Wi-Fi，掃 QR。第一次請允許 Windows 防火牆放行 8780。
-
-QR 使用區網 IP，不是 localhost。沒有區網時聽眾連不上。
-
-## 模型
-
-- 名稱：MediaTek Research Breeze ASR 25
-- 來源：https://huggingface.co/MediaTek-Research/Breeze-ASR-25
-- 架構：Whisper-large-v2 微調，約 15.5 億參數，Apache 2.0
-- 擅長：台灣國語、中英夾雜。只聽寫，不翻譯。
-- 本專案下載：https://huggingface.co/shdennlin/breeze-asr-25-ggml 的 `ggml-breeze-asr-25-q5_0.bin`（約 1.1GB）
-- q8 約 1.7GB，品質更接近 fp16；這顆 CPU 建議先 q5。
-- 權重不進 Git，不進 Cloudflare / Zeabur 映像。
-
-熱詞：Breeze 沒有 Qwen 那種鎖定。程式把前面這段放進 `initial_prompt`：
-
-`以下是普通話的句子，請用繁體中文輸出。常見專有名詞：般若、菩提心、空性、因緣。`
-
-這是偏置，不保證鎖詞。譯文用詞要放翻譯層。
-
-## 聽眾房
-
-- 主持頁：`/`
-- 聽眾頁：`/r/{id}`，預設 `/r/class`
-- 聽眾 WebSocket：`/ws/listen?room_id=`
-- QR：`/api/qr?room_id=`，網址是區網 IP + 埠 8780
-- 只推已辨識完的句子。斷線重連會補最近歷史。
-- 免安裝、免帳號。手機平板用瀏覽器開。
+步驟、埠與模型網址見 `docs/INSTALL.md`。權重不進 Git。沒有可分享的區網位址時不發 QR，也不改成 localhost。
 
 ## 現在沒做到的
 
-- 不是單一 exe / MSI，是 `install.bat` 加桌面捷徑。
-- 沒有 Qwen realtime 一條長連線。
-- 沒有設定頁切換聽寫引擎。
-- 房間在記憶體，重開就沒了。
-- 標點要後處理，Breeze 訓練時拿掉了標點。
+- 不是單一 exe／MSI，是 `install.bat` 加尚未在此執行的桌面捷徑腳本。
+- 沒有 Qwen realtime 一條長連線，也沒有設定頁切換聽寫引擎。
+- 熱詞只是 `initial_prompt` 偏置，不保證鎖詞。譯文用詞放翻譯層。
 
 完整說明見 `docs/SPEC.md`。
