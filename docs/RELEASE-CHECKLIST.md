@@ -2,9 +2,11 @@
 
 這是可安裝驗收的候選版。以下未有真實結果的項目不可標成通過。
 
+完整匯出程式提交 `d5297f9` 的 [Actions](https://github.com/aa0968111723-prog/breeze-live-room/actions/runs/37328332363) 全部通過。CI 驗證與實際主持機驗收分別記錄如下。
+
 | 門檻 | 通過條件 | 本輪狀態 |
 | --- | --- | --- |
-| 回歸測試 | Python、錄音、觀眾端測試通過 | 本機 47 項及兩組 Node 通過；四組矩陣見 Actions |
+| 回歸測試 | Python、錄音、觀眾端測試通過 | 本機及 Windows／Linux × Python 3.11／3.12 的 47 項與兩組 Node 通過 |
 | 模型真實推論 | 固定權重、兩次非空辨識、常駐程序重用並關閉 | Linux 與 Windows CI 英文樣本通過 |
 | 主持機容量 | 真實中文樣本 RTF < 1，完整收音／辨識不持續積壓 | 待 Windows 主持機量測 |
 | Windows 安裝 | 固定下載校驗、DLL、中文及空白路徑可用 | Windows Server 2025 CI 通過；主持機待驗 |

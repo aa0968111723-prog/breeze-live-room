@@ -1,6 +1,6 @@
 # Windows 安裝與操作
 
-這個候選版基於 `fix/field-ready-core@1f4732e`。請從 [候選版分支](https://github.com/aa0968111723-prog/breeze-live-room/tree/codex/windows-readiness-20261005) 選 Code → Download ZIP，再解壓縮。修正在 [PR #2](https://github.com/aa0968111723-prog/breeze-live-room/pull/2)，尚未合併到 main。
+這個候選版包含完整安裝、辨識自檢及長場次匯出修正。請從 [候選版分支](https://github.com/aa0968111723-prog/breeze-live-room/tree/codex/windows-readiness-20261005) 選 Code → Download ZIP，再解壓縮。修正在 [PR #3](https://github.com/aa0968111723-prog/breeze-live-room/pull/3)，目標為 main，目前仍是驗收候選版。
 
 ## 先準備兩個基礎元件
 
