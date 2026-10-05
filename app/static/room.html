@@ -4,18 +4,27 @@
 <title>聽眾字幕</title>
 <style>
 body{margin:0;background:#111;color:#fff;font-family:sans-serif}
-.en{font-size:32px;padding:24px;line-height:1.4}
-.zh{font-size:18px;color:#bbb;padding:0 24px 24px}
+.en{font-size:34px;padding:24px 20px 8px;line-height:1.35}
+.zh{font-size:18px;color:#c8c8c8;padding:0 20px 28px}
+small{display:block;color:#888;padding:12px 20px}
 </style>
-<div class="en" id="en">等待主持端…</div>
+<small id="state">連線中…</small>
+<div class="en" id="en">等待主持端</div>
 <div class="zh" id="zh"></div>
 <script>
-const room=location.pathname.split('/').pop();
-const ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws/listen?room_id='+room);
-function show(item){ document.querySelector('#en').textContent=item.en||item.zh; document.querySelector('#zh').textContent=item.zh||''; }
+const room=location.pathname.split('/').filter(Boolean).pop();
+const proto=location.protocol==='https:'?'wss':'ws';
+const ws=new WebSocket(proto+'://'+location.host+'/ws/listen?room_id='+encodeURIComponent(room));
+function show(item){
+  document.querySelector('#en').textContent=item.en||item.zh||'';
+  document.querySelector('#zh').textContent=item.en?item.zh:'';
+}
+ws.onopen=()=>{ document.querySelector('#state').textContent='已連上 '+room; };
+ws.onclose=()=>{ document.querySelector('#state').textContent='斷線，請重新整理頁面'; };
 ws.onmessage=ev=>{
   const data=JSON.parse(ev.data);
   if(data.history?.length) show(data.history.at(-1));
   if(data.type==='final') show(data);
 };
+setInterval(()=>{ if(ws.readyState===1) ws.send('ping'); }, 15000);
 </script>
