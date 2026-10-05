@@ -1,4 +1,6 @@
 <!doctype html>
+<html lang="zh-Hant">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>聽眾字幕</title>
@@ -6,25 +8,36 @@
 body{margin:0;background:#111;color:#fff;font-family:sans-serif}
 .en{font-size:34px;padding:24px 20px 8px;line-height:1.35}
 .zh{font-size:18px;color:#c8c8c8;padding:0 20px 28px}
-small{display:block;color:#888;padding:12px 20px}
+small{display:block;color:#aaa;padding:12px 20px}
+button{margin:0 20px 20px;font-size:16px;padding:8px 12px}
 </style>
+</head>
+<body>
 <small id="state">連線中…</small>
 <div class="en" id="en">等待主持端</div>
 <div class="zh" id="zh"></div>
-<script>
-const room=location.pathname.split('/').filter(Boolean).pop();
-const proto=location.protocol==='https:'?'wss':'ws';
-const ws=new WebSocket(proto+'://'+location.host+'/ws/listen?room_id='+encodeURIComponent(room));
-function show(item){
-  document.querySelector('#en').textContent=item.en||item.zh||'';
-  document.querySelector('#zh').textContent=item.en?item.zh:'';
+<button id="retry" type="button">重新連線</button>
+<script type="module">
+import { connectRoom } from "/static/room_client.js";
+const room = location.pathname.split("/").filter(Boolean).pop();
+const items = new Map();
+function show(item) {
+  if (!item || item.seq == null) return;
+  items.set(item.id, item);
+  const latest = [...items.values()].sort((a, b) => a.seq - b.seq).at(-1);
+  document.querySelector("#en").textContent = latest.en || latest.zh || "";
+  document.querySelector("#zh").textContent = latest.en ? latest.zh : "";
 }
-ws.onopen=()=>{ document.querySelector('#state').textContent='已連上 '+room; };
-ws.onclose=()=>{ document.querySelector('#state').textContent='斷線，請重新整理頁面'; };
-ws.onmessage=ev=>{
-  const data=JSON.parse(ev.data);
-  if(data.history?.length) show(data.history.at(-1));
-  if(data.type==='final') show(data);
-};
-setInterval(()=>{ if(ws.readyState===1) ws.send('ping'); }, 15000);
+connectRoom({
+  room,
+  url: () => {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    return proto + "://" + location.host + "/ws/listen?room_id=" + encodeURIComponent(room);
+  },
+  onState: (text) => { document.querySelector("#state").textContent = text; },
+  onEvent: show,
+});
+document.querySelector("#retry").onclick = () => location.reload();
 </script>
+</body>
+</html>

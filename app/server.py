@@ -1,172 +1,222 @@
 from __future__ import annotations
 
-import asyncio
 import os
-import shutil
-import socket
-import subprocess
-import time
-import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+
+from app.asr import CliAsr
+from app.audio import AudioError, convert_to_wav, ffmpeg_bin, read_limited, wav_duration_seconds
+from app.auth import new_host_token, require_host, require_local_host
+from app.pipeline import Pipeline, Segment
+from app.rooms import RoomIdError, validate_room_id
+from app.settings import Settings
+from app.share import listen_url
+from app.translate import Translator
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = Path(__file__).resolve().parent / "static"
 MODEL = ROOT / "models" / "ggml-breeze-asr-25-q5_0.bin"
 WHISPER = ROOT / "tools" / "whisper-cli.exe"
 TMP = ROOT / "tmp"
-TMP.mkdir(exist_ok=True)
-PROMPT = "以下是普通話的句子，請用繁體中文輸出。常見專有名詞：般若、菩提心、空性、因緣。"
+PROMPT = "以下是普通話的句子，請用繁體中文輸出。常見專有名詞：般若、菩提心、空性、因緣。這是提示偏置，不保證鎖詞。"
 
-app = FastAPI(title="breeze-live-room")
-app.mount("/static", StaticFiles(directory=STATIC), name="static")
-rooms: dict[str, dict] = {}
 
-def lan_ip() -> str:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.connect(("8.8.8.8", 80))
-        return sock.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        sock.close()
+def _upsert(history: list, event: dict) -> None:
+    for index, item in enumerate(history):
+        if item.get("id") == event.get("id"):
+            history[index] = event
+            return
+    history.append(event)
 
-def room(room_id: str) -> dict:
-    room_id = (room_id or "class")[:32]
-    if room_id not in rooms:
-        rooms[room_id] = {"listeners": set(), "history": []}
-    return rooms[room_id]
 
-async def broadcast(state: dict, payload: dict) -> None:
+def create_app(settings: Settings | None = None, asr=None, translator: Translator | None = None, decoder=None) -> FastAPI:
+    settings = settings or Settings.from_env()
+    token = new_host_token()
+    translator = translator or Translator(
+        enabled=settings.translate,
+        key=os.getenv("OPENAI_API_KEY", ""),
+    )
+    asr = asr or CliAsr(WHISPER, MODEL)
+    pipeline = Pipeline(asr, translator, PROMPT, TMP)
+    rooms: dict[str, dict] = {}
+
+    app = FastAPI(title="breeze-live-room")
+    app.mount("/static", StaticFiles(directory=STATIC), name="static")
+    app.state.settings = settings
+    app.state.token = token
+    app.state.pipeline = pipeline
+    app.state.rooms = rooms
+    app.state.translator = translator
+    app.state.asr = asr
+
+    def state_for(room_id: str) -> dict:
+        if room_id not in rooms:
+            if len(rooms) >= settings.max_rooms:
+                raise HTTPException(status_code=429, detail="房間數已達上限")
+            rooms[room_id] = {"listeners": set(), "history": []}
+        return rooms[room_id]
+
+    def decode(src: Path, work: Path) -> Path:
+        if decoder:
+            return decoder(src, work)
+        ffmpeg = ffmpeg_bin(ROOT)
+        if not ffmpeg:
+            raise AudioError(422, "找不到 ffmpeg。請安裝 ffmpeg，或把 ffmpeg.exe 放進 tools\\")
+        wav = convert_to_wav(src, work, ffmpeg)
+        seconds = wav_duration_seconds(wav)
+        if seconds is not None and seconds > settings.max_audio_seconds:
+            raise AudioError(413, f"音訊長於 {settings.max_audio_seconds} 秒，已拒絕")
+        return wav
+
+    @app.get("/")
+    async def host_page() -> FileResponse:
+        return FileResponse(STATIC / "host.html")
+
+    @app.get("/r/{room_id}")
+    async def room_page(room_id: str) -> FileResponse:
+        try:
+            validate_room_id(room_id)
+        except RoomIdError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return FileResponse(STATIC / "room.html")
+
+    @app.get("/api/host-token")
+    async def host_token(request: Request) -> dict:
+        require_local_host(request, settings.allow_testclient)
+        return {"token": token}
+
+    @app.get("/api/setup")
+    async def setup(room_id: str = "class") -> dict:
+        try:
+            room_id = validate_room_id(room_id)
+        except RoomIdError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        url = listen_url(room_id, settings.port, settings.share_scheme)
+        key_set = bool(os.getenv("OPENAI_API_KEY"))
+        return {
+            "room": room_id,
+            "listen_url": url,
+            "share_ready": url is not None,
+            "share_message": None if url else "尚無可供其他裝置使用的連結",
+            "whisper": WHISPER.exists(),
+            "model": MODEL.exists(),
+            "ffmpeg": ffmpeg_bin(ROOT) is not None,
+            "translate_configured": key_set and settings.translate,
+            "translate_verified": False,
+            "translate_label": translator.status_label(),
+            "asr_mode": "cli",
+            "model_reloads_each_segment": True,
+            "host_token": None,
+        }
+
+    @app.get("/api/qr")
+    async def qr(room_id: str = "class") -> Response:
+        try:
+            room_id = validate_room_id(room_id)
+        except RoomIdError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        url = listen_url(room_id, settings.port, settings.share_scheme)
+        if not url:
+            return JSONResponse(status_code=409, content={"ok": False, "detail": "尚無可供其他裝置使用的連結"})
+        import io
+        import qrcode
+        img = qrcode.make(url)
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        return Response(buf.getvalue(), media_type="image/png")
+
+    @app.post("/api/push")
+    async def push(
+        request: Request,
+        room_id: str = Form(...),
+        session_id: str = Form(...),
+        seq: int = Form(...),
+        audio: UploadFile = File(...),
+    ) -> dict:
+        require_host(request, token)
+        try:
+            room_id = validate_room_id(room_id)
+        except RoomIdError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if seq < 1 or seq > 100000:
+            raise HTTPException(status_code=400, detail="段落序號不正確")
+        if not session_id or len(session_id) > 64:
+            raise HTTPException(status_code=400, detail="會話代號不正確")
+        blocks = []
+        while True:
+            block = await audio.read(64 * 1024)
+            if not block:
+                break
+            blocks.append(block)
+            if sum(len(b) for b in blocks) > settings.max_audio_bytes:
+                raise HTTPException(status_code=413, detail=f"音訊超過 {settings.max_audio_bytes} bytes，已拒絕")
+        try:
+            raw = read_limited(blocks, settings.max_audio_bytes)
+        except AudioError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+        state = state_for(room_id)
+        if len(pipeline.results) >= settings.max_queue and pipeline.get(room_id, session_id, seq) is None:
+            waiting = sum(1 for item in pipeline.results.values() if item.status == "queued")
+            if waiting >= settings.max_queue:
+                raise HTTPException(status_code=429, detail="辨識佇列已滿，請稍後再送")
+        segment = Segment(room_id=room_id, session_id=session_id, seq=seq)
+        before = len(pipeline.broadcasts)
+        try:
+            done = await pipeline.submit(segment, raw, decode)
+        except AudioError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+        for event in pipeline.broadcasts[before:]:
+            _upsert(state["history"], event)
+            await _broadcast(state, event)
+        state["history"] = state["history"][-settings.history_limit :]
+        return {"ok": done.status != "error", **done.public()}
+
+    @app.websocket("/ws/listen")
+    async def listen(ws: WebSocket, room_id: str = "class") -> None:
+        try:
+            room_id = validate_room_id(room_id)
+        except RoomIdError:
+            await ws.close(code=1008)
+            return
+        await ws.accept()
+        try:
+            state = state_for(room_id)
+        except HTTPException:
+            await ws.close(code=1013)
+            return
+        if len(state["listeners"]) >= settings.max_listeners:
+            await ws.close(code=1013)
+            return
+        state["listeners"].add(ws)
+        try:
+            await ws.send_json({"type": "hello", "history": state["history"][-40:]})
+        except Exception:
+            state["listeners"].discard(ws)
+            return
+        try:
+            while True:
+                await ws.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            state["listeners"].discard(ws)
+
+    return app
+
+
+async def _broadcast(state: dict, payload: dict) -> None:
+    import asyncio
     dead = []
     for ws in list(state["listeners"]):
         try:
-            await ws.send_json(payload)
+            await asyncio.wait_for(ws.send_json(payload), timeout=2)
         except Exception:
             dead.append(ws)
     for ws in dead:
         state["listeners"].discard(ws)
 
-def ffmpeg_bin() -> str | None:
-    local = ROOT / "tools" / "ffmpeg.exe"
-    if local.exists():
-        return str(local)
-    return shutil.which("ffmpeg")
 
-def to_wav(src: Path) -> Path:
-    ffmpeg = ffmpeg_bin()
-    if not ffmpeg:
-        raise RuntimeError("找不到 ffmpeg。請安裝 ffmpeg，或把 ffmpeg.exe 放進 tools\\")
-    wav = src.with_suffix(".wav")
-    proc = subprocess.run(
-        [ffmpeg, "-y", "-i", str(src), "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(wav)],
-        capture_output=True, text=True, timeout=40,
-    )
-    if proc.returncode != 0 or not wav.exists():
-        raise RuntimeError(proc.stderr[-400:] or "ffmpeg 轉檔失敗")
-    return wav
-
-def transcribe(wav: Path) -> str:
-    if not WHISPER.exists():
-        raise RuntimeError("找不到 tools\\whisper-cli.exe")
-    if not MODEL.exists():
-        raise RuntimeError("找不到 models\\ggml-breeze-asr-25-q5_0.bin，請先跑 install.bat")
-    proc = subprocess.run(
-        [str(WHISPER), "-m", str(MODEL), "-f", str(wav), "-l", "zh", "-np", "-nt", "-t", "6", "--prompt", PROMPT],
-        capture_output=True, text=True, timeout=120,
-    )
-    text = " ".join(line.strip() for line in proc.stdout.splitlines() if line.strip())
-    if proc.returncode != 0 and not text:
-        raise RuntimeError(proc.stderr[-400:] or "Breeze 辨識失敗")
-    return text
-
-def translate(zh: str) -> str:
-    key = os.getenv("OPENAI_API_KEY", "")
-    if not key or not zh:
-        return ""
-    import json
-    import urllib.request
-    body = json.dumps({
-        "model": os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-4.1-mini"),
-        "messages": [
-            {"role": "system", "content": "Translate the Traditional Chinese lecture line into natural English. Translate questions, do not answer them. Keep Buddhist terms stable."},
-            {"role": "user", "content": zh},
-        ],
-    }).encode()
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=body,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=40) as resp:
-        data = json.loads(resp.read().decode())
-    return data["choices"][0]["message"]["content"].strip()
-
-@app.get("/")
-async def host_page() -> FileResponse:
-    return FileResponse(STATIC / "host.html")
-
-@app.get("/r/{room_id}")
-async def room_page(room_id: str) -> FileResponse:
-    return FileResponse(STATIC / "room.html")
-
-@app.get("/api/setup")
-async def setup(room_id: str = "class") -> dict:
-    return {
-        "room": room_id,
-        "listen_url": f"http://{lan_ip()}:8780/r/{room_id}",
-        "whisper": WHISPER.exists(),
-        "model": MODEL.exists(),
-        "ffmpeg": ffmpeg_bin() is not None,
-        "translate": bool(os.getenv("OPENAI_API_KEY")),
-    }
-
-@app.get("/api/qr")
-async def qr(room_id: str = "class") -> Response:
-    import io
-    import qrcode
-    img = qrcode.make(f"http://{lan_ip()}:8780/r/{room_id}")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return Response(buf.getvalue(), media_type="image/png")
-
-@app.post("/api/push")
-async def push(room_id: str = Form("class"), audio: UploadFile = File(...)) -> dict:
-    state = room(room_id)
-    stem = TMP / uuid.uuid4().hex
-    src = stem.with_suffix(".webm")
-    wav = None
-    try:
-        src.write_bytes(await audio.read())
-        wav = await asyncio.to_thread(to_wav, src)
-        zh = await asyncio.to_thread(transcribe, wav)
-        if not zh:
-            return {"ok": False, "detail": "這段沒聽到話"}
-        en = await asyncio.to_thread(translate, zh)
-        event = {"type": "final", "id": uuid.uuid4().hex[:10], "zh": zh, "en": en, "t": int(time.time() * 1000)}
-        state["history"].append(event)
-        state["history"] = state["history"][-80:]
-        await broadcast(state, event)
-        return {"ok": True, **event}
-    except Exception as exc:
-        return {"ok": False, "detail": str(exc)}
-    finally:
-        src.unlink(missing_ok=True)
-        if wav:
-            wav.unlink(missing_ok=True)
-
-@app.websocket("/ws/listen")
-async def listen(ws: WebSocket, room_id: str = "class") -> None:
-    await ws.accept()
-    state = room(room_id)
-    state["listeners"].add(ws)
-    await ws.send_json({"type": "hello", "history": state["history"][-40:]})
-    try:
-        while True:
-            await ws.receive_text()
-    except WebSocketDisconnect:
-        state["listeners"].discard(ws)
+app = create_app()

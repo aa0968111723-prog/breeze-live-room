@@ -22,7 +22,7 @@
 - 基底：Whisper-large-v2，約 15.5 億參數
 - 授權：Apache 2.0
 - 擅長：台灣國語、台灣口音、中英夾雜
-- 沒有 Qwen 那種熱詞鎖定。只能把前 30 個詞放進 initial_prompt
+- 沒有 Qwen 那種熱詞鎖定。initial_prompt 只是偏置，這次沒有查到可據以宣稱的固定 30 詞上限。
 - 標點在訓練時多半被拿掉，字幕標點要後處理
 - 本專案用 whisper.cpp GGML q5，檔案約 1.1GB：https://huggingface.co/shdennlin/breeze-asr-25-ggml
 - q8 約 1.7GB，品質更接近完整版；這台 16GB 建議先用 q5
@@ -47,7 +47,7 @@
 ## 這個軟體不做什麼
 
 - 不是 Qwen3.8-LiveTranslate 那種平均 2.3 秒同傳。
-- 這台 CPU 字幕大概晚 6–15 秒，句子長或電腦忙時更慢。
+- 這台 CPU 的延遲沒有在本次查核量測。不要把 6–15 秒當成實測結果。
 - 不克隆聲音，不播合成語音，避免回授。
 - 沒有把權重打進安裝檔。模型第一次由 install.bat 下載。
 - 不是已封裝的單一 exe。現在是桌面捷徑加本機伺服器。

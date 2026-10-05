@@ -1,59 +1,121 @@
 <!doctype html>
+<html lang="zh-Hant">
+<head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>禪譯聽眾房</title>
 <style>
-body{font-family:sans-serif;margin:24px;background:#f6f1e7;color:#2b241c}
-button{font-size:18px;padding:10px 16px;margin-right:8px}
-#log{white-space:pre-wrap;background:#fff;padding:12px;min-height:220px}
+body{margin:0;font-family:"Segoe UI",sans-serif;background:#f6f1e7;color:#2b241c}
+main{max-width:760px;margin:0 auto;padding:24px}
+h1{font-size:28px;margin:0 0 8px}
+button,input,select{font-size:18px}
+button{padding:12px 18px;margin:8px 8px 0 0;border:0;border-radius:10px;background:#8a5a2b;color:#fff}
+button:disabled{opacity:.45}
+.card{background:#fff;border-radius:16px;padding:16px;margin-top:16px;box-shadow:0 8px 24px rgba(70,42,16,.08)}
 .warn{color:#8a3b12}
+#log{white-space:pre-wrap;min-height:160px}
 </style>
+</head>
+<body>
+<main>
 <h1>禪譯聽眾房</h1>
-<p>電腦聽中文，手機平板掃 QR 看英文。</p>
-<label>房間 <input id="room" value="class"></label>
+<p>這台電腦聽中文。手機和平板掃 QR 看字幕。</p>
+<div class="card">
+<label>房間 <input id="room" value="class" autocomplete="off"></label>
+<div>
 <button id="go">開始聽</button>
 <button id="stop" disabled>停止</button>
+</div>
 <p id="status"></p>
-<img id="qr" alt="QR" width="220">
+<img id="qr" alt="聽眾 QR" width="220">
 <p id="url"></p>
-<div id="log"></div>
-<script>
-const roomEl=document.querySelector('#room'), log=document.querySelector('#log'), status=document.querySelector('#status');
-let rec, timer, stream;
-function line(text){ log.textContent=text+'\n'+log.textContent; }
-async function setup(){
-  const data=await fetch('/api/setup?room_id='+encodeURIComponent(roomEl.value)).then(r=>r.json());
-  document.querySelector('#qr').src='/api/qr?room_id='+encodeURIComponent(roomEl.value)+'&t='+Date.now();
-  document.querySelector('#url').textContent=data.listen_url;
-  const missing=[];
-  if(!data.whisper) missing.push('whisper-cli.exe');
-  if(!data.model) missing.push('模型');
-  if(!data.ffmpeg) missing.push('ffmpeg');
-  status.className=missing.length?'warn':'';
-  status.textContent=missing.length?('還缺：'+missing.join('、')):(data.translate?'可以開聽，英譯已開':'可以開聽，尚未設 OPENAI_API_KEY，聽眾只會看到中文');
+</div>
+<div class="card" id="log"></div>
+</main>
+<script type="module">
+import { createCaptureController } from "/static/recorder_machine.js";
+const roomEl = document.querySelector("#room");
+const log = document.querySelector("#log");
+const status = document.querySelector("#status");
+const go = document.querySelector("#go");
+const stop = document.querySelector("#stop");
+let token = "";
+function line(text) { log.textContent = text + "\n" + log.textContent; }
+function micError(err) {
+  const name = err && err.name;
+  if (name === "NotAllowedError") return "瀏覽器拒絕了麥克風。請允許後再按開始。";
+  if (name === "NotFoundError") return "找不到麥克風。";
+  if (name === "NotReadableError") return "麥克風被別的程式占用，或剛剛被拔掉。";
+  return "無法開始聽：" + (err && err.message ? err.message : "未知錯誤");
 }
-roomEl.onchange=setup; setup();
-document.querySelector('#go').onclick=async()=>{
-  stream=await navigator.mediaDevices.getUserMedia({audio:true});
-  const mime=MediaRecorder.isTypeSupported('audio/webm;codecs=opus')?'audio/webm;codecs=opus':'audio/webm';
-  rec=new MediaRecorder(stream,{mimeType:mime});
-  rec.ondataavailable=async ev=>{
-    if(!ev.data || ev.data.size<800) return;
-    const body=new FormData();
-    body.append('room_id', roomEl.value||'class');
-    body.append('audio', ev.data, 'chunk.webm');
-    const data=await fetch('/api/push',{method:'POST',body}).then(r=>r.json());
-    if(!data.ok){ line('失敗：'+(data.detail||'辨識失敗')); return; }
-    line((data.en||'(尚無英譯)')+'\n'+data.zh);
-  };
-  rec.start();
-  timer=setInterval(()=>{ if(rec && rec.state==='recording'){ rec.requestData(); rec.stop(); rec.start(); } }, 6000);
-  document.querySelector('#stop').disabled=false;
-  line('開始聽了。每 6 秒送一段。');
+async function setup() {
+  const data = await fetch("/api/setup?room_id=" + encodeURIComponent(roomEl.value)).then(r => r.json());
+  const qr = document.querySelector("#qr");
+  if (!data.share_ready) {
+    qr.removeAttribute("src");
+    document.querySelector("#url").textContent = data.share_message || "尚無可供其他裝置使用的連結";
+  } else {
+    qr.src = "/api/qr?room_id=" + encodeURIComponent(roomEl.value) + "&t=" + Date.now();
+    document.querySelector("#url").textContent = data.listen_url;
+  }
+  const missing = [];
+  if (!data.whisper) missing.push("whisper-cli.exe");
+  if (!data.model) missing.push("Breeze 模型");
+  if (!data.ffmpeg) missing.push("ffmpeg");
+  status.className = missing.length ? "warn" : "";
+  status.textContent = missing.length
+    ? ("還缺：" + missing.join("、") + "。不會改走雲端辨識。")
+    : (data.translate_label + "。模型模式：" + data.asr_mode);
+}
+const ctl = createCaptureController({
+  periodMs: 6000,
+  roomId: () => roomEl.value || "class",
+  newId: () => crypto.randomUUID().replace(/-/g, "").slice(0, 16),
+  openMic: () => navigator.mediaDevices.getUserMedia({ audio: true }),
+  createRecorder: (stream) => {
+    const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
+    return new MediaRecorder(stream, { mimeType: mime });
+  },
+  upload: async (meta, blob) => {
+    const body = new FormData();
+    body.append("room_id", meta.roomId);
+    body.append("session_id", meta.sessionId);
+    body.append("seq", String(meta.seq));
+    body.append("audio", blob, "segment.webm");
+    const resp = await fetch("/api/push", { method: "POST", body, headers: { authorization: "Bearer " + token } });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) { line("失敗：" + (data.detail || data.error || "辨識失敗")); return; }
+    line((data.en || "（尚無英譯）") + "\n" + data.zh);
+  },
+});
+go.onclick = async () => {
+  go.disabled = true;
+  try {
+    await ctl.start();
+    stop.disabled = false;
+    line("開始聽了。每一段都是完整錄音，不是切片。");
+  } catch (err) {
+    status.className = "warn";
+    status.textContent = micError(err);
+    go.disabled = false;
+  }
 };
-document.querySelector('#stop').onclick=()=>{
-  clearInterval(timer);
-  if(rec && rec.state!=='inactive') rec.stop();
-  stream?.getTracks().forEach(t=>t.stop());
-  document.querySelector('#stop').disabled=true;
+stop.onclick = async () => {
+  stop.disabled = true;
+  await ctl.stop();
+  go.disabled = false;
+  line("已停止，麥克風已放開。");
 };
+const tokenResp = await fetch("/api/host-token");
+if (!tokenResp.ok) {
+  status.className = "warn";
+  status.textContent = "請用這台電腦的瀏覽器開主持頁。聽眾頁不能開始聽。";
+  go.disabled = true;
+} else {
+  token = (await tokenResp.json()).token;
+}
+roomEl.onchange = setup;
+setup();
 </script>
+</body>
+</html>
