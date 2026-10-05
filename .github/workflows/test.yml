@@ -42,10 +42,8 @@ jobs:
           try {
             cmd /c install.bat
             if ($LASTEXITCODE -ne 0) { throw 'Windows install failed' }
-            $desktop = [Environment]::GetFolderPath('Desktop')
-            $shell = New-Object -ComObject WScript.Shell
-            $shortcut = $shell.CreateShortcut((Join-Path $desktop 'Breeze Live Room.lnk'))
-            if ($shortcut.TargetPath -ne (Join-Path $target 'start.bat')) { throw 'Desktop shortcut target is incorrect' }
+            powershell -NoProfile -ExecutionPolicy Bypass -File .\install-shortcut.ps1 -CheckOnly
+            if ($LASTEXITCODE -ne 0) { throw 'Desktop shortcut target is incorrect' }
             cmd /c doctor.bat
             if ($LASTEXITCODE -ne 0) { throw 'Preflight failed' }
             cmd /c verify.bat

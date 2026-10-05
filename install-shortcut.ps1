@@ -1,18 +1,72 @@
-﻿$ErrorActionPreference = 'Stop'
-# Derive the Unicode directory inside PowerShell, avoiding ANSI argv decoding.
+﻿param([switch]$CheckOnly)
+$ErrorActionPreference = 'Stop'
+# Use the Unicode Shell Link interface. WScript.Shell loses characters on an
+# English Windows installation when a target contains a Chinese directory.
+Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+
+[ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+class BreezeShellLink { }
+
+[ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IBreezeShellLinkW {
+    void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int size, IntPtr data, uint flags);
+    void GetIDList(out IntPtr list);
+    void SetIDList(IntPtr list);
+    void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder text, int size);
+    void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string text);
+    void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int size);
+    void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string path);
+    void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder text, int size);
+    void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string text);
+    void GetHotkey(out short hotkey);
+    void SetHotkey(short hotkey);
+    void GetShowCmd(out int command);
+    void SetShowCmd(int command);
+    void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int size, out int index);
+    void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string path, int index);
+    void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string path, uint reserved);
+    void Resolve(IntPtr window, uint flags);
+    void SetPath([MarshalAs(UnmanagedType.LPWStr)] string path);
+}
+
+public static class BreezeDesktopShortcut {
+    public static void Create(string target, string directory, string link) {
+        IBreezeShellLinkW shell = (IBreezeShellLinkW)new BreezeShellLink();
+        try {
+            shell.SetPath(target);
+            shell.SetWorkingDirectory(directory);
+            shell.SetDescription("Breeze Live Room");
+            shell.SetShowCmd(1);
+            ((IPersistFile)shell).Save(link, true);
+        } finally { Marshal.FinalReleaseComObject(shell); }
+    }
+    public static void Verify(string target, string directory, string link) {
+        IBreezeShellLinkW shell = (IBreezeShellLinkW)new BreezeShellLink();
+        try {
+            ((IPersistFile)shell).Load(link, 0);
+            StringBuilder savedTarget = new StringBuilder(32768);
+            StringBuilder savedDirectory = new StringBuilder(32768);
+            shell.GetPath(savedTarget, savedTarget.Capacity, IntPtr.Zero, 4);
+            shell.GetWorkingDirectory(savedDirectory, savedDirectory.Capacity);
+            if (!String.Equals(savedTarget.ToString(), target, StringComparison.OrdinalIgnoreCase) ||
+                !String.Equals(savedDirectory.ToString(), directory, StringComparison.OrdinalIgnoreCase)) {
+                throw new InvalidOperationException("The Unicode shortcut target or directory was not preserved.");
+            }
+        } finally { Marshal.FinalReleaseComObject(shell); }
+    }
+}
+'@
 $WorkingDirectory = $PSScriptRoot
-$desktop = [Environment]::GetFolderPath("Desktop")
+$desktop = [Environment]::GetFolderPath('Desktop')
 if (-not $desktop) { exit 1 }
 [System.IO.Directory]::CreateDirectory($desktop) | Out-Null
-$shortcutPath = Join-Path $desktop "Breeze Live Room.lnk"
-$shell = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut($shortcutPath)
-$shortcut.TargetPath = (Join-Path $WorkingDirectory "start.bat")
-$shortcut.WorkingDirectory = $WorkingDirectory
-$shortcut.WindowStyle = 1
-$shortcut.Description = "Breeze Live Room"
-$shortcut.Save()
-$saved = $shell.CreateShortcut($shortcutPath)
-if ($saved.TargetPath -ne (Join-Path $WorkingDirectory "start.bat")) {
-    throw 'The desktop shortcut target was not preserved.'
+$shortcutPath = Join-Path $desktop 'Breeze Live Room.lnk'
+$target = Join-Path $WorkingDirectory 'start.bat'
+if (-not $CheckOnly) {
+    [BreezeDesktopShortcut]::Create($target, $WorkingDirectory, $shortcutPath)
 }
+[BreezeDesktopShortcut]::Verify($target, $WorkingDirectory, $shortcutPath)
