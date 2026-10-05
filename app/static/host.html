@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>禪譯聽眾房</title>
+<style>
+body{font-family:sans-serif;margin:24px;background:#f6f1e7;color:#2b241c}
+button{font-size:18px;padding:10px 16px}
+#log{white-space:pre-wrap;background:#fff;padding:12px;min-height:180px}
+</style>
+<h1>禪譯聽眾房</h1>
+<p>電腦聽中文，手機掃 QR 看英文。</p>
+<label>房間 <input id="room" value="class"></label>
+<button id="go">開始聽</button>
+<button id="stop" disabled>停止</button>
+<p id="status"></p>
+<img id="qr" alt="QR">
+<p id="url"></p>
+<div id="log"></div>
+<script>
+const roomEl=document.querySelector('#room'), log=document.querySelector('#log');
+let rec, timer;
+async function setup(){
+  const data=await fetch('/api/setup?room_id='+encodeURIComponent(roomEl.value)).then(r=>r.json());
+  document.querySelector('#qr').src='/api/qr?room_id='+encodeURIComponent(roomEl.value);
+  document.querySelector('#url').textContent=data.listen_url;
+  document.querySelector('#status').textContent=`whisper ${data.whisper?'ok':'missing'} / model ${data.model?'ok':'missing'} / translate ${data.translate?'on':'off'}`;
+}
+roomEl.onchange=setup; setup();
+document.querySelector('#go').onclick=async()=>{
+  const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+  rec=new MediaRecorder(stream);
+  rec.ondataavailable=async ev=>{
+    if(!ev.data.size) return;
+    const body=new FormData();
+    body.append('room_id', roomEl.value);
+    body.append('audio', ev.data, 'chunk.webm');
+    const res=await fetch('/api/push',{method:'POST',body});
+    const data=await res.json();
+    if(data.zh) log.textContent=`${data.zh}\n${data.en||'(尚無英譯)'}\n\n`+log.textContent;
+  };
+  rec.start();
+  timer=setInterval(()=>{ if(rec.state==='recording'){ rec.requestData(); rec.stop(); rec.start(); } }, 6000);
+  document.querySelector('#stop').disabled=false;
+};
+document.querySelector('#stop').onclick=()=>{ clearInterval(timer); rec?.stop(); };
+</script>

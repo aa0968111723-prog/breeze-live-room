@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>聽眾字幕</title>
+<style>
+body{margin:0;background:#111;color:#fff;font-family:sans-serif}
+.en{font-size:32px;padding:24px;line-height:1.4}
+.zh{font-size:18px;color:#bbb;padding:0 24px 24px}
+</style>
+<div class="en" id="en">等待主持端…</div>
+<div class="zh" id="zh"></div>
+<script>
+const room=location.pathname.split('/').pop();
+const ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws/listen?room_id='+room);
+function show(item){ document.querySelector('#en').textContent=item.en||item.zh; document.querySelector('#zh').textContent=item.zh||''; }
+ws.onmessage=ev=>{
+  const data=JSON.parse(ev.data);
+  if(data.history?.length) show(data.history.at(-1));
+  if(data.type==='final') show(data);
+};
+</script>
