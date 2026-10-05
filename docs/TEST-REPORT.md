@@ -1,3 +1,30 @@
+# 本輪安裝驗收候選版測試紀錄（2026-10-05）
+
+基於 fix/field-ready-core@1f4732e。以下結果是本輪親自執行，不是主持機的實測。
+
+- Linux、CPython 3.12.14：原版 34 passed in 6.68s；本輪安裝及 Windows 修正後 46 項通過，完整匯出修正後 47 passed in 7.30s。node recorder machine 與 room client 均 exit 0。
+- 實際下載並核對固定 Breeze q5 SHA256 與 whisper.cpp v1.9.2 Linux 套件。
+- 使用 upstream 公開英文 JFK 音訊前 6 秒，常駐載入約 0.507 秒；兩次推論約 14.467／14.974 秒，均回傳非空文字、同一 PID、最後關閉。這不是中文準確度與 Windows 主持機結果。
+- 此測試 RTF 約 2.41／2.50，未通過此環境的連續即時容量門檻。
+- 實際核對 Windows whisper ZIP 的 SHA256，確認 whisper-cli、whisper-server 與 ggml／whisper DLL 都在套件中；PE 匯入顯示需要 Microsoft Visual C++ runtime。
+- [Actions run 37296121195](https://github.com/aa0968111723-prog/breeze-live-room/actions/runs/37296121195) 在提交 `1d7cf08069054b1a18f8f439c201abd747cd80ce` 全部通過：Windows／Linux × Python 3.11／3.12 的 46 項回歸與兩組 Node，以及 Windows 中文／空白路徑安裝、SHA256、DLL、Unicode 桌面捷徑、常駐與 CLI 各兩次真實推論。Windows runner 是 Server 2025，不是使用者的 Windows 11 主持機。
+- Windows 預設參數的 6 秒英文樣本：resident 33.766／33.641 秒，RTF 5.628／5.607；CLI 36.062／36.125 秒，RTF 6.010／6.021。推論可用，但未通過這台 CI 機的連續即時容量門檻。
+- Linux 真實模型 API 流程：health、setup、上傳、辨識、相同段重送去重、SQLite、SRT 與程序關閉通過；同一段只推論一次、模型載入一次。HTTPX ASGI 全流程約 17.051 秒，不含真實瀏覽器收音。
+- 完整匯出回歸：近期字幕窗口設成 2，送入 6 段、跨兩個會話；JSON／SRT 仍包含全部段落，重開服務後仍可匯出，其他房間不混入。新一輪四組矩陣測試以此提交的 Actions 為準。
+- 完整匯出程式提交 `d5297f932c4933a7535ef454e0feb3dd9eac6be5` 的 [Actions run 37328332363](https://github.com/aa0968111723-prog/breeze-live-room/actions/runs/37328332363) 全部通過：四組 Windows／Linux × Python 3.11／3.12 各 47 項回歸、兩組 Node，以及 Windows 完整安裝與兩種模式的真實辨識。
+- 該輪 Windows 6 秒英文樣本：resident 42.547／42.328 秒，RTF 7.091／7.055；CLI 45.015／44.969 秒，RTF 7.502／7.495。不同輪的速度有變動，仍不滿足此 CI 機的即時容量，必須測量實際主持機。
+- 合成文字容量檢查：保存 1200 段、近期窗口 200，SRT 匯出仍有完整 1200 段及 2 小時時間軸，匯出約 0.0091 秒。這只驗證儲存／匯出容量，不是真實錄音或 2 小時連續運作測試。
+- Chromium 整合環境受阻：下載回傳非有效 ZIP，未宣稱真實瀏覽器錄音整合通過。
+- 尚無主持機真實麥克風、30 分鐘中文、2 小時場次、3 台手機、真金鑰英譯的通過證據。
+
+- 實測速度選項：同一段英文樣本，greedy／audio context=0 為 14.050 秒，context=512 為 4.491 秒；文字不同。預設未變，中文品質與 Windows 速度仍需重新驗收。
+
+- 透過交付的 verify_runtime.py 重測速度選項（context=512、beam=1、best_of=1）：5.218／6.039 秒，RTF 0.870／1.006；第二次仍未達即時容量門檻，不能只採用最快一次的數字。
+
+下方是歷史查核紀錄，不代表本輪提交的現況。
+
+---
+
 # 測試紀錄
 
 日期：2026-10-05。機器：Linux 查核環境，不是 Ryzen 5 5600H / 16GB / Windows 11 主持機。沒有麥克風、Breeze 權重、`whisper-cli.exe`、OpenAI 金鑰。

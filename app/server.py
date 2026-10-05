@@ -146,25 +146,30 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
     model = Path(settings.model_path) if settings.model_path else DEFAULT_MODEL
     whisper = Path(settings.whisper_path) if settings.whisper_path else DEFAULT_WHISPER
     resident_error = ""
+    book = RoomBook(settings.max_rooms, settings.room_idle_s)
+    bus = RoomBus(settings.history_limit)
+    store = CaptionStore(settings.data_path or None)
     if asr is None:
         if settings.asr_mode == "resident":
             resident = ResidentAsr(
                 settings.resident_url,
-                server_bin=DEFAULT_SERVER if DEFAULT_SERVER.exists() else whisper,
+                server_bin=Path(settings.server_path) if settings.server_path else DEFAULT_SERVER,
                 model=model,
                 threads=settings.asr_threads,
+                startup_timeout_s=settings.resident_startup_s,
+                inference_timeout_s=settings.asr_timeout_s,
+                audio_context=settings.asr_audio_context,
+                beam_size=settings.asr_beam_size,
+                best_of=settings.asr_best_of,
             )
             started = resident.start()
             if started.ok:
                 asr = resident
             else:
                 resident_error = started.error
-                asr = CliAsr(whisper, model, threads=settings.asr_threads)
+                asr = resident
         else:
-            asr = CliAsr(whisper, model, threads=settings.asr_threads)
-    book = RoomBook(settings.max_rooms, settings.room_idle_s)
-    bus = RoomBus(settings.history_limit)
-    store = CaptionStore(settings.data_path or None)
+            asr = CliAsr(whisper, model, threads=settings.asr_threads, timeout_s=settings.asr_timeout_s, audio_context=settings.asr_audio_context, beam_size=settings.asr_beam_size, best_of=settings.asr_best_of)
     share_override = {"host": settings.share_host}
     tasks: list[asyncio.Task] = []
 
@@ -227,8 +232,10 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
     async def lifespan(app: FastAPI):
         pipeline.ensure_workers()
         tasks.append(asyncio.create_task(sweep_loop()))
-        yield
-        await shutdown()
+        try:
+            yield
+        finally:
+            await shutdown()
 
     app = FastAPI(title="breeze-live-room", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
@@ -272,7 +279,8 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         except RoomIdError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         url = share_for(room_id)
-        resident_ready = isinstance(asr, ResidentAsr) and asr.health()
+        resident_ready = isinstance(asr, ResidentAsr) and await asyncio.to_thread(asr.health)
+        asr_ready = resident_ready if isinstance(asr, ResidentAsr) else (whisper.is_file() and model.is_file() if isinstance(asr, CliAsr) else True)
         return {
             "room": room_id,
             "listen_url": url,
@@ -287,14 +295,21 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             "translate_configured": bool(translator.key) and settings.translate,
             "translate_verified": False,
             "translate_label": translator.status_label(),
-            "asr_mode": "resident" if resident_ready else "cli",
-            "model_reloads_each_segment": not resident_ready,
-            "resident_error": resident_error,
+            "asr_mode": "resident" if isinstance(asr, ResidentAsr) else "cli",
+            "asr_ready": asr_ready,
+            "model_reloads_each_segment": isinstance(asr, CliAsr),
+            "resident_error": getattr(asr, "last_error", "") or resident_error,
             "host_token": None,
             "queue": pipeline.stats(),
             "listeners": sum(len(item["listeners"]) for item in book.rooms.values()),
             "storage": store.enabled,
         }
+
+    @app.get("/api/health")
+    async def health() -> Response:
+        asr_ready = await asyncio.to_thread(asr.health) if isinstance(asr, ResidentAsr) else (whisper.is_file() and model.is_file() if isinstance(asr, CliAsr) else True)
+        ready = asr_ready and (decoder is not None or ffmpeg_bin(ROOT) is not None)
+        return JSONResponse({"service": "breeze-live-room", "ready": ready, "asr_ready": asr_ready}, status_code=200 if ready else 503, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/qr")
     async def qr(room_id: str = "class") -> Response:
@@ -444,7 +459,8 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         if kind not in {"txt", "json", "srt", "vtt"}:
             raise HTTPException(status_code=400, detail="不支援的匯出格式")
         try:
-            payload = export_text(bus.history(room_id), kind)
+            events = await asyncio.to_thread(store.room_rows, room_id) if store.enabled else bus.history(room_id)
+            payload = export_text(events, kind)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         media = "application/json" if kind == "json" else "text/plain; charset=utf-8"

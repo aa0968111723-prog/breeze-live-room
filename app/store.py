@@ -35,6 +35,7 @@ class CaptionStore:
                         )
                         """
                     )
+                    conn.execute("create index if not exists captions_room_session_seq on captions (room_id, session_id, seq)")
             finally:
                 conn.close()
 
@@ -101,8 +102,17 @@ class CaptionStore:
         def read(conn: sqlite3.Connection) -> list[dict]:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "select * from captions where room_id = ? order by session_id, seq",
-                (room_id,),
+                """
+                with sessions as (
+                    select session_id, min(rowid) as session_ord
+                    from captions where room_id = ? group by session_id
+                )
+                select captions.*, sessions.session_ord
+                from captions join sessions on captions.session_id = sessions.session_id
+                where captions.room_id = ?
+                order by sessions.session_ord, captions.seq
+                """,
+                (room_id, room_id),
             ).fetchall()
             return [dict(row) for row in rows]
         return self._run(read)
