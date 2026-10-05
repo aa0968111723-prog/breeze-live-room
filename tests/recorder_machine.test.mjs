@@ -238,4 +238,71 @@ await flagCtl.stop();
 assert.equal(flagged.length, 1);
 assert.equal(flagged[0].data.size, 80);
 assert.equal(flagged[0].data.complete, false);
+
+const capped = [];
+const cappedRecs = [];
+const cappedCtl = createCaptureController({
+  periodMs: 15,
+  maxInflight: 2,
+  openMic: async () => fakeStream(),
+  createRecorder() {
+    const listeners = {};
+    const rec = {
+      state: "inactive",
+      addEventListener(name, fn) { listeners[name] = fn; },
+      start() { this.state = "recording"; },
+      stop() {
+        this.state = "inactive";
+        listeners.dataavailable?.({ data: { size: 90, complete: true } });
+      },
+    };
+    cappedRecs.push(rec);
+    return rec;
+  },
+  newId: () => "cap",
+  roomId: () => "class",
+  upload: (meta) => new Promise((resolve) => { capped.push({ meta, resolve }); }),
+});
+try {
+  await cappedCtl.start();
+  const deadline = Date.now() + 1000;
+  while (capped.length < 2 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(capped.length, 2);
+  assert.deepEqual(capped.map((item) => item.meta.seq), [1, 2]);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(capped.length, 2, "滿載時不能再塞第三段上傳");
+  assert.ok(cappedCtl.inflight <= 2);
+  assert.ok(cappedRecs.filter((rec) => rec.state === "recording").length <= 1);
+  assert.equal(cappedCtl.canEditRoom(), false);
+} finally {
+  const stopping = cappedCtl.stop();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  for (const item of capped) item.resolve();
+  await stopping;
+}
+assert.equal(cappedCtl.state, "idle");
+
+const failedStream = fakeStream();
+let failedRelease;
+const failedCtl = createCaptureController({
+  periodMs: 60000,
+  openMic: async () => failedStream,
+  createRecorder: factory.createRecorder,
+  newId: () => "fail-sess",
+  roomId: () => "class",
+  upload: () => new Promise((resolve) => { failedRelease = resolve; }),
+});
+await failedCtl.start();
+failedCtl.fail("麥克風中斷或被拔除");
+assert.equal(failedCtl.state, "error");
+assert.equal(failedCtl.canEditRoom(), true);
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.ok(failedStream.getTracks().stopped >= 1);
+assert.equal(failedCtl.inflight, 1);
+failedRelease();
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(failedCtl.uploads.length, 1);
+assert.equal(failedCtl.uploads[0].meta.sessionId, "fail-sess");
 console.log("recorder machine ok");

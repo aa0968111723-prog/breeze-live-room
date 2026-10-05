@@ -87,7 +87,7 @@ function micError(err) {
   const name = err && err.name;
   if (name === "NotAllowedError") return "瀏覽器拒絕了麥克風。請允許後再按開始。";
   if (name === "NotFoundError") return "找不到麥克風。";
-  if (name === "NotReadableError") return "麥克風被別的程式占用，或剛剛被拔掉。";
+  if (name === "NotReadableError") return "麥克風被別的程式佔用，或剛剛被拔掉。";
   return "無法開始聽：" + (err && err.message ? err.message : "未知錯誤");
 }
 function deviceId() {

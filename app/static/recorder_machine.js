@@ -13,6 +13,7 @@ export function createCaptureController(deps) {
   const uploads = [];
   const inflight = new Set();
   const maxInflight = deps.maxInflight || 2;
+  let timerBusy = false;
 
   function setState(next) {
     state = next;
@@ -90,11 +91,17 @@ export function createCaptureController(deps) {
     const activeSession = session;
     recorder = null;
     if (!current) return Promise.resolve();
+    // Stay tracked until the upload itself is queued. Do not await it: the next
+    // segment must be able to record while up to maxInflight uploads run.
     const job = (async () => {
-      const blob = await stopRecorder(current);
-      if (!meta || !activeSession || !blob || typeof blob.size !== "number" || blob.size <= 0) return;
-      const t1 = Date.now() - activeSession.startedAt;
-      await trackUpload({ ...meta, t1_ms: t1 }, blob);
+      try {
+        const blob = await stopRecorder(current);
+        if (!meta || !activeSession || !blob || typeof blob.size !== "number" || blob.size <= 0) return;
+        const t1 = Date.now() - activeSession.startedAt;
+        trackUpload({ ...meta, t1_ms: t1 }, blob);
+      } catch {
+        /* settle still waits for whatever was queued */
+      }
     })();
     inflight.add(job);
     return job.finally(() => inflight.delete(job));
@@ -105,7 +112,7 @@ export function createCaptureController(deps) {
     while (inflight.size >= maxInflight && my === generation && !stopRequested) {
       await Promise.race([...inflight]);
     }
-    if (my !== generation || stopRequested || state !== "recording") return;
+    if (my !== generation || stopRequested || state !== "recording" || recorder) return;
     const started = Date.now();
     const meta = {
       sessionId: session.id,
@@ -126,23 +133,34 @@ export function createCaptureController(deps) {
 
   function armTimer(my) {
     clearTimer();
+    timerBusy = false;
     timer = setInterval(() => {
-      if (stopRequested || state !== "recording" || my !== generation) return;
-      finishCurrent().then(() => {
-        if (stopRequested || state !== "recording" || my !== generation) return;
-        return beginSegment(my);
-      });
+      if (timerBusy || stopRequested || state !== "recording" || my !== generation) return;
+      timerBusy = true;
+      const busyGen = generation;
+      finishCurrent()
+        .then(() => {
+          if (busyGen !== generation || stopRequested || state !== "recording") return;
+          return beginSegment(busyGen);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (busyGen === generation) timerBusy = false;
+        });
     }, deps.periodMs || 6000);
   }
 
   function fail(reason) {
     generation += 1;
     stopRequested = true;
+    timerBusy = false;
     lastError = reason || "錄音中斷";
     clearTimer();
-    finishCurrent();
-    releaseStream();
+    const oldStream = stream;
+    stream = null;
+    const closing = finishCurrent();
     setState("error");
+    closing.finally(() => closeStream(oldStream));
   }
 
   return {
@@ -198,6 +216,7 @@ export function createCaptureController(deps) {
       const my = generation;
       generation += 1;
       stopRequested = true;
+      timerBusy = false;
       setState("draining");
       clearTimer();
       try {

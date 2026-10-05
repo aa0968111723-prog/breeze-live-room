@@ -56,6 +56,7 @@ export function connectRoom({ room, url, onState, onEvent, onGap, openSocket, sl
     if (sleep) return sleep(ms);
     return new Promise((resolve) => {
       const finish = () => {
+        if (timer) clearTimeout(timer);
         timer = null;
         cancelWait = null;
         resolve();
@@ -136,7 +137,8 @@ export function connectRoom({ room, url, onState, onEvent, onGap, openSocket, sl
     nudge() {
       if (stopped) return;
       attempt = 0;
-      if (cancelWait) cancelWait();
+      // Backoff uses the timer. The live socket wait must stay up; stop() closes it.
+      if (timer && cancelWait) cancelWait();
     },
     stop() {
       stopped = true;

@@ -112,4 +112,53 @@ assert.equal(sockets[1].onmessage, null);
 if (sockets[1].onmessage) sockets[1].onmessage({ data: JSON.stringify({ type: "ping" }) });
 assert.equal(sockets[1].sent.length, 0);
 await conn.done;
+
+const nudged = [];
+const nudgeConn = connectRoom({
+  room: "class",
+  url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
+  openSocket(address) {
+    const ws = fakeSocket(address);
+    nudged.push(ws);
+    return ws;
+  },
+  onState: () => {},
+  onEvent: () => {},
+});
+await tick();
+assert.equal(nudged.length, 1);
+nudgeConn.nudge();
+await tick();
+assert.equal(nudged.length, 1);
+assert.equal(typeof nudged[0].onmessage, "function");
+nudged[0].onmessage({ data: JSON.stringify({ type: "ping" }) });
+assert.equal(JSON.parse(nudged[0].sent[0]).type, "pong");
+nudgeConn.stop();
+await nudgeConn.done;
+
+const resumed = [];
+const resumeConn = connectRoom({
+  room: "class",
+  url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
+  openSocket(address) {
+    const ws = fakeSocket(address);
+    resumed.push(ws);
+    return ws;
+  },
+  onState: () => {},
+  onEvent: () => {},
+});
+await tick();
+resumed[0].close();
+await tick();
+resumeConn.nudge();
+await tick();
+assert.equal(resumed.length, 2);
+assert.equal(typeof resumed[1].onmessage, "function");
+await new Promise((resolve) => setTimeout(resolve, 900));
+assert.equal(typeof resumed[1].onmessage, "function");
+resumed[1].onmessage({ data: JSON.stringify({ type: "ping" }) });
+assert.equal(JSON.parse(resumed[1].sent[0]).type, "pong");
+resumeConn.stop();
+await resumeConn.done;
 console.log("room client ok");
