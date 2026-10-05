@@ -2,11 +2,11 @@
 
 日期：2026-10-05。機器：Linux 查核環境，不是 Ryzen 5 5600H / 16GB / Windows 11 主持機。沒有麥克風、Breeze 權重、`whisper-cli.exe`、OpenAI 金鑰。
 
-分支 `fix/round2-continue`。HEAD 是 `98a5bb517b4945856b8e54799514399364d05bf9`。工作樹有大量未提交的第二輪修改，沒有新的 SHA。
+分支 `fix/round2-continue`。程式提交是 `cb21186d35a50690b7f012f35b4423b88b7ff6d4`，接在 `5c7784ca54d9c103529d85fbd1e2a111cc89c8bc` 之上。這份 SHA 紀錄是隨後的文件提交，不是 GitHub Actions 的結果。
 
 ## 已修
 
-程式裡有這些行為，尚未提交，本文件不把它們寫成已測試通過：
+這些行為在提交 `cb21186`。本地自動測試有覆蓋對應失敗路徑。這不是實機通過，GitHub Actions 也還沒跑這個提交：
 
 - 主持權杖只在 loopback，且 Host／Origin 要對上確切埠；權杖不進 setup／QR
 - `/api/push` 在解析表單前准入；同一段 single-flight；重送相同內容不佔第二個名額
@@ -20,7 +20,7 @@
 
 ## 仍未完成
 
-- 工作樹未提交，所以這輪測試檔還不在 HEAD 的 CI 上。
+- GitHub Actions 還沒跑 `cb21186`。推送前遠端 PR head 仍是 `5c7784c`。
 - 模型雜湊未在此計算、未釘選。
 - CLI 仍是每段重開行程。常駐「只載入一次」沒有實機證據。
 - 捷徑腳本、Windows DLL、防火牆、埠、中文或空白路徑都沒在這裡跑。
@@ -29,12 +29,12 @@
 
 ## 自動測試已通過
 
-2026-10-05，這台 Linux，CPython 3.11.17（`/root/breeze-live-room/.venv`），工作目錄 `/root/breeze-live-room`。沒有下載模型，沒有使用付費金鑰。HEAD 仍是 `98a5bb517b4945856b8e54799514399364d05bf9`，下列結果是未提交的工作樹，不是 GitHub Actions 結果。
+2026-10-05，這台 Linux，CPython 3.11.17（`/root/breeze-live-room/.venv`），工作目錄 `/root/breeze-live-room`。沒有下載模型，沒有使用付費金鑰。rebase 之後的程式提交 `cb21186d35a50690b7f012f35b4423b88b7ff6d4` 上親見下列結果，不是 GitHub Actions 結果。
 
 指令與結果：
 
-- 最新測試修改之後的權威結果：`cd /root/breeze-live-room && .venv/bin/python -m pytest -q --tb=line` 印出 `34 passed in 11.49s`（exit 0）。同一輪 `node tests/recorder_machine.test.mjs` 印出 `recorder machine ok`，`node tests/room_client.test.mjs` 印出 `room client ok`。
-- 同一工作樹較早也通過：`32 passed`（管線與派送修正前）、`31 passed in 10.88s`、`31 passed in 10.24s`、`31 passed in 9.74s`。
+- rebase 後的權威結果：`cd /root/breeze-live-room && .venv/bin/python -m pytest -q --tb=line` 印出 `34 passed in 14.78s`（exit 0）。同一輪 `node tests/recorder_machine.test.mjs` 印出 `recorder machine ok`，`node tests/room_client.test.mjs` 印出 `room client ok`（Node v26.3.1）。
+- 同一批測試較早也通過：`34 passed in 11.49s`（rebase 前）、`32 passed`、`31 passed in 10.88s`、`31 passed in 10.24s`、`31 passed in 9.74s`。
 - `node tests/recorder_machine.test.mjs` 印出 ok（`recorder machine ok`）；`node tests/room_client.test.mjs` 印出 ok（`room client ok`）。Node v26.3.1。CI 指定 Node 22，尚未在這個工作樹上跑。
 
 socket `__aexit__` 與顯示順序（display-order）測試修正之前的乾淨複製是 `25 passed, 6 failed`，失敗都在 `tests/test_round2.py`，不是 `ModuleNotFoundError: No module named 'app'`。那次不能當成目前結果。GitHub Actions 還沒在這個工作樹上跑過，所以「目前 CI 通過」尚未成立。Copilot review 成功也不等於測試通過。

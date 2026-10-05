@@ -9,13 +9,13 @@
 ## 版本狀態
 
 - 分支：`fix/round2-continue`
-- HEAD：`98a5bb517b4945856b8e54799514399364d05bf9`
-- 工作樹有大量未提交的第二輪修改（含未追蹤的 `app/run.py`、`app/store.py`、`app/textutil.py`、`install-shortcut.ps1`、`tests/test_round2.py`、`tests/room_client.test.mjs`）。沒有新的 SHA。遠端與 CI 仍是這個 HEAD。
+- 程式提交：`cb21186d35a50690b7f012f35b4423b88b7ff6d4`
+- 推送前，遠端 PR head 仍是 `5c7784ca54d9c103529d85fbd1e2a111cc89c8bc`。GitHub Actions 還沒跑 `cb21186`。
 - 本文件寫於 2026-10-05。這台是 Linux 查核機，直譯器是倉庫 venv 的 CPython 3.11.17（`/root/breeze-live-room/.venv`），不是 Ryzen 5 5600H / 16GB / Windows 11 主持機。這裡沒有麥克風、Breeze 權重、whisper-cli、`whisper-cli.exe`、OpenAI 金鑰。
 
 ## 已修
 
-以工作樹程式為準，尚未提交，不能當成已合併或已通過 CI：
+以提交 `cb21186` 的程式為準。尚未合併，也不能當成 GitHub Actions 已通過：
 
 - 主持權杖只發給 loopback，而且 Host／Origin 要對上允許的 scheme、host 與確切埠。權杖不進 QR、聽眾網址、`/api/setup`。
 - `/api/push` 在解析表單前先做准入。同一段 single-flight。中文先廣播，英譯失敗只更新同一段。
@@ -36,8 +36,8 @@
 
 2026-10-05，Linux，倉庫 venv 的 CPython 3.11.17（`/root/breeze-live-room/.venv`），Node v26.3.1。工作樹、不是 GitHub Actions 結果。沒有下載模型，沒有付費金鑰。
 
-- 最新測試修改之後的權威結果：`cd /root/breeze-live-room && .venv/bin/python -m pytest -q --tb=line` 印出 `34 passed in 11.49s`（exit 0）。
-- 同一工作樹較早也通過：`32 passed`（管線與派送修正前）、`31 passed in 10.88s`、`31 passed in 10.24s`、`31 passed in 9.74s`。
+- rebase 後的權威結果：`cd /root/breeze-live-room && .venv/bin/python -m pytest -q --tb=line` 印出 `34 passed in 14.78s`（exit 0）。
+- 同一批測試較早也通過：`34 passed in 11.49s`（rebase 前）、`32 passed`、`31 passed in 10.88s`、`31 passed in 10.24s`、`31 passed in 9.74s`。
 - socket `__aexit__` 與顯示順序（display-order）測試修正之前的乾淨複製是 `25 passed, 6 failed`，不能當成目前結果。
 - `node tests/recorder_machine.test.mjs` 印出 `recorder machine ok`；`node tests/room_client.test.mjs` 印出 `room client ok`。
 

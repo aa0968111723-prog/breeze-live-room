@@ -1,6 +1,6 @@
 # 安裝
 
-日期：2026-10-05。這份說明對齊工作樹。HEAD 仍是 `98a5bb517b4945856b8e54799514399364d05bf9`，第二輪修改尚未提交。
+日期：2026-10-05。這份說明對齊程式提交 `cb21186d35a50690b7f012f35b4423b88b7ff6d4`。
 
 這台是 Linux 查核機，不是 Windows 主持機。`install.bat`、`start.bat`、`install-shortcut.ps1` 都沒有在這裡執行。不要只複製單一 exe 就假設能跑；這次沒有在 Windows 上驗證 DLL、防火牆、埠佔用，或含中文與空白的路徑。
 
@@ -13,7 +13,7 @@
 ## 步驟
 
 1. 安裝 Python 3.11，勾選 Add to PATH。
-2. 克隆專案。目前要看的修正在工作樹，尚未提交。
+2. 克隆專案，看分支 `fix/round2-continue` 的提交 `cb21186d35a50690b7f012f35b4423b88b7ff6d4`。
 3. 雙擊 `install.bat`。失敗時不會說安裝完成。磁碟剩餘少於 5GB 會中止，不下載。
 4. 模型網址仍是 https://huggingface.co/shdennlin/breeze-asr-25-ggml/resolve/main/ggml-breeze-asr-25-q5_0.bin （約 1.1GB 的 q5）。雜湊沒有在這台計算，所以沒有釘選。只有你另外放了 `models\ggml-breeze-asr-25-q5_0.bin.sha256` 時，`install.bat` 才會比對。權重不進 Git。
 5. 放入固定版本的 whisper.cpp Windows 套件：`tools\whisper-cli.exe`、要用常駐時再加 `tools\whisper-server.exe`，以及 ffmpeg 與其 DLL。

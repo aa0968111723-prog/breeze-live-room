@@ -3,8 +3,8 @@
 日期：2026-10-05。
 
 - 分支：`fix/round2-continue`
-- HEAD：`98a5bb517b4945856b8e54799514399364d05bf9`
-- 工作樹有大量未提交的第二輪修改，含未追蹤檔。沒有新的 SHA。本紀錄描述工作樹，不把差分說成已提交。
+- 程式提交：`cb21186d35a50690b7f012f35b4423b88b7ff6d4`（`fix/round2-continue`，在 `5c7784ca54d9c103529d85fbd1e2a111cc89c8bc` 之上）
+- 本紀錄描述提交 `cb21186`。推送前遠端仍是 `5c7784c`。GitHub Actions 還沒跑這個提交。
 - 這台是 Linux，直譯器是倉庫 venv 的 CPython 3.11.17（`/root/breeze-live-room/.venv`），不是 Ryzen 5 5600H / 16GB / Windows 11 主持機。沒有麥克風、Breeze 權重、whisper-cli、`whisper-cli.exe`、OpenAI 金鑰。
 - 倉庫沒有 `AGENTS.md`。
 
@@ -28,7 +28,7 @@
 
 ## 仍未完成
 
-- 上述程式在工作樹，尚未提交。HEAD 的 CI 不包含這輪未追蹤測試。
+- GitHub Actions 還沒跑這個提交。實機驗證沒有通過。
 - q5 網址仍是 Hugging Face 的 `ggml-breeze-asr-25-q5_0.bin`。雜湊沒有在這台計算，儲存庫沒有釘選。`install.bat` 只有在旁路 sha256 檔存在時才比對。
 - CLI 每次重新啟動 whisper-cli。常駐路徑未在主持機證明「模型只載入一次」。ready 旗標不能拿來宣稱已載入。
 - 不是單一 exe／MSI。`install-shortcut.ps1` 存在，這裡沒執行。Windows DLL、防火牆、埠佔用、含中文或空白的安裝路徑未驗證。
@@ -44,8 +44,8 @@
 
 2026-10-05 在這台 Linux 的工作樹上親見，直譯器是倉庫 venv 的 CPython 3.11.17（`/root/breeze-live-room/.venv`）。沒有模型、沒有付費金鑰。這不是 GitHub Actions 的結果。
 
-- 最新測試修改之後的權威結果：`cd /root/breeze-live-room && .venv/bin/python -m pytest -q --tb=line` 印出 `34 passed in 11.49s`（exit 0）。
-- 同一工作樹較早也通過：`32 passed`（管線與派送修正前）、`31 passed in 10.88s`、`31 passed in 10.24s`、`31 passed in 9.74s`。
+- rebase 後的權威結果：`cd /root/breeze-live-room && .venv/bin/python -m pytest -q --tb=line` 印出 `34 passed in 14.78s`（exit 0）。
+- 同一批測試較早也通過：`34 passed in 11.49s`（rebase 前）、`32 passed`、`31 passed in 10.88s`、`31 passed in 10.24s`、`31 passed in 9.74s`。
 - socket `__aexit__` 與顯示順序（display-order）測試修正之前的乾淨複製是 `25 passed, 6 failed`，不能當成目前結果。
 - `node tests/recorder_machine.test.mjs` 與 `node tests/room_client.test.mjs` 皆印出 ok（Node v26.3.1）。CI 仍指定 Node 22，尚未在這個工作樹上跑。
 
