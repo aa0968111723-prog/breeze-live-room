@@ -6,13 +6,19 @@
 
 ## 第一次使用
 
-1. 準備 Windows 11 x64（Intel／AMD）、Python 3.11 或 3.12，以及 Microsoft Visual C++ x64 執行階段。
+1. 準備 Windows 11 x64（Intel／AMD）。安裝器會下載並核對獨立 Python，無需先手動安裝 Python 或 Git。
 2. 解壓縮專案，雙擊 `install.bat`。會安裝 Python 套件，下載固定版本 Breeze 模型、whisper.cpp CPU 套件與 ffmpeg，並核對大小與 SHA256。第一次約下載 1.2GB，需至少 5GB 可用空間。
 3. 關閉字幕服務後，雙擊 `verify.bat`，確認真實模型可辨識及速度足以承受。結果在 `data/runtime-check.json`，不包含逐字稿或 API 金鑰。
 4. 雙擊 `start.bat`。啟動前會檢查工具／DLL、模型、埠及目錄權限；瀏覽器等服務啟動後才開啟。
 5. 在主持機的 `http://127.0.0.1:<BREEZE_PORT>` 允許麥克風，開始聽。聽眾裝置與電腦連同一個 Wi-Fi，掃 QR 看字幕。
 
 錯誤時雙擊 `doctor.bat`。詳細步驟與 Microsoft 官方下載入口在 [安裝說明](docs/INSTALL.md)。
+
+## 安裝包與更新
+
+正式安裝包在 [GitHub Releases](https://github.com/aa0968111723-prog/breeze-live-room/releases)。下載 ZIP、解壓縮後雙擊 `install.bat`；第一次安裝自動準備 Python、套件、模型與工具，並建立啟動／更新／診斷桌面捷徑。
+
+關閉字幕程式後雙擊 `update.bat` 更新；`rollback.bat` 回復前版。更新保留 `.env` 與字幕資料，先核對發布包 SHA256、準備新環境並備份。維護者推送版本標籤後，GitHub 自動測試 Windows 一鍵安裝與真實辨識，通過才發布。尚未建立正式 Release 時更新器會明確提示。完整流程見 [長期維護說明](docs/MAINTENANCE.md)。
 
 ## 中文與英譯
 

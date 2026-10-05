@@ -2,15 +2,15 @@
 
 這個候選版包含完整安裝、辨識自檢及長場次匯出修正。請從 [候選版分支](https://github.com/aa0968111723-prog/breeze-live-room/tree/codex/windows-readiness-20261005) 選 Code → Download ZIP，再解壓縮。修正在 [PR #3](https://github.com/aa0968111723-prog/breeze-live-room/pull/3)，目標為 main，目前仍是驗收候選版。
 
-## 先準備兩個基礎元件
+## 執行環境
 
-- Python 3.11 或 3.12：從 [Python 官方 Windows 下載頁](https://www.python.org/downloads/windows/) 安裝，勾選 Add Python to PATH 與 Python Launcher。這裡的回歸驗證是 Python 3.12；CI 同時測 3.11／3.12。
-- Microsoft Visual C++ x64 執行階段：使用 [Microsoft 官方說明](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist) 的 x64 下載。whisper 套件需要 MSVCP140／VCRUNTIME140。未安裝時，不要從任意網站下載單顆 DLL。
+- Python：`install.bat` 自動下載固定且核對 SHA256 的官方獨立 Python 到 `.python/`，不用手動安裝或修改 PATH。回歸 CI 同時測 3.11／3.12；使用者安裝採專用 3.12 環境。
+- Microsoft Visual C++ x64 執行階段：缺少時安裝器會從 Microsoft 下載，核對官方數位簽章再安裝。也可使用 [Microsoft 官方說明](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist) 的 x64 下載。whisper 套件需要 MSVCP140／VCRUNTIME140。
 
 ## 安裝
 
 1. 解壓縮專案，雙擊 `install.bat`。
-2. 安裝器建立專案自己的 `.venv`，下載並校驗模型、whisper.cpp 與 ffmpeg，不需要手動挑選 CUDA 版本。
+2. 安裝器準備獨立 Python 並建立專案自己的 `.venv`，依鎖檔安裝套件，下載並校驗模型、whisper.cpp 與 ffmpeg，不需要手動挑選 CUDA 版本。
 3. 模型固定來源為 shdennlin/breeze-asr-25-ggml 的 `36c726093efe1760d1dd39c3cfe8b6a7282437d1`，SHA256 固定為 `f51573bd6ef9b1fac0bd09a1652eda58a1a638d824a08771ccdee1102fe5990a`。
 4. 程式工具固定為 whisper.cpp v1.9.2 CPU x64 與 Gyan FFmpeg 9.0.2 essentials。各下載的預期大小、SHA256 及來源在 `runtime-manifest.json`。FFmpeg 官方下載頁列有 Gyan 的 Windows 編譯版本。
 5. 不完整下載保留為 .part，可重跑續傳；只有完整校驗通過的檔案會取代正式檔案。舊 tools 會備份到 `.downloads/previous-tools-*`，避免混用舊 DLL。
@@ -46,7 +46,7 @@ Windows 防火牆需要允許這個服務在私人網路被其他裝置連線。
 
 雙擊 `doctor.bat`：檢查 Python 套件、模型 SHA256、執行檔／DLL、埠與目錄權限；不呼叫英譯 API，也不錄音。
 
-- 缺少 Python：安裝後重開終端／重新執行 install。
+- 缺少 Python：重新執行 install；檢查網路是否可連線 NuGet。
 - whisper 無法啟動、代碼 3221225781／-1073741515：檢查 Microsoft Visual C++ x64 執行階段與完整 tools 套件。
 - 埠被占用：先關閉舊字幕服務，或修改 `BREEZE_PORT`。
 - 常駐模型載入失敗：查看畫面原因，確認模型完整、whisper-server 可執行及 `BREEZE_RESIDENT_URL` 沒有與其他服務撞埠。

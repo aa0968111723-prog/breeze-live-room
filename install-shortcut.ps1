@@ -64,9 +64,11 @@ $WorkingDirectory = $PSScriptRoot
 $desktop = [Environment]::GetFolderPath('Desktop')
 if (-not $desktop) { exit 1 }
 [System.IO.Directory]::CreateDirectory($desktop) | Out-Null
-$shortcutPath = Join-Path $desktop 'Breeze Live Room.lnk'
-$target = Join-Path $WorkingDirectory 'start.bat'
-if (-not $CheckOnly) {
-    [BreezeDesktopShortcut]::Create($target, $WorkingDirectory, $shortcutPath)
+foreach ($entry in @(@('Breeze Live Room', 'start.bat'), @('Breeze Update', 'update.bat'), @('Breeze Doctor', 'doctor.bat'))) {
+    $shortcutPath = Join-Path $desktop ($entry[0] + '.lnk')
+    $target = Join-Path $WorkingDirectory $entry[1]
+    if (-not $CheckOnly) {
+        [BreezeDesktopShortcut]::Create($target, $WorkingDirectory, $shortcutPath)
+    }
+    [BreezeDesktopShortcut]::Verify($target, $WorkingDirectory, $shortcutPath)
 }
-[BreezeDesktopShortcut]::Verify($target, $WorkingDirectory, $shortcutPath)

@@ -37,7 +37,8 @@ class NativePaths:
             os.link(absolute, alias)
         except OSError as exc:
             if not allow_copy:
-                raise OSError("原生模型工具需要英數字檔名；請改用預設模型檔名，或允許模型目錄建立暫存連結。") from exc
+                if shutil.disk_usage(self.workspace()).free < absolute.stat().st_size + 64 * 1024 * 1024:
+                    raise OSError("模型檔名含中文且此目錄無法建立連結；請改用英數字模型檔名，或預留空間供暫存複本。") from exc
             shutil.copyfile(absolute, alias)
         return os.path.relpath(alias, self.cwd)
 
