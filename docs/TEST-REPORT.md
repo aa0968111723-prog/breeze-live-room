@@ -20,7 +20,7 @@
 
 ## 仍未完成
 
-- GitHub Actions 還沒跑 `cb21186`。推送前遠端 PR head 仍是 `5c7784c`。
+- 推上去的 PR head 是 `4f3d947`。程式本體在 `cb21186`。GitHub 權杖不能改 `.github/workflows/test.yml`，所以遠端工作流程仍只跑 pytest 和 `tests/recorder_machine.test.mjs`。`tests/room_client.test.mjs` 在這台 Node v26.3.1 印出 `room client ok`，CI 要等有人加上 `node tests/room_client.test.mjs` 才會跑它。
 - 模型雜湊未在此計算、未釘選。
 - CLI 仍是每段重開行程。常駐「只載入一次」沒有實機證據。
 - 捷徑腳本、Windows DLL、防火牆、埠、中文或空白路徑都沒在這裡跑。

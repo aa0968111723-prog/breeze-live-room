@@ -10,7 +10,7 @@
 
 - 分支：`fix/round2-continue`
 - 程式提交：`cb21186d35a50690b7f012f35b4423b88b7ff6d4`
-- 推送前，遠端 PR head 仍是 `5c7784ca54d9c103529d85fbd1e2a111cc89c8bc`。GitHub Actions 還沒跑 `cb21186`。
+- 已快轉推上 `fix/field-ready-core`，tip 是 `4f3d947`。程式本體在 `cb21186`。工作流程檔沒有一起推上：這組權杖不能改 `.github/workflows/test.yml`。CI 因此還不會跑 `tests/room_client.test.mjs`。
 - 本文件寫於 2026-10-05。這台是 Linux 查核機，直譯器是倉庫 venv 的 CPython 3.11.17（`/root/breeze-live-room/.venv`），不是 Ryzen 5 5600H / 16GB / Windows 11 主持機。這裡沒有麥克風、Breeze 權重、whisper-cli、`whisper-cli.exe`、OpenAI 金鑰。
 
 ## 已修
