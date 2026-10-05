@@ -15,6 +15,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.asr import CliAsr, ResidentAsr
 from app.doctor import inspect
+from app.native_paths import NativePaths
 from app.server import create_app
 from app.settings import Settings
 from scripts.install_runtime import download_verified, extract_binaries
@@ -134,6 +135,46 @@ def test_cli_windows_utf8_and_missing_dll(tmp_path):
     assert not result.ok and "DLL" in result.error
 
 
+def test_native_windows_paths_preserve_unicode_files_and_prompt(tmp_path):
+    folder = tmp_path / "host 中文" / "models"
+    folder.mkdir(parents=True)
+    model = folder / "模型.bin"
+    audio = tmp_path / "語音.wav"
+    model.write_bytes(b"model")
+    audio.write_bytes(b"audio")
+    paths = NativePaths(model)
+    # Exercise the Windows path strategy on either test platform.
+    paths.cwd = folder
+    try:
+        model_arg = paths.argument(model)
+        audio_arg = paths.argument(audio, allow_copy=True)
+        assert model_arg.isascii() and audio_arg.isascii()
+        assert (folder / model_arg).read_bytes() == b"model"
+        assert (folder / audio_arg).read_bytes() == b"audio"
+        command = paths.cli_command(folder / "whisper-cli.exe", ["-m", model_arg, "-f", audio_arg, "--prompt", "般若\n中文"])
+        response = folder / command[1][1:]
+        assert response.read_text(encoding="utf-8").splitlines()[-1] == "般若 中文"
+        workspace = response.parent
+    finally:
+        paths.close()
+    assert not workspace.exists()
+    assert model.read_bytes() == b"model" and audio.read_bytes() == b"audio"
+
+
+def test_resident_reports_bounded_startup_failure_and_closes_pipe(tmp_path):
+    binary, model = tmp_path / "server", tmp_path / "model"
+    binary.touch()
+    model.touch()
+    process = Process()
+    process.stopped = True
+    process.stderr = io.BytesIO(b"x" * 8000 + b"\nmodel file not found")
+    asr = ResidentAsr(f"http://127.0.0.1:{free_port()}", server_bin=binary, model=model, popen=lambda *a, **kw: process)
+    result = asr.start()
+    assert not result.ok and "model file not found" in result.error
+    assert len(asr.startup_output) <= 4096
+    assert process.stderr.closed and asr.proc is None and asr.native_paths is None
+
+
 class Response(io.BytesIO):
     def __init__(self, data, status=200, headers=None):
         super().__init__(data)
@@ -187,7 +228,12 @@ def test_doctor_port_conflict_and_secret_redaction(tmp_path, monkeypatch):
         (tools / name).touch()
     model = tmp_path / "model"
     model.write_bytes(b"fixture")
-    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess([], 0))
+    original_run = subprocess.run
+    def native_probe(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd[0].endswith(".exe"):
+            return subprocess.CompletedProcess(cmd, 0)
+        return original_run(cmd, *args, **kwargs)
+    monkeypatch.setattr(subprocess, "run", native_probe)
     with socket.socket() as listener:
         listener.bind(("0.0.0.0", 0))
         settings = Settings(port=listener.getsockname()[1], model_path=str(model), asr_mode="resident")

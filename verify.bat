@@ -9,7 +9,7 @@ if not exist .venv\Scripts\python.exe (
   exit /b 1
 )
 echo 請先關閉字幕服務，現在檢查實際模型與辨識速度。
-.venv\Scripts\python.exe scripts\verify_runtime.py
+.venv\Scripts\python.exe scripts\verify_runtime.py %*
 set RESULT=%errorlevel%
 if not defined BREEZE_NONINTERACTIVE pause
 exit /b %RESULT%

@@ -9,6 +9,9 @@ import socket
 import time
 import urllib.error
 import urllib.request
+import threading
+
+from app.native_paths import NativePaths
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -51,23 +54,25 @@ class CliAsr:
             return AsrResult(ok=False, error="找不到 Breeze 模型。請先安裝，不要改走雲端辨識。")
         import subprocess
 
-        cmd = [
-            str(self.whisper), "-m", str(self.model), "-f", str(wav),
-            "-l", "zh", "-np", "-nt", "-t", str(self.threads), "--prompt", prompt,
-        ]
-        if self.audio_context:
-            cmd += ["--audio-ctx", str(self.audio_context)]
-        if self.beam_size:
-            cmd += ["--beam-size", str(self.beam_size)]
-        if self.best_of:
-            cmd += ["--best-of", str(self.best_of)]
+        paths = NativePaths(self.model)
         run = self.runner or subprocess.run
         try:
-            proc = run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=self.timeout_s)
+            args = ["-m", paths.argument(self.model), "-f", paths.argument(wav, allow_copy=True),
+                    "-l", "zh", "-np", "-nt", "-t", str(self.threads), "--prompt", prompt]
+            if self.audio_context:
+                args += ["--audio-ctx", str(self.audio_context)]
+            if self.beam_size:
+                args += ["--beam-size", str(self.beam_size)]
+            if self.best_of:
+                args += ["--best-of", str(self.best_of)]
+            cmd = paths.cli_command(self.whisper, args)
+            proc = run(cmd, cwd=paths.cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=self.timeout_s)
         except subprocess.TimeoutExpired:
             return AsrResult(ok=False, error="whisper-cli 逾時", loaded_once=False)
         except OSError:
             return AsrResult(ok=False, error="whisper-cli 無法啟動。請重新安裝執行檔與 DLL。", loaded_once=False)
+        finally:
+            paths.close()
         text = " ".join(line.strip() for line in (proc.stdout or "").splitlines() if line.strip())
         if proc.returncode != 0:
             err = (proc.stderr or "")[-400:] or "Breeze 辨識失敗"
@@ -135,6 +140,24 @@ class ResidentAsr:
         self.audio_context = audio_context
         self.beam_size = beam_size
         self.best_of = best_of
+        self.native_paths = None
+        self.startup_output = b""
+        self.output_thread = None
+        self.capture_startup = False
+
+    def _drain_stderr(self, stream) -> None:
+        try:
+            while block := stream.read(1024):
+                if self.capture_startup:
+                    self.startup_output = (self.startup_output + block)[-4096:]
+        finally:
+            stream.close()
+
+    def _startup_failure(self, message: str) -> str:
+        if self.output_thread:
+            self.output_thread.join(timeout=1)
+        detail = self.startup_output.decode("utf-8", errors="replace").strip()[-600:]
+        return message + (" " + detail if detail else "")
 
     def health(self) -> bool:
         if self.transport is not None and self.ready and self.loads >= 1:
@@ -180,39 +203,47 @@ class ResidentAsr:
                 return AsrResult(ok=False, error=self.last_error)
         except OSError:
             pass
-        cmd = [
-            str(self.server_bin), "-m", str(self.model), "--host", host, "--port", port,
-            "-l", "zh", "-t", str(self.threads),
-        ]
-        if self.audio_context:
-            cmd += ["--audio-ctx", str(self.audio_context)]
-        if self.beam_size:
-            cmd += ["--beam-size", str(self.beam_size)]
-        if self.best_of:
-            cmd += ["--best-of", str(self.best_of)]
         import subprocess
         opener = self.popen or subprocess.Popen
         try:
-            # DEVNULL, not PIPE: an unread stderr pipe fills and stalls the server.
-            self.proc = opener(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.native_paths = NativePaths(self.model)
+            cmd = [str(self.server_bin.resolve()), "-m", self.native_paths.argument(self.model), "--host", host, "--port", port,
+                   "-l", "zh", "-t", str(self.threads)]
+            if self.audio_context:
+                cmd += ["--audio-ctx", str(self.audio_context)]
+            if self.beam_size:
+                cmd += ["--beam-size", str(self.beam_size)]
+            if self.best_of:
+                cmd += ["--best-of", str(self.best_of)]
+            self.startup_output = b""
+            self.capture_startup = True
+            self.proc = opener(cmd, cwd=self.native_paths.cwd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            stream = getattr(self.proc, "stderr", None)
+            if stream is not None:
+                # Always drain the pipe; keep only a bounded startup diagnostic.
+                self.output_thread = threading.Thread(target=self._drain_stderr, args=(stream,), daemon=True)
+                self.output_thread.start()
         except OSError as exc:
+            self.close()
             self.ready = False
             self.last_error = f"whisper-server 無法啟動：{exc}"[:180]
             return AsrResult(ok=False, error=self.last_error)
         poll = getattr(self.proc, "poll", None)
         if self.proc is None or (callable(poll) and poll() is not None):
-            self.proc = None
-            self.ready = False
-            self.last_error = "whisper-server 啟動後立刻結束，沒有改走雲端。"
+            error = self._startup_failure("whisper-server 啟動後立刻結束，沒有改走雲端。")
+            self.close()
+            self.last_error = error
             return AsrResult(ok=False, error=self.last_error)
         deadline = time.monotonic() + self.startup_timeout_s
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
-                self.last_error = "whisper-server 在模型就緒前結束，請檢查模型與 DLL。"
+                self.last_error = self._startup_failure("whisper-server 在模型就緒前結束，請檢查模型與 DLL。")
                 break
             if self.health():
                 self.loads += 1
                 self.ready = True
+                self.capture_startup = False
+                self.startup_output = b""
                 self.last_error = ""
                 return AsrResult(ok=True, loaded_once=self.loads == 1)
             time.sleep(self.poll_interval_s)
@@ -281,14 +312,20 @@ class ResidentAsr:
         proc = self.proc
         self.proc = None
         self.ready = False
-        if proc is None:
-            return
-        try:
-            proc.terminate()
-            proc.wait(timeout=3)
-        except Exception:
+        if proc is not None:
             try:
-                proc.kill()
+                proc.terminate()
                 proc.wait(timeout=3)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+        if self.output_thread:
+            self.output_thread.join(timeout=1)
+            self.output_thread = None
+        self.capture_startup = False
+        if self.native_paths:
+            self.native_paths.close()
+            self.native_paths = None

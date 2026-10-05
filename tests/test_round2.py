@@ -709,7 +709,7 @@ def test_resident_ready_flag_is_not_inference(tmp_path):
     asr = ResidentAsr()
     asr.mark_ready_for_test()
     wav = tmp_path / "a.wav"
-    wav.write_text("般若")
+    wav.write_text("般若", encoding="utf-8")
     marked = asr.transcribe(wav, "提示")
     assert marked.ok is False
     assert marked.text == ""

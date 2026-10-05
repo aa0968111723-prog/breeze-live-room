@@ -166,7 +166,7 @@ def main() -> int:
     doctor = subprocess.run([sys.executable, "-m", "app.doctor", "--verify-model"], cwd=ROOT)
     if doctor.returncode:
         return doctor.returncode
-    shortcut = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ROOT / "install-shortcut.ps1"), "-WorkingDirectory", str(ROOT)], cwd=ROOT)
+    shortcut = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ".\\install-shortcut.ps1"], cwd=ROOT)
     if shortcut.returncode:
         print("桌面捷徑未建立，仍可雙擊 start.bat。")
     print("安裝及啟動前檢查完成。請雙擊 start.bat，再進行麥克風試錄。")

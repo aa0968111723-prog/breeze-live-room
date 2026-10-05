@@ -5,6 +5,7 @@ on:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
         python: ["3.11", "3.12"]
@@ -41,10 +42,18 @@ jobs:
           try {
             cmd /c install.bat
             if ($LASTEXITCODE -ne 0) { throw 'Windows install failed' }
+            $desktop = [Environment]::GetFolderPath('Desktop')
+            $shell = New-Object -ComObject WScript.Shell
+            $shortcut = $shell.CreateShortcut((Join-Path $desktop 'Breeze Live Room.lnk'))
+            if ($shortcut.TargetPath -ne (Join-Path $target 'start.bat')) { throw 'Desktop shortcut target is incorrect' }
             cmd /c doctor.bat
             if ($LASTEXITCODE -ne 0) { throw 'Preflight failed' }
             cmd /c verify.bat
             if ($LASTEXITCODE -ne 0) { throw 'Real ASR inference failed' }
+            $env:BREEZE_ASR = 'cli'
+            cmd /c verify.bat --output data/runtime-check-cli.json
+            if ($LASTEXITCODE -ne 0) { throw 'Real CLI inference failed' }
+            Remove-Item Env:BREEZE_ASR
           } finally {
             Pop-Location
           }
@@ -52,5 +61,5 @@ jobs:
         if: always()
         with:
           name: windows-runtime-check
-          path: ${{ runner.temp }}/Breeze test 測試/data/runtime-check.json
+          path: ${{ runner.temp }}/Breeze test 測試/data/runtime-check*.json
           if-no-files-found: ignore
