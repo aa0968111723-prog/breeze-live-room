@@ -79,6 +79,9 @@ class Settings:
     max_inflight_bytes: int = 32 * 1024 * 1024
     asr_workers: int = 1
     asr_threads: int = 6
+    asr_audio_context: int = 0
+    asr_beam_size: int = 0
+    asr_best_of: int = 0
     history_limit: int = 200
     max_results: int = 500
     max_held: int = 32
@@ -89,7 +92,9 @@ class Settings:
     data_path: str = ""
     model_path: str = ""
     whisper_path: str = ""
+    server_path: str = ""
     resident_url: str = "http://127.0.0.1:8178"
+    resident_startup_s: float = 180.0
     asr_mode: str = "cli"
     gap_wait_s: float = 3.0
     decode_timeout_s: float = 40.0
@@ -128,6 +133,14 @@ class Settings:
             raise ValueError("歷史、翻譯佇列與聽眾佇列至少為 1")
         if self.gap_wait_s < 0 or self.room_idle_s < 0:
             raise ValueError("等待時間不能是負數")
+        if self.asr_mode not in {"cli", "resident"}:
+            raise ValueError("BREEZE_ASR 只接受 cli 或 resident")
+        if self.resident_startup_s <= 0 or self.asr_timeout_s <= 0:
+            raise ValueError("辨識啟動及推論逾時必須大於零")
+        if self.asr_audio_context != 0 and not 128 <= self.asr_audio_context <= 1500:
+            raise ValueError("BREEZE_ASR_AUDIO_CONTEXT 必須是 0 或 128 到 1500")
+        if not 0 <= self.asr_beam_size <= 8 or not 0 <= self.asr_best_of <= 8:
+            raise ValueError("BREEZE_ASR_BEAM_SIZE 與 BREEZE_ASR_BEST_OF 必須在 0 到 8")
         for scheme in self.allowed_schemes:
             if scheme not in {"http", "https"}:
                 raise ValueError("允許的 scheme 只接受 http 或 https")
@@ -147,6 +160,9 @@ class Settings:
             max_inflight_bytes=_raw_int(env, "BREEZE_MAX_INFLIGHT_BYTES", 32 * 1024 * 1024),
             asr_workers=_raw_int(env, "BREEZE_ASR_WORKERS", 1),
             asr_threads=_raw_int(env, "BREEZE_ASR_THREADS", 6),
+            asr_audio_context=_raw_int(env, "BREEZE_ASR_AUDIO_CONTEXT", 0),
+            asr_beam_size=_raw_int(env, "BREEZE_ASR_BEAM_SIZE", 0),
+            asr_best_of=_raw_int(env, "BREEZE_ASR_BEST_OF", 0),
             history_limit=_raw_int(env, "BREEZE_HISTORY_LIMIT", 200),
             max_results=_raw_int(env, "BREEZE_MAX_RESULTS", 500),
             max_held=_raw_int(env, "BREEZE_MAX_HELD", 32),
@@ -157,7 +173,9 @@ class Settings:
             data_path=env.get("BREEZE_DATA_PATH", "").strip(),
             model_path=env.get("BREEZE_MODEL", "").strip(),
             whisper_path=env.get("BREEZE_WHISPER", "").strip(),
+            server_path=env.get("BREEZE_WHISPER_SERVER", "").strip(),
             resident_url=env.get("BREEZE_RESIDENT_URL", "http://127.0.0.1:8178").strip() or "http://127.0.0.1:8178",
+            resident_startup_s=_raw_float(env, "BREEZE_RESIDENT_STARTUP_TIMEOUT", 180.0),
             asr_mode=env.get("BREEZE_ASR", "cli").strip() or "cli",
             gap_wait_s=_raw_float(env, "BREEZE_GAP_WAIT", 3.0),
             decode_timeout_s=_raw_float(env, "BREEZE_DECODE_TIMEOUT", 40.0),

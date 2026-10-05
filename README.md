@@ -1,72 +1,41 @@
 # breeze-live-room
 
-桌面軟體：本機 Breeze ASR 25 聽中文，穩定句再英譯，手機平板掃 QR 看字幕。
+本機 Breeze 中文辨識、可選英文翻譯，以及區網手機／平板字幕。
 
-專案：https://github.com/aa0968111723-prog/breeze-live-room
+目前是安裝驗收候選版。程式修正以 `fix/field-ready-core@1f4732e` 為基準；正式使用仍須完成主持機的速度、中文準確度、麥克風與長時間驗收。通過單元測試不等於通過實機驗收。
 
-這不是 Qwen 那種 2.3 秒同傳。聽寫留在這台電腦，英譯才會出去（若有設 OpenAI 金鑰）。沒有金鑰就只出中文，不會改走雲端辨識。
+## 第一次使用
 
-## 版本狀態
+1. 準備 Windows 11 x64（Intel／AMD）、Python 3.11 或 3.12，以及 Microsoft Visual C++ x64 執行階段。
+2. 解壓縮專案，雙擊 `install.bat`。會安裝 Python 套件，下載固定版本 Breeze 模型、whisper.cpp CPU 套件與 ffmpeg，並核對大小與 SHA256。第一次約下載 1.2GB，需至少 5GB 可用空間。
+3. 關閉字幕服務後，雙擊 `verify.bat`，確認真實模型可辨識及速度足以承受。結果在 `data/runtime-check.json`，不包含逐字稿或 API 金鑰。
+4. 雙擊 `start.bat`。啟動前會檢查工具／DLL、模型、埠及目錄權限；瀏覽器等服務啟動後才開啟。
+5. 在主持機的 `http://127.0.0.1:<BREEZE_PORT>` 允許麥克風，開始聽。聽眾裝置與電腦連同一個 Wi-Fi，掃 QR 看字幕。
 
-- 分支：`fix/round2-continue`
-- 程式提交：`cb21186d35a50690b7f012f35b4423b88b7ff6d4`
-- 已快轉推上 `fix/field-ready-core`。程式本體在 `cb21186`。`97d0c77` 的 GitHub Actions（run `37261737041`）是 `34 passed in 7.05s` 與 `recorder machine ok`。`tests/room_client.test.mjs` 不在工作流程裡，CI 沒跑它。
-- 本文件寫於 2026-10-05。這台是 Linux 查核機，直譯器是倉庫 venv 的 CPython 3.11.17（`/root/breeze-live-room/.venv`），不是 Ryzen 5 5600H / 16GB / Windows 11 主持機。這裡沒有麥克風、Breeze 權重、whisper-cli、`whisper-cli.exe`、OpenAI 金鑰。
+錯誤時雙擊 `doctor.bat`。詳細步驟與 Microsoft 官方下載入口在 [安裝說明](docs/INSTALL.md)。
 
-## 已修
+## 中文與英譯
 
-以提交 `cb21186` 的程式為準。尚未合併，也不能當成 GitHub Actions 已通過：
+沒有 API 金鑰即可使用本機中文字幕。英譯需自行在 `.env` 填 `OPENAI_API_KEY`，中文辨識不改走雲端。安裝器不覆蓋既有 `.env` 或逐字稿。
 
-- 主持權杖只發給 loopback，而且 Host／Origin 要對上允許的 scheme、host 與確切埠。權杖不進 QR、聽眾網址、`/api/setup`。
-- `/api/push` 在解析表單前先做准入。同一段 single-flight。中文先廣播，英譯失敗只更新同一段。
-- RoomBus 依 `room_id` 分開。缺段會標 `missing` 或對聽眾回 gap。匿名 WebSocket 不開房。
-- `ResidentAsr` 的 ready 旗標不是推論。`.env` 不覆蓋已存在的行程環境。`start.bat` 與 `app.run` 共用 `BREEZE_PORT`。
+新安裝預設 `BREEZE_ASR=resident`；常駐服務必須回報模型真正就緒後才允許開始。失敗會提示，不會偷偷改成 CLI 模式。`BREEZE_ASR=cli` 仍可使用，但每段會重新載入模型。
 
-## 仍未完成
+新安裝以 SQLite 保存文字（`BREEZE_DATA_PATH=data/captions.sqlite3`），不保存錄音。既有配置保留原值。
 
-- 工作樹沒提交，CI 還看不到這輪差分。
-- 模型 SHA256 沒有在這裡計算，所以沒有釘選。
-- 預設仍是每次重開 whisper-cli。常駐模型「只載入一次」沒有實機證據。
-- 不是單一 exe／MSI。捷徑腳本沒在這裡執行。Windows DLL、防火牆、埠佔用、含中文或空白的路徑都沒驗證。
-- 標點只對以「嗎／呢」結尾且尚無句末符號的句子補問號，不是完整標點還原。
-- 預設字幕在記憶體。SQLite 要另設 `BREEZE_DATA_PATH`，沒有完整 migration，不存音檔。仍是單一 Uvicorn process。
-- 不能把 6–15 秒、RTF、p50／p95、RAM、CPU 或「模型已在實機只載入一次」寫成量測結果。這裡沒有這些數字。
+## 速度門檻
 
-## 自動測試已通過
+`verify.bat` 使用公開英文樣本執行兩次本機辨識，顯示即時率 RTF：辨識時間 ÷ 音訊時間。RTF 小於 1 才有可能承受持續語音，仍須以自己的中文語音及完整流程驗收。
 
-2026-10-05，Linux，倉庫 venv 的 CPython 3.11.17（`/root/breeze-live-room/.venv`），Node v26.3.1。工作樹、不是 GitHub Actions 結果。沒有下載模型，沒有付費金鑰。
+若兩段上傳／辨識都未完成，畫面會顯示「處理積壓，已暫停產生新錄音」。這段等待沒有新的錄音，請暫停說話；不要把這個降級行為當成無缺段的正式即時服務。上傳失敗也會顯示紀錄。
 
-- rebase 後的權威結果：`cd /root/breeze-live-room && .venv/bin/python -m pytest -q --tb=line` 印出 `34 passed in 14.78s`（exit 0）。
-- 同一批測試較早也通過：`34 passed in 11.49s`（rebase 前）、`32 passed`、`31 passed in 10.88s`、`31 passed in 10.24s`、`31 passed in 9.74s`。
-- socket `__aexit__` 與顯示順序（display-order）測試修正之前的乾淨複製是 `25 passed, 6 failed`，不能當成目前結果。
-- `node tests/recorder_machine.test.mjs` 印出 `recorder machine ok`；`node tests/room_client.test.mjs` 印出 `room client ok`。
+## 測試與限制
 
-CI 工作流程指定 Node 22，這台沒有用 Node 22 重跑。GitHub Actions 還沒在這個工作樹上跑。Copilot review 成功不等於測試通過。
+本輪 Linux／Python 3.12 已通過 44 項 Python 回歸及兩組 Node 測試；實際載入固定 Breeze q5 權重，以同一個常駐程序完成兩次辨識並關閉。
 
-## 實機驗證沒有通過
+這台 Linux 環境辨識 6 秒英文樣本約需 14.5～15 秒，不能承受該樣本的連續音訊。這不是 Ryzen 5 5600H／Windows 主持機的測量，也不是中文準確度測試。
 
-30 分鐘講話、2 小時連續跑、3 台手機，以及 Ryzen 5 5600H / 16GB / Windows 11 主持機上的檢查都沒有通過。具體阻塞：這台環境跑不了該測試。不要編 RTF 或延遲。阻塞清單在 `docs/TEST-REPORT.md`。
+Windows workflow 增加 Python 3.11／3.12、錄音與觀眾端測試，以及含中文／空白路徑的安裝與真實推論檢查。執行結果以該提交的 GitHub Actions 為準；不先宣稱通過。
 
-## 主持機紀錄（不是這次量測）
+目前未完成真實麥克風、30 分鐘中文、2 小時場次、3 台手機及真金鑰英譯驗收。瀏覽器整合在本輪環境受阻，Chromium 下載回傳無效檔案。正式使用門檻見 [驗收清單](docs/RELEASE-CHECKLIST.md)。
 
-2026-10-05 看過的主持機（DESKTOP-P8RGA3A，暫時用）：
-
-- AMD Ryzen 5 5600H with Radeon Graphics，3.30 GHz
-- 記憶體 16GB（可用 15.4GB），3200 MT/s
-- 顯示卡是 AMD Radeon 內顯，Windows 寫 496 MB，沒有 NVIDIA
-- 碟 477GB，當時已用 255GB
-- Windows 11 Pro 25H2
-
-結論：規格上能跑 q5，不能走 CUDA。延遲沒有在這台查核機上量過。這段只是看過的規格，不是實機驗證通過。
-
-## 安裝
-
-步驟、埠與模型網址見 `docs/INSTALL.md`。權重不進 Git。沒有可分享的區網位址時不發 QR，也不改成 localhost。
-
-## 現在沒做到的
-
-- 不是單一 exe／MSI，是 `install.bat` 加尚未在此執行的桌面捷徑腳本。
-- 沒有 Qwen realtime 一條長連線，也沒有設定頁切換聽寫引擎。
-- 熱詞只是 `initial_prompt` 偏置，不保證鎖詞。譯文用詞放翻譯層。
-
-完整說明見 `docs/SPEC.md`。
+本版未包含前次提出的全部 10 個追加面向；那些是後續功能工作包。
