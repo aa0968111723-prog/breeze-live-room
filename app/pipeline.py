@@ -21,6 +21,7 @@ class Segment:
     status: str = "queued"
     translate_status: str = ""
     error: str = ""
+    version: int = 1
     received_at: float = field(default_factory=time.time)
 
     @property
@@ -38,6 +39,7 @@ class Segment:
             "room_id": self.room_id,
             "session_id": self.session_id,
             "seq": self.seq,
+            "version": self.version,
             "zh": self.zh,
             "en": self.en,
             "status": self.status,
@@ -55,66 +57,78 @@ class Pipeline:
         self.tmp.mkdir(parents=True, exist_ok=True)
         self._lock = asyncio.Lock()
         self.results: dict[tuple[str, str, int], Segment] = {}
-        self.broadcasts: list[dict] = []
+        self.events: list[dict] = []
+        self.broadcasts = self.events
         self._held: dict[tuple[str, str], dict[int, Segment]] = {}
         self._next: dict[tuple[str, str], int] = {}
         self._emitted: set[tuple[str, str, int]] = set()
+        self.inflight = 0
 
     def get(self, room_id: str, session_id: str, seq: int) -> Segment | None:
         return self.results.get((room_id, session_id, seq))
 
+    def try_admit(self, limit: int) -> bool:
+        if self.inflight >= limit:
+            return False
+        self.inflight += 1
+        return True
+
+    def release_admit(self) -> None:
+        self.inflight = max(0, self.inflight - 1)
+
     async def submit(self, segment: Segment, audio: bytes, decoder) -> Segment:
         existing = self.results.get(segment.key)
-        if existing and existing.status in {"ready", "translate_failed", "zh_ready", "error"}:
+        if existing and existing.status in {"ready", "translate_failed", "zh_ready", "error", "missing"}:
             return existing
-        async with self._lock:
-            existing = self.results.get(segment.key)
-            if existing and existing.status in {"ready", "translate_failed", "zh_ready", "error"}:
-                return existing
-            work = self.tmp / uuid.uuid4().hex
-            work.mkdir(parents=True, exist_ok=True)
+        work = self.tmp / uuid.uuid4().hex
+        work.mkdir(parents=True, exist_ok=True)
+        try:
+            src = work / "in.bin"
+            src.write_bytes(audio)
             try:
-                src = work / "in.bin"
-                src.write_bytes(audio)
-                wav = decoder(src, work)
-                asr: AsrResult = await asyncio.to_thread(self.asr.transcribe, wav, self.prompt)
-                if not asr.ok:
-                    segment.status = "error"
-                    segment.error = asr.error or "辨識失敗"
-                    self.results[segment.key] = segment
-                    self._release(segment)
-                    return segment
-                segment.zh = asr.text.strip()
-                if not segment.zh:
-                    segment.status = "error"
-                    segment.error = "這段沒聽到話"
-                    self.results[segment.key] = segment
-                    self._release(segment)
-                    return segment
-                segment.status = "zh_ready"
+                wav = await asyncio.to_thread(decoder, src, work)
+            except Exception as exc:
+                segment.status = "error"
+                segment.error = str(exc)[:180] or "解碼失敗"
                 self.results[segment.key] = segment
                 self._release(segment)
-                try:
-                    translated: TranslateResult = await asyncio.to_thread(self.translator.translate, segment.zh)
-                except Exception:
-                    segment.en = ""
-                    segment.translate_status = "error"
-                    segment.error = "英譯失敗，中文仍保留"
-                    segment.status = "translate_failed"
-                    self.results[segment.key] = segment
-                    self._update(segment)
-                    return segment
+                return segment
+            async with self._lock:
+                asr: AsrResult = await asyncio.to_thread(self.asr.transcribe, wav, self.prompt)
+            if not asr.ok or not (asr.text or "").strip():
+                segment.status = "error"
+                segment.error = asr.error or "這段沒聽到話"
+                self.results[segment.key] = segment
+                self._release(segment)
+                return segment
+            segment.zh = asr.text.strip()
+            segment.status = "zh_ready"
+            segment.version = 1
+            self.results[segment.key] = segment
+            self._release(segment)
+            try:
+                translated: TranslateResult = await asyncio.to_thread(self.translator.translate, segment.zh)
                 segment.en = translated.text
                 segment.translate_status = translated.status
                 segment.error = translated.detail
-                segment.status = "ready" if translated.status == "ok" else "translate_failed"
-                if translated.status in {"off", "no_key"}:
-                    segment.status = "ready"
-                self.results[segment.key] = segment
-                self._update(segment)
-                return segment
-            finally:
-                shutil.rmtree(work, ignore_errors=True)
+                segment.status = "ready" if translated.status in {"ok", "off", "no_key"} else "translate_failed"
+            except Exception:
+                segment.en = ""
+                segment.translate_status = "error"
+                segment.error = "英譯失敗，中文仍保留"
+                segment.status = "translate_failed"
+            segment.version = 2
+            self.results[segment.key] = segment
+            self._update(segment)
+            return segment
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def mark_missing(self, room_id: str, session_id: str, seq: int, reason: str) -> Segment:
+        segment = Segment(room_id=room_id, session_id=session_id, seq=seq, status="missing", error=reason)
+        self.results[segment.key] = segment
+        self._release(segment)
+        return segment
 
     def _release(self, segment: Segment) -> None:
         group = (segment.room_id, segment.session_id)
@@ -123,15 +137,13 @@ class Pipeline:
         nxt = self._next.get(group, 1)
         while nxt in held:
             item = held.pop(nxt)
-            if item.status in {"zh_ready", "ready", "translate_failed", "error"}:
-                self.broadcasts.append(item.public())
-                self._emitted.add((group[0], group[1], nxt))
+            self.events.append(item.public())
+            self._emitted.add((group[0], group[1], nxt))
             nxt += 1
             self._next[group] = nxt
 
     def _update(self, segment: Segment) -> None:
-        group = (segment.room_id, segment.session_id)
         if (segment.room_id, segment.session_id, segment.seq) in self._emitted:
-            self.broadcasts.append(segment.public())
+            self.events.append(segment.public())
             return
-        self._held.setdefault(group, {})[segment.seq] = segment
+        self._held.setdefault((segment.room_id, segment.session_id), {})[segment.seq] = segment
