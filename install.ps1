@@ -7,6 +7,12 @@ $env:TMP = $env:TEMP
 New-Item -ItemType Directory -Force $env:TEMP | Out-Null
 $env:SSLKEYLOGFILE = $null
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+function Get-BreezeSha256([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($hash.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+    finally { $stream.Dispose(); $hash.Dispose() }
+}
 try {
     if (-not [Environment]::Is64BitOperatingSystem -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
         throw 'Windows x64 Intel/AMD is required.'
@@ -20,15 +26,16 @@ try {
         New-Item -ItemType Directory -Force $cache | Out-Null
         $archive = Join-Path $cache ('python-' + $asset.version + '.zip')
         Write-Host 'Preparing private Python runtime...'
-        if (-not (Test-Path -LiteralPath $archive) -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $asset.sha256) {
+        if (-not (Test-Path -LiteralPath $archive) -or (Get-BreezeSha256 $archive) -ne $asset.sha256) {
             Invoke-WebRequest -UseBasicParsing -Uri $asset.url -OutFile ($archive + '.part')
-            if ((Get-FileHash -LiteralPath ($archive + '.part') -Algorithm SHA256).Hash -ne $asset.sha256) {
+            if ((Get-BreezeSha256 ($archive + '.part')) -ne $asset.sha256) {
                 throw 'Python download checksum mismatch. Run install again.'
             }
             Move-Item -LiteralPath ($archive + '.part') -Destination $archive -Force
         }
         $stage = Join-Path $cache ('python-stage-' + [Guid]::NewGuid().ToString('N'))
-        Expand-Archive -LiteralPath $archive -DestinationPath $stage
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [IO.Compression.ZipFile]::ExtractToDirectory($archive, $stage)
         New-Item -ItemType Directory -Force (Split-Path $pythonRoot) | Out-Null
         Move-Item -LiteralPath $stage -Destination $pythonRoot
     }

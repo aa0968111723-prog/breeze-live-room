@@ -63,7 +63,7 @@ def test_rollback_preserves_settings_and_captions_and_restores_model(tmp_path):
     temporary.write_bytes(b'new-model')
     temporary.replace(root / 'models/model.bin')
     restore(root, backup)
-    assert (root / 'VERSION').read_text().strip() == '0.2.0'
+    assert (root / 'VERSION').read_text().strip() == (ROOT / 'VERSION').read_text().strip()
     assert (root / 'models/model.bin').read_bytes() == b'original-model'
     assert (root / '.env').read_text() == 'private-settings'
     assert (root / 'data/captions.sqlite3').read_bytes() == b'user-captions'
@@ -87,6 +87,6 @@ def test_failed_update_restores_source_environment_and_user_data(tmp_path, monke
             raise RuntimeError('injected installation failure')
     with pytest.raises(RuntimeError, match='injected'):
         apply(root, stage, run=runner)
-    assert (root / 'VERSION').read_text().strip() == '0.2.0'
+    assert (root / 'VERSION').read_text().strip() == (ROOT / 'VERSION').read_text().strip()
     assert (root / '.venv/old').read_text() == 'old-environment'
     assert (root / '.env').read_text() == 'keep-settings'
