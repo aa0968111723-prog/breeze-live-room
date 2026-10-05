@@ -1,0 +1,10 @@
+models/
+tools/
+.env
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.gguf
+*.bin
