@@ -76,6 +76,7 @@ const phaseLabels = {
   idle: "待命",
   preparing: "準備麥克風",
   recording: "聽講中",
+  waiting: "處理積壓，已暫停產生新錄音；此時說話不會加入字幕",
   draining: "送出尾段",
   error: "收音中斷",
 };
@@ -122,11 +123,12 @@ async function setup() {
   if (!data.whisper) missing.push("whisper-cli.exe");
   if (!data.model) missing.push("Breeze 模型");
   if (!data.ffmpeg) missing.push("ffmpeg");
+  if (data.asr_ready === false) missing.push(data.resident_error || "辨識服務尚未就緒");
   ready = missing.length === 0;
   status.className = missing.length ? "warn" : "";
   status.textContent = missing.length
     ? ("還缺：" + missing.join("、") + "。不會改走雲端辨識。")
-    : (data.translate_label + "。模型模式：" + data.asr_mode + (data.model_reloads_each_segment ? "，每段會重新載入。" : "，常駐已載入。"));
+    : (data.translate_label + "。模型模式：" + data.asr_mode + (data.model_reloads_each_segment ? "，每段會重新載入。" : "，常駐服務已就緒。"));
   go.disabled = !ready || !token || !ctl.canEditRoom();
 }
 async function refreshMetrics() {
@@ -144,6 +146,11 @@ const ctl = createCaptureController({
   roomId: () => roomEl.value || "class",
   newId: () => crypto.randomUUID().replace(/-/g, "").slice(0, 16),
   openMic: () => navigator.mediaDevices.getUserMedia({ audio: deviceId() }),
+  onUploadError: (meta, err) => {
+    line("第 " + meta.seq + " 段上傳未確認完成：" + (err?.message || "網路錯誤") + "；請檢查連線與字幕。停止後可匯出已接收內容。");
+    status.className = "warn";
+    status.textContent = "有字幕段上傳未確認完成，請檢查下方紀錄。";
+  },
   createRecorder: (stream) => {
     const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
     return new MediaRecorder(stream, { mimeType: mime });
@@ -162,11 +169,18 @@ const ctl = createCaptureController({
       return body;
     }
     async function post(retryFlag) {
-      return fetch(address, {
-        method: "POST",
-        body: formFor(retryFlag),
-        headers: { authorization: "Bearer " + token, ...(retryFlag ? { "x-breeze-retry": "1" } : {}) },
-      });
+      const abort = new AbortController();
+      const timeout = setTimeout(() => abort.abort(), 300000);
+      try {
+        return await fetch(address, {
+          method: "POST",
+          body: formFor(retryFlag),
+          signal: abort.signal,
+          headers: { authorization: "Bearer " + token, ...(retryFlag ? { "x-breeze-retry": "1" } : {}) },
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
     }
     let resp = await post(false);
     let data = await resp.json();

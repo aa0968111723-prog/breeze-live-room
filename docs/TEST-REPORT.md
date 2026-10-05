@@ -1,3 +1,24 @@
+# 本輪安裝驗收候選版測試紀錄（2026-10-05）
+
+基於 fix/field-ready-core@1f4732e。以下結果是本輪親自執行，不是主持機的實測。
+
+- Linux、CPython 3.12.14：原版 34 passed in 6.68s；修改後 44 passed in 7.04s。node recorder machine 與 room client 均 exit 0。
+- 實際下載並核對固定 Breeze q5 SHA256 與 whisper.cpp v1.9.2 Linux 套件。
+- 使用 upstream 公開英文 JFK 音訊前 6 秒，常駐載入約 0.507 秒；兩次推論約 14.467／14.974 秒，均回傳非空文字、同一 PID、最後關閉。這不是中文準確度與 Windows 主持機結果。
+- 此測試 RTF 約 2.41／2.50，未通過此環境的連續即時容量門檻。
+- 實際核對 Windows whisper ZIP 的 SHA256，確認 whisper-cli、whisper-server 與 ggml／whisper DLL 都在套件中；PE 匯入顯示需要 Microsoft Visual C++ runtime。
+- 新 workflow 的 Windows / Python 3.11／3.12、含中文／空白路徑安裝與真實推論，結果需以對應提交的 Actions 為準。
+- Chromium 整合環境受阻：下載回傳非有效 ZIP，未宣稱真實瀏覽器錄音整合通過。
+- 尚無主持機真實麥克風、30 分鐘中文、2 小時場次、3 台手機、真金鑰英譯的通過證據。
+
+- 實測速度選項：同一段英文樣本，greedy／audio context=0 為 14.050 秒，context=512 為 4.491 秒；文字不同。預設未變，中文品質與 Windows 速度仍需重新驗收。
+
+- 透過交付的 verify_runtime.py 重測速度選項（context=512、beam=1、best_of=1）：5.218／6.039 秒，RTF 0.870／1.006；第二次仍未達即時容量門檻，不能只採用最快一次的數字。
+
+下方是歷史查核紀錄，不代表本輪提交的現況。
+
+---
+
 # 測試紀錄
 
 日期：2026-10-05。機器：Linux 查核環境，不是 Ryzen 5 5600H / 16GB / Windows 11 主持機。沒有麥克風、Breeze 權重、`whisper-cli.exe`、OpenAI 金鑰。

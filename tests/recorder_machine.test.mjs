@@ -204,6 +204,7 @@ await boom.stop();
 assert.equal(boom.state, "idle");
 assert.equal(boom.canEditRoom(), true);
 assert.equal(boom.uploads.length, 0);
+assert.equal(boom.lastError, "上傳失敗");
 
 const flagged = [];
 const flaggedRecs = [];
@@ -273,6 +274,7 @@ try {
   assert.deepEqual(capped.map((item) => item.meta.seq), [1, 2]);
   await new Promise((resolve) => setTimeout(resolve, 40));
   assert.equal(capped.length, 2, "滿載時不能再塞第三段上傳");
+  assert.equal(cappedCtl.state, "waiting", "不能把沒有錄音器的等待顯示為正常錄音");
   assert.ok(cappedCtl.inflight <= 2);
   assert.ok(cappedRecs.filter((rec) => rec.state === "recording").length <= 1);
   assert.equal(cappedCtl.canEditRoom(), false);
@@ -283,6 +285,9 @@ try {
   await stopping;
 }
 assert.equal(cappedCtl.state, "idle");
+assert.ok(cappedCtl.gaps.length >= 1);
+assert.equal(cappedCtl.gaps[0].reason, "backpressure");
+assert.ok(cappedCtl.gaps[0].t1_ms >= cappedCtl.gaps[0].t0_ms);
 
 const failedStream = fakeStream();
 let failedRelease;
