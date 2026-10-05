@@ -3,41 +3,107 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>聽眾字幕</title>
+<title>禪譯聽眾</title>
 <style>
-body{margin:0;background:#111;color:#fff;font-family:sans-serif}
-.en{font-size:34px;padding:24px 20px 8px;line-height:1.35}
-.zh{font-size:18px;color:#c8c8c8;padding:0 20px 28px}
-small{display:block;color:#aaa;padding:12px 20px}
-button{margin:0 20px 20px;font-size:16px;padding:8px 12px}
+:root { --bg: #fbf6ee; --fg: #2a2118; --muted: #6b5644; --line: rgba(90, 60, 30, .2); --size: 34px; }
+body { margin: 0; background: var(--bg); color: var(--fg); font-family: "Segoe UI", "PingFang TC", sans-serif; }
+body.dark { --bg: #16130f; --fg: #f6f1e7; --muted: #d9d0c3; --line: rgba(255, 255, 255, .16); }
+body.zh-only .en, body.en-only .zh { display: none; }
+.en { font-size: var(--size); padding: 24px 20px 8px; line-height: 1.35; }
+.zh { font-size: calc(var(--size) * .62); color: var(--muted); padding: 0 20px 20px; line-height: 1.45; }
+header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 12px 16px; }
+button, select { font-size: 16px; min-height: 44px; padding: 8px 12px; border-radius: 10px; border: 0; background: #8a5424; color: white; }
+#state { color: var(--muted); }
+ul { list-style: none; margin: 0; padding: 0 16px 24px; max-height: 40vh; overflow: auto; }
+li { padding: 8px 0; border-top: 1px solid var(--line); }
+#hist-label { margin: 0 16px; color: var(--muted); }
 </style>
 </head>
 <body>
-<small id="state">連線中…</small>
+<header>
+<span id="state">連線中…</span>
+<button id="retry" type="button">重新連線</button>
+<button id="theme" type="button">暗色</button>
+<button id="full" type="button">全螢幕</button>
+<label>顯示 <select id="mode"><option value="both">中英</option><option value="zh">中文</option><option value="en">英文</option></select></label>
+<label>字級 <select id="size"><option value="28">小</option><option value="34" selected>中</option><option value="46">大</option></select></label>
+<label><input id="pause" type="checkbox"> 暫停跟隨</label>
+<button id="live" type="button">回到即時</button>
+</header>
 <div class="en" id="en">等待主持端</div>
 <div class="zh" id="zh"></div>
-<button id="retry" type="button">重新連線</button>
+<p id="hist-label">最近字幕</p>
+<ul id="history"></ul>
 <script type="module">
-import { connectRoom } from "/static/room_client.js";
+import { connectRoom, liveTail, orderedCaptions } from "/static/room_client.js";
 const room = location.pathname.split("/").filter(Boolean).pop();
 const items = new Map();
-function show(item) {
-  if (!item || item.seq == null) return;
-  items.set(item.id, item);
-  const latest = [...items.values()].sort((a, b) => a.seq - b.seq).at(-1);
-  document.querySelector("#en").textContent = latest.en || latest.zh || "";
-  document.querySelector("#zh").textContent = latest.en ? latest.zh : "";
+const state = { follow: true, pinned: null };
+const en = document.querySelector("#en");
+const zh = document.querySelector("#zh");
+const history = document.querySelector("#history");
+function render() {
+  const item = liveTail(items, state.follow, state.pinned);
+  const failed = item && (item.status === "missing" || item.status === "error" || item.status === "timeout" || item.status === "cancelled");
+  en.textContent = !item ? "等待主持端" : (failed ? (item.error || "這段沒有字幕") : (item.en || ""));
+  zh.textContent = item ? (item.zh || "") : "";
+  history.textContent = "";
+  const rows = orderedCaptions(items).slice(-12);
+  for (const row of rows) {
+    const li = document.createElement("li");
+    const zh = row.zh || row.error || "";
+    li.textContent = row.en ? zh + "　" + row.en : zh;
+    history.appendChild(li);
+  }
 }
-connectRoom({
-  room,
-  url: () => {
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    return proto + "://" + location.host + "/ws/listen?room_id=" + encodeURIComponent(room);
-  },
-  onState: (text) => { document.querySelector("#state").textContent = text; },
-  onEvent: show,
-});
-document.querySelector("#retry").onclick = () => location.reload();
+function show(item) {
+  if (!item || item.seq == null || !item.id) return;
+  const prev = items.get(item.id);
+  if (prev && (prev.version || 1) >= (Number(item.version) || 1)) return;
+  items.set(item.id, item);
+  while (items.size > 80) items.delete(items.keys().next().value);
+  render();
+}
+let conn = connect();
+function connect() {
+  return connectRoom({
+    room,
+    url: () => {
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      return proto + "://" + location.host + "/ws/listen?room_id=" + encodeURIComponent(room);
+    },
+    onState: (text) => { document.querySelector("#state").textContent = text; },
+    onEvent: show,
+    onGap: () => { document.querySelector("#state").textContent = "補償窗口不足，只補到伺服器還留著的字幕"; },
+  });
+}
+document.querySelector("#retry").onclick = () => { conn.stop(); conn = connect(); conn.nudge(); };
+document.querySelector("#theme").onclick = () => {
+  document.body.classList.toggle("dark");
+  document.querySelector("#theme").textContent = document.body.classList.contains("dark") ? "亮色" : "暗色";
+};
+document.querySelector("#full").onclick = () => {
+  if (!document.fullscreenElement) document.documentElement.requestFullscreen();
+  else document.exitFullscreen();
+};
+document.querySelector("#mode").onchange = (ev) => {
+  document.body.classList.remove("zh-only", "en-only");
+  if (ev.target.value === "zh") document.body.classList.add("zh-only");
+  if (ev.target.value === "en") document.body.classList.add("en-only");
+};
+document.querySelector("#size").onchange = (ev) => { document.documentElement.style.setProperty("--size", ev.target.value + "px"); };
+document.querySelector("#pause").onchange = (ev) => {
+  state.follow = !ev.target.checked;
+  if (!state.follow) state.pinned = liveTail(items, true) && liveTail(items, true).id;
+  render();
+};
+document.querySelector("#live").onclick = () => {
+  state.follow = true;
+  state.pinned = null;
+  document.querySelector("#pause").checked = false;
+  render();
+};
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") conn.nudge(); });
 </script>
 </body>
 </html>

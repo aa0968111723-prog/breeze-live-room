@@ -1,18 +1,35 @@
 export function createCaptureController(deps) {
   let state = "idle";
   let session = null;
+  let pendingRoom = "";
   let seq = 0;
   let timer = null;
   let recorder = null;
   let stream = null;
   let stopRequested = false;
+  let generation = 0;
+  let lastError = "";
   const released = { tracks: 0, timers: 0, recorders: 0 };
   const uploads = [];
+  const inflight = new Set();
+  const maxInflight = deps.maxInflight || 2;
+
+  function setState(next) {
+    state = next;
+    if (typeof deps.onPhase === "function") {
+      try { deps.onPhase(next); } catch { /* host paint */ }
+    }
+  }
+
+  function closeStream(target) {
+    if (!target) return;
+    const tracks = target.getTracks();
+    for (const track of tracks) track.stop();
+    released.tracks += tracks.length;
+  }
 
   function releaseStream() {
-    if (!stream) return;
-    for (const track of stream.getTracks()) track.stop();
-    released.tracks += stream.getTracks().length;
+    closeStream(stream);
     stream = null;
   }
 
@@ -23,26 +40,109 @@ export function createCaptureController(deps) {
     released.timers += 1;
   }
 
-  function stopRecorder() {
-    if (!recorder || recorder.state === "inactive") return Promise.resolve();
+  function stopRecorder(rec) {
+    if (!rec || rec.state === "inactive") return Promise.resolve(null);
+    released.recorders += 1;
     return new Promise((resolve) => {
-      const done = () => resolve();
-      recorder.addEventListener("stop", done, { once: true });
-      recorder.stop();
-      released.recorders += 1;
+      let settled = false;
+      const finish = (blob) => {
+        if (settled) return;
+        settled = true;
+        resolve(blob || null);
+      };
+      try {
+        rec.addEventListener("dataavailable", (ev) => {
+          finish(ev && ev.data ? ev.data : null);
+        }, { once: true });
+      } catch {
+        finish(null);
+        return;
+      }
+      try {
+        rec.stop();
+      } catch {
+        finish(null);
+      }
     });
   }
 
-  async function beginSegment() {
+  function trackUpload(meta, blob) {
+    if (!blob || typeof blob.size !== "number" || blob.size <= 0) return Promise.resolve();
+    const job = Promise.resolve()
+      .then(() => deps.upload(meta, blob))
+      .then((result) => {
+        uploads.push({ meta, bytes: blob.size, result });
+        if (uploads.length > 200) uploads.shift();
+      }, () => {});
+    inflight.add(job);
+    return job.finally(() => inflight.delete(job));
+  }
+
+  async function settleUploads() {
+    while (inflight.size) {
+      await Promise.allSettled([...inflight]);
+    }
+  }
+
+  function finishCurrent() {
+    const current = recorder;
+    const meta = current && current._meta;
+    const activeSession = session;
+    recorder = null;
+    if (!current) return Promise.resolve();
+    const job = (async () => {
+      const blob = await stopRecorder(current);
+      if (!meta || !activeSession || !blob || typeof blob.size !== "number" || blob.size <= 0) return;
+      const t1 = Date.now() - activeSession.startedAt;
+      await trackUpload({ ...meta, t1_ms: t1 }, blob);
+    })();
+    inflight.add(job);
+    return job.finally(() => inflight.delete(job));
+  }
+
+  async function beginSegment(my) {
+    if (my !== generation || !stream || !session) return;
+    while (inflight.size >= maxInflight && my === generation && !stopRequested) {
+      await Promise.race([...inflight]);
+    }
+    if (my !== generation || stopRequested || state !== "recording") return;
+    const started = Date.now();
+    const meta = {
+      sessionId: session.id,
+      roomId: session.roomId,
+      seq: seq + 1,
+      t0_ms: started - session.startedAt,
+    };
     recorder = deps.createRecorder(stream);
-    const current = { sessionId: session.id, roomId: session.roomId, seq: seq + 1 };
-    recorder.addEventListener("dataavailable", (ev) => {
-      if (!ev.data || ev.data.complete === false) return;
-      uploads.push(current);
-      deps.upload(current, ev.data);
-    });
+    recorder._meta = meta;
     recorder.start();
-    seq = current.seq;
+    seq = meta.seq;
+    if (typeof recorder.addEventListener === "function") {
+      recorder.addEventListener("error", () => {
+        if (my === generation && state === "recording") fail("錄音器發生錯誤");
+      }, { once: true });
+    }
+  }
+
+  function armTimer(my) {
+    clearTimer();
+    timer = setInterval(() => {
+      if (stopRequested || state !== "recording" || my !== generation) return;
+      finishCurrent().then(() => {
+        if (stopRequested || state !== "recording" || my !== generation) return;
+        return beginSegment(my);
+      });
+    }, deps.periodMs || 6000);
+  }
+
+  function fail(reason) {
+    generation += 1;
+    stopRequested = true;
+    lastError = reason || "錄音中斷";
+    clearTimer();
+    finishCurrent();
+    releaseStream();
+    setState("error");
   }
 
   return {
@@ -50,41 +150,64 @@ export function createCaptureController(deps) {
     get released() { return released; },
     get uploads() { return uploads; },
     get session() { return session; },
+    get pendingRoom() { return pendingRoom; },
+    get lastError() { return lastError; },
+    get inflight() { return inflight.size; },
+    canEditRoom() { return state === "idle" || state === "error"; },
+    fail,
     async start() {
       if (state === "preparing" || state === "recording" || state === "draining") {
         throw new Error("已經在聽，請先停止");
       }
-      state = "preparing";
+      const my = ++generation;
+      const pinnedRoom = String(deps.roomId() || "class");
+      const pinnedId = deps.newId();
+      pendingRoom = pinnedRoom;
+      setState("preparing");
       stopRequested = false;
+      lastError = "";
+      let mic = null;
       try {
-        stream = await deps.openMic();
-        session = { id: deps.newId(), roomId: deps.roomId() };
-        seq = 0;
-        state = "recording";
-        await beginSegment();
-        timer = setInterval(() => {
-          if (stopRequested || state !== "recording") return;
-          stopRecorder().then(async () => {
-            if (stopRequested || state !== "recording") return;
-            await beginSegment();
-          });
-        }, deps.periodMs || 6000);
+        mic = await deps.openMic();
       } catch (err) {
-        clearTimer();
+        if (my !== generation) return;
         releaseStream();
-        state = "error";
+        lastError = err && err.message ? err.message : "無法開始聽";
+        setState("error");
         throw err;
       }
+      if (my !== generation || stopRequested) {
+        closeStream(mic);
+        return;
+      }
+      stream = mic;
+      for (const track of stream.getTracks()) {
+        track.addEventListener?.("ended", () => {
+          if (my === generation && state === "recording") fail("麥克風中斷或被拔除");
+        });
+      }
+      session = { id: pinnedId, roomId: pinnedRoom, startedAt: Date.now() };
+      seq = 0;
+      setState("recording");
+      await beginSegment(my);
+      if (my !== generation || stopRequested || state !== "recording") return;
+      armTimer(my);
     },
     async stop() {
-      if (state !== "recording" && state !== "preparing") return;
-      state = "draining";
+      if (state !== "recording" && state !== "preparing" && state !== "draining") return;
+      const my = generation;
+      generation += 1;
       stopRequested = true;
+      setState("draining");
       clearTimer();
-      await stopRecorder();
-      releaseStream();
-      recorder = null;
-      state = "idle";
+      try {
+        await finishCurrent();
+        releaseStream();
+        recorder = null;
+        await settleUploads();
+      } finally {
+        if (state === "draining" && generation === my + 1) setState("idle");
+      }
     },
   };
 }

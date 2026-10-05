@@ -67,7 +67,7 @@ async def test_push_requires_host_and_hides_token(monkeypatch):
     monkeypatch.setattr(share, "lan_ip", lambda: None)
     app = make_app()
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8780") as client:
         denied = await client.post("/api/push", data={"room_id": "class", "session_id": "s", "seq": "1"}, files={"audio": ("a.webm", b"1234", "audio/webm")})
         assert denied.status_code == 401
         setup = await client.get("/api/setup", params={"room_id": "class"})
@@ -84,7 +84,7 @@ async def test_translate_failure_keeps_chinese():
     asr = FakeAsr()
     app = make_app(asr=asr, translator=BoomTranslator(enabled=True, key="secret"))
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8780") as client:
         token = await token_of(app, client)
         resp = await client.post(
             "/api/push",
@@ -105,7 +105,7 @@ async def test_retry_does_not_transcribe_twice():
     asr = FakeAsr()
     app = make_app(asr=asr)
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8780") as client:
         token = await token_of(app, client)
         headers = auth(token)
         first = await client.post("/api/push", data={"room_id": "class", "session_id": "s", "seq": "1"}, files={"audio": ("a.webm", b"1", "audio/webm")}, headers=headers)
@@ -119,7 +119,7 @@ async def test_out_of_order_asr_still_broadcasts_by_seq():
     asr = FakeAsr(delay_for={"1": 0.2})
     app = make_app(asr=asr)
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8780") as client:
         token = await token_of(app, client)
         headers = auth(token)
 
@@ -146,7 +146,7 @@ async def test_out_of_order_asr_still_broadcasts_by_seq():
 async def test_room_id_not_truncated_and_invalid_rejected():
     app = make_app()
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8780") as client:
         token = await token_of(app, client)
         long_a = "a" * 40
         long_b = "a" * 32 + "b" * 8
@@ -163,7 +163,7 @@ async def test_room_id_not_truncated_and_invalid_rejected():
 async def test_oversize_rejected():
     app = make_app()
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8780") as client:
         token = await token_of(app, client)
         resp = await client.post(
             "/api/push",
