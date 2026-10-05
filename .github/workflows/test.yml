@@ -14,5 +14,5 @@ jobs:
         with:
           node-version: "22"
       - run: pip install -r requirements.txt -r requirements-dev.txt
-      - run: pytest
+      - run: python -m pytest
       - run: node tests/recorder_machine.test.mjs

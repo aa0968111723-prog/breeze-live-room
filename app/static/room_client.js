@@ -1,9 +1,19 @@
 export function connectRoom({ room, url, onState, onEvent, openSocket, sleep }) {
-  let lastSeq = 0;
+  const versions = new Map();
   let attempt = 0;
   let stopped = false;
+  let socket = null;
   const wait = sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const opener = openSocket || ((address) => new WebSocket(address));
+
+  function take(item) {
+    if (!item || !item.id) return;
+    const version = item.version || (item.en ? 2 : 1);
+    const key = item.session_id + ":" + item.id;
+    if ((versions.get(key) || 0) >= version) return;
+    versions.set(key, version);
+    onEvent(item);
+  }
 
   async function loop() {
     while (!stopped && attempt < 8) {
@@ -17,28 +27,18 @@ export function connectRoom({ room, url, onState, onEvent, openSocket, sleep }) 
         await wait(Math.min(8000, 400 * 2 ** attempt));
         continue;
       }
+      socket = ws;
       await new Promise((resolve) => {
-        ws.onopen = () => {
-          attempt = 0;
-          onState("已連上 " + room);
-        };
+        ws.onopen = () => { attempt = 0; onState("已連上 " + room); };
         ws.onmessage = (ev) => {
           const data = JSON.parse(ev.data);
-          const history = data.history || [];
-          for (const item of history) {
-            if (item.seq > lastSeq) {
-              lastSeq = item.seq;
-              onEvent(item);
-            }
-          }
-          if (data.seq && data.seq >= lastSeq) {
-            lastSeq = data.seq;
-            onEvent(data);
-          }
+          for (const item of data.history || []) take(item);
+          if (data.id) take(data);
         };
         ws.onclose = () => resolve();
         ws.onerror = () => ws.close();
       });
+      socket = null;
       if (stopped) return;
       attempt += 1;
       onState("斷線，正在重連");
@@ -48,5 +48,5 @@ export function connectRoom({ room, url, onState, onEvent, openSocket, sleep }) 
   }
 
   loop();
-  return { stop() { stopped = true; } };
+  return { stop() { stopped = true; if (socket) socket.close(); } };
 }
