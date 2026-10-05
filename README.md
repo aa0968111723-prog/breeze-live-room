@@ -20,7 +20,7 @@
 
 新安裝預設 `BREEZE_ASR=resident`；常駐服務必須回報模型真正就緒後才允許開始。失敗會提示，不會偷偷改成 CLI 模式。`BREEZE_ASR=cli` 仍可使用，但每段會重新載入模型。
 
-新安裝以 SQLite 保存文字（`BREEZE_DATA_PATH=data/captions.sqlite3`），不保存錄音。既有配置保留原值。
+新安裝以 SQLite 保存文字（`BREEZE_DATA_PATH=data/captions.sqlite3`），不保存錄音。啟用儲存後，匯出讀取資料庫中保存期限內的完整內容，重開服務後仍可匯出，不只最近 200 段。預設保留 24 小時，重要場次請及時匯出；可用 `BREEZE_CAPTION_TTL` 調整秒數。既有配置保留原值，未啟用儲存時只有近期字幕。
 
 ## 速度門檻
 

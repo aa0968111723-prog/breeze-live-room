@@ -125,10 +125,10 @@ async function setup() {
   if (!data.ffmpeg) missing.push("ffmpeg");
   if (data.asr_ready === false) missing.push(data.resident_error || "辨識服務尚未就緒");
   ready = missing.length === 0;
-  status.className = missing.length ? "warn" : "";
+  status.className = missing.length || !data.storage ? "warn" : "";
   status.textContent = missing.length
     ? ("還缺：" + missing.join("、") + "。不會改走雲端辨識。")
-    : (data.translate_label + "。模型模式：" + data.asr_mode + (data.model_reloads_each_segment ? "，每段會重新載入。" : "，常駐服務已就緒。"));
+    : (data.translate_label + "。模型模式：" + data.asr_mode + (data.model_reloads_each_segment ? "，每段會重新載入。" : "，常駐服務已就緒。") + (data.storage ? "逐字稿已啟用儲存，可匯出保存期限內的完整內容。" : "逐字稿未啟用儲存；重開服務會清空，只可匯出近期字幕。"));
   go.disabled = !ready || !token || !ctl.canEditRoom();
 }
 async function refreshMetrics() {

@@ -1,6 +1,6 @@
 # Windows 安裝與操作
 
-這個候選版基於 `fix/field-ready-core@1f4732e`；請使用含有 `verify.bat`、`doctor.bat` 與 `runtime-manifest.json` 的分支。
+這個候選版基於 `fix/field-ready-core@1f4732e`。請從 [候選版分支](https://github.com/aa0968111723-prog/breeze-live-room/tree/codex/windows-readiness-20261005) 選 Code → Download ZIP，再解壓縮。修正在 [PR #2](https://github.com/aa0968111723-prog/breeze-live-room/pull/2)，尚未合併到 main。
 
 ## 先準備兩個基礎元件
 
@@ -33,6 +33,14 @@
 Windows 防火牆需要允許這個服務在私人網路被其他裝置連線。若無可分享的位址，畫面不產生 localhost QR。
 
 新安裝預設常駐模式與文字儲存。既有 `.env` 若仍為 `BREEZE_ASR=cli`，每段重新載入是該模式的行為。要測常駐可改為 `BREEZE_ASR=resident`，停止服務後重開。
+
+## 長場次逐字稿
+
+新安裝會把文字保存到 `data/captions.sqlite3`。匯出以資料庫中保存期限內的完整內容為準，超過近期字幕窗口後仍保留前段，重開服務後也能匯出原房間。錄音不會保留。
+
+文字預設保留 24 小時；重要場次請在結束後匯出。若需延長，可在 `.env` 設 `BREEZE_CAPTION_TTL`（秒數）。舊 `.env` 未啟用儲存時，補上 `BREEZE_DATA_PATH=data/captions.sqlite3` 後重開服務；只會保存啟用後收到的文字。
+
+畫面若顯示「逐字稿未啟用儲存」，服務重開會清空字幕，匯出只有近期內容。
 
 ## 排錯
 

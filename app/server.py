@@ -459,7 +459,8 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         if kind not in {"txt", "json", "srt", "vtt"}:
             raise HTTPException(status_code=400, detail="不支援的匯出格式")
         try:
-            payload = export_text(bus.history(room_id), kind)
+            events = await asyncio.to_thread(store.room_rows, room_id) if store.enabled else bus.history(room_id)
+            payload = export_text(events, kind)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         media = "application/json" if kind == "json" else "text/plain; charset=utf-8"

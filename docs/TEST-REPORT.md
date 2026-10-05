@@ -2,12 +2,15 @@
 
 基於 fix/field-ready-core@1f4732e。以下結果是本輪親自執行，不是主持機的實測。
 
-- Linux、CPython 3.12.14：原版 34 passed in 6.68s；修改後 44 passed in 7.04s。node recorder machine 與 room client 均 exit 0。
+- Linux、CPython 3.12.14：原版 34 passed in 6.68s；本輪安裝及 Windows 修正後 46 項通過，完整匯出修正後 47 passed in 7.30s。node recorder machine 與 room client 均 exit 0。
 - 實際下載並核對固定 Breeze q5 SHA256 與 whisper.cpp v1.9.2 Linux 套件。
 - 使用 upstream 公開英文 JFK 音訊前 6 秒，常駐載入約 0.507 秒；兩次推論約 14.467／14.974 秒，均回傳非空文字、同一 PID、最後關閉。這不是中文準確度與 Windows 主持機結果。
 - 此測試 RTF 約 2.41／2.50，未通過此環境的連續即時容量門檻。
 - 實際核對 Windows whisper ZIP 的 SHA256，確認 whisper-cli、whisper-server 與 ggml／whisper DLL 都在套件中；PE 匯入顯示需要 Microsoft Visual C++ runtime。
-- 新 workflow 的 Windows / Python 3.11／3.12、含中文／空白路徑安裝與真實推論，結果需以對應提交的 Actions 為準。
+- [Actions run 37296121195](https://github.com/aa0968111723-prog/breeze-live-room/actions/runs/37296121195) 在提交 `1d7cf08069054b1a18f8f439c201abd747cd80ce` 全部通過：Windows／Linux × Python 3.11／3.12 的 46 項回歸與兩組 Node，以及 Windows 中文／空白路徑安裝、SHA256、DLL、Unicode 桌面捷徑、常駐與 CLI 各兩次真實推論。Windows runner 是 Server 2025，不是使用者的 Windows 11 主持機。
+- Windows 預設參數的 6 秒英文樣本：resident 33.766／33.641 秒，RTF 5.628／5.607；CLI 36.062／36.125 秒，RTF 6.010／6.021。推論可用，但未通過這台 CI 機的連續即時容量門檻。
+- Linux 真實模型 API 流程：health、setup、上傳、辨識、相同段重送去重、SQLite、SRT 與程序關閉通過；同一段只推論一次、模型載入一次。HTTPX ASGI 全流程約 17.051 秒，不含真實瀏覽器收音。
+- 完整匯出回歸：近期字幕窗口設成 2，送入 6 段、跨兩個會話；JSON／SRT 仍包含全部段落，重開服務後仍可匯出，其他房間不混入。新一輪四組矩陣測試以此提交的 Actions 為準。
 - Chromium 整合環境受阻：下載回傳非有效 ZIP，未宣稱真實瀏覽器錄音整合通過。
 - 尚無主持機真實麥克風、30 分鐘中文、2 小時場次、3 台手機、真金鑰英譯的通過證據。
 

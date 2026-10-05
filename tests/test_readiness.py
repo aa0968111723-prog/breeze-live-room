@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.asr import CliAsr, ResidentAsr
+from app.asr import AsrResult, CliAsr, ResidentAsr
 from app.doctor import inspect
 from app.native_paths import NativePaths
 from app.server import create_app
@@ -258,3 +258,41 @@ async def test_setup_and_health_do_not_claim_unloaded_resident_ready():
             assert app.state.token not in response.text
     finally:
         await app.state.shutdown()
+
+
+@pytest.mark.anyio
+async def test_saved_export_survives_live_history_limit_and_restart(tmp_path):
+    class LocalAsr:
+        def transcribe(self, path, prompt):
+            return AsrResult(ok=True, text=path.read_bytes().decode("utf-8"))
+    def decode(source, work):
+        wav = work / "audio.wav"
+        wav.write_bytes(source.read_bytes())
+        return wav
+    settings = Settings(history_limit=2, data_path=str(tmp_path / "captions.sqlite3"), translate=False)
+    first = create_app(settings, asr=LocalAsr(), decoder=decode)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=first), base_url="http://127.0.0.1:8780") as client:
+            token = (await client.get("/api/host-token")).json()["token"]
+            headers = {"Authorization": "Bearer " + token, "Origin": "http://127.0.0.1:8780"}
+            for seq in range(1, 6):
+                response = await client.post("/api/push", data={"room_id": "long-room", "session_id": "z-old", "seq": str(seq), "t0_ms": str((seq-1)*6000), "t1_ms": str(seq*6000)}, files={"audio": ("test.wav", f"中文 {seq}".encode(), "audio/wav")}, headers=headers)
+                assert response.status_code == 200
+            newer = await client.post("/api/push", data={"room_id": "long-room", "session_id": "a-new", "seq": "1", "t0_ms": "0", "t1_ms": "6000"}, files={"audio": ("test.wav", "新場次".encode(), "audio/wav")}, headers=headers)
+            assert newer.status_code == 200
+            assert len(first.state.bus.history("long-room")) == 2
+            exported = await client.get("/api/export", params={"room_id": "long-room", "kind": "json"}, headers=headers)
+            assert [(r["session_id"], r["seq"]) for r in exported.json()] == [("z-old", s) for s in range(1, 6)] + [("a-new", 1)]
+            assert (await client.get("/api/export", params={"room_id": "other-room", "kind": "json"}, headers=headers)).json() == []
+    finally:
+        await first.state.shutdown()
+    resumed = create_app(settings, asr=LocalAsr(), decoder=decode)
+    try:
+        assert resumed.state.bus.history("long-room") == []
+        async with AsyncClient(transport=ASGITransport(app=resumed), base_url="http://127.0.0.1:8780") as client:
+            token = (await client.get("/api/host-token")).json()["token"]
+            srt = await client.get("/api/export", params={"room_id": "long-room", "kind": "srt"}, headers={"Authorization": "Bearer " + token})
+            assert srt.status_code == 200 and srt.text.count("-->") == 6
+            assert "中文 1" in srt.text and "中文 5" in srt.text and "新場次" in srt.text
+    finally:
+        await resumed.state.shutdown()
