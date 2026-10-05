@@ -20,7 +20,7 @@
 
 ## 仍未完成
 
-- 推上去的 PR head 是 `4f3d947`。程式本體在 `cb21186`。GitHub 權杖不能改 `.github/workflows/test.yml`，所以遠端工作流程仍只跑 pytest 和 `tests/recorder_machine.test.mjs`。`tests/room_client.test.mjs` 在這台 Node v26.3.1 印出 `room client ok`，CI 要等有人加上 `node tests/room_client.test.mjs` 才會跑它。
+- 程式本體在 `cb21186`。推上後的 `97d0c77` 觸發 GitHub Actions：run `37261737041` 印出 `34 passed in 7.05s`，以及 `recorder machine ok`。工作流程沒有 `node tests/room_client.test.mjs`（這組權杖不能改 `.github/workflows/test.yml`）。該檔在這台 Node v26.3.1 印出 `room client ok`，CI 還沒跑它。Node 22 只跑了錄音狀態機那個測試。
 - 模型雜湊未在此計算、未釘選。
 - CLI 仍是每段重開行程。常駐「只載入一次」沒有實機證據。
 - 捷徑腳本、Windows DLL、防火牆、埠、中文或空白路徑都沒在這裡跑。
@@ -37,7 +37,7 @@
 - 同一批測試較早也通過：`34 passed in 11.49s`（rebase 前）、`32 passed`、`31 passed in 10.88s`、`31 passed in 10.24s`、`31 passed in 9.74s`。
 - `node tests/recorder_machine.test.mjs` 印出 ok（`recorder machine ok`）；`node tests/room_client.test.mjs` 印出 ok（`room client ok`）。Node v26.3.1。CI 指定 Node 22，尚未在這個工作樹上跑。
 
-socket `__aexit__` 與顯示順序（display-order）測試修正之前的乾淨複製是 `25 passed, 6 failed`，失敗都在 `tests/test_round2.py`，不是 `ModuleNotFoundError: No module named 'app'`。那次不能當成目前結果。GitHub Actions 還沒在這個工作樹上跑過，所以「目前 CI 通過」尚未成立。Copilot review 成功也不等於測試通過。
+socket `__aexit__` 與顯示順序（display-order）測試修正之前的乾淨複製是 `25 passed, 6 failed`，失敗都在 `tests/test_round2.py`，不是 `ModuleNotFoundError: No module named 'app'`。那次不能當成目前結果。`97d0c77` 的 Actions 已跑 pytest 與錄音狀態機測試，見上面的 run。那次成功不含 `room_client.test.mjs`，也不等於實機通過。Copilot review 成功也不等於測試通過。
 
 ## 實機驗證沒有通過
 

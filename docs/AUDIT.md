@@ -4,7 +4,7 @@
 
 - 分支：`fix/round2-continue`
 - 程式提交：`cb21186d35a50690b7f012f35b4423b88b7ff6d4`（`fix/round2-continue`，在 `5c7784ca54d9c103529d85fbd1e2a111cc89c8bc` 之上）
-- 本紀錄描述提交 `cb21186`。推送前遠端仍是 `5c7784c`。GitHub Actions 還沒跑這個提交。
+- 本紀錄描述提交 `cb21186`。`97d0c77` 的 GitHub Actions run `37261737041` 是 `34 passed in 7.05s` 與 `recorder machine ok`。`room_client.test.mjs` 不在該工作流程。
 - 這台是 Linux，直譯器是倉庫 venv 的 CPython 3.11.17（`/root/breeze-live-room/.venv`），不是 Ryzen 5 5600H / 16GB / Windows 11 主持機。沒有麥克風、Breeze 權重、whisper-cli、`whisper-cli.exe`、OpenAI 金鑰。
 - 倉庫沒有 `AGENTS.md`。
 
@@ -28,7 +28,7 @@
 
 ## 仍未完成
 
-- GitHub Actions 還沒跑這個提交。實機驗證沒有通過。
+- Actions 沒跑聽眾客戶端測試。實機驗證沒有通過。
 - q5 網址仍是 Hugging Face 的 `ggml-breeze-asr-25-q5_0.bin`。雜湊沒有在這台計算，儲存庫沒有釘選。`install.bat` 只有在旁路 sha256 檔存在時才比對。
 - CLI 每次重新啟動 whisper-cli。常駐路徑未在主持機證明「模型只載入一次」。ready 旗標不能拿來宣稱已載入。
 - 不是單一 exe／MSI。`install-shortcut.ps1` 存在，這裡沒執行。Windows DLL、防火牆、埠佔用、含中文或空白的安裝路徑未驗證。
