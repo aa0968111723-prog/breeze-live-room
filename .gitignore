@@ -1,5 +1,8 @@
 .venv/
 models/
 tools/
+tmp/
+.env
 __pycache__/
 *.wav
+*.webm
