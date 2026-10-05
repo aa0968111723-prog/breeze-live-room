@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from app.asr import CliAsr
 from app.audio import AudioError, convert_to_wav, ffmpeg_bin, read_limited, wav_duration_seconds
 from app.auth import new_host_token, require_host, require_local_host
+from app.dispatch import RoomBus
 from app.pipeline import Pipeline, Segment
 from app.rooms import RoomIdError, validate_room_id
 from app.settings import Settings
@@ -23,32 +24,24 @@ WHISPER = ROOT / "tools" / "whisper-cli.exe"
 TMP = ROOT / "tmp"
 PROMPT = "以下是普通話的句子，請用繁體中文輸出。常見專有名詞：般若、菩提心、空性、因緣。這是提示偏置，不保證鎖詞。"
 
-
-def _upsert(history: list, event: dict) -> None:
-    for index, item in enumerate(history):
-        if item.get("id") == event.get("id"):
-            history[index] = event
-            return
-    history.append(event)
-
-
 def create_app(settings: Settings | None = None, asr=None, translator: Translator | None = None, decoder=None) -> FastAPI:
     settings = settings or Settings.from_env()
     token = new_host_token()
-    translator = translator or Translator(
-        enabled=settings.translate,
-        key=os.getenv("OPENAI_API_KEY", ""),
-    )
+    translator = translator or Translator(enabled=settings.translate, key=os.getenv("OPENAI_API_KEY", ""))
     asr = asr or CliAsr(WHISPER, MODEL)
     pipeline = Pipeline(asr, translator, PROMPT, TMP)
+    bus = RoomBus()
     rooms: dict[str, dict] = {}
+    inflight = {"n": 0}
 
     app = FastAPI(title="breeze-live-room")
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     app.state.settings = settings
     app.state.token = token
     app.state.pipeline = pipeline
+    app.state.bus = bus
     app.state.rooms = rooms
+    app.state.inflight = inflight
     app.state.translator = translator
     app.state.asr = asr
 
@@ -129,13 +122,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         return Response(buf.getvalue(), media_type="image/png")
 
     @app.post("/api/push")
-    async def push(
-        request: Request,
-        room_id: str = Form(...),
-        session_id: str = Form(...),
-        seq: int = Form(...),
-        audio: UploadFile = File(...),
-    ) -> dict:
+    async def push(request: Request, room_id: str = Form(...), session_id: str = Form(...), seq: int = Form(...), audio: UploadFile = File(...)) -> dict:
         require_host(request, token)
         try:
             room_id = validate_room_id(room_id)
@@ -145,34 +132,32 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             raise HTTPException(status_code=400, detail="段落序號不正確")
         if not session_id or len(session_id) > 64:
             raise HTTPException(status_code=400, detail="會話代號不正確")
-        blocks = []
-        while True:
-            block = await audio.read(64 * 1024)
-            if not block:
-                break
-            blocks.append(block)
-            if sum(len(b) for b in blocks) > settings.max_audio_bytes:
-                raise HTTPException(status_code=413, detail=f"音訊超過 {settings.max_audio_bytes} bytes，已拒絕")
+        if inflight["n"] >= settings.max_queue and pipeline.get(room_id, session_id, seq) is None:
+            raise HTTPException(status_code=429, detail="辨識佇列已滿，請稍後再送")
+        inflight["n"] += 1
         try:
+            blocks = []
+            while True:
+                block = await audio.read(64 * 1024)
+                if not block:
+                    break
+                blocks.append(block)
+                if sum(len(b) for b in blocks) > settings.max_audio_bytes:
+                    raise HTTPException(status_code=413, detail=f"音訊超過 {settings.max_audio_bytes} bytes，已拒絕")
             raw = read_limited(blocks, settings.max_audio_bytes)
-        except AudioError as exc:
-            raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
-        state = state_for(room_id)
-        if len(pipeline.results) >= settings.max_queue and pipeline.get(room_id, session_id, seq) is None:
-            waiting = sum(1 for item in pipeline.results.values() if item.status == "queued")
-            if waiting >= settings.max_queue:
-                raise HTTPException(status_code=429, detail="辨識佇列已滿，請稍後再送")
-        segment = Segment(room_id=room_id, session_id=session_id, seq=seq)
-        before = len(pipeline.broadcasts)
-        try:
-            done = await pipeline.submit(segment, raw, decode)
-        except AudioError as exc:
-            raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
-        for event in pipeline.broadcasts[before:]:
-            _upsert(state["history"], event)
+            state = state_for(room_id)
+            done = await pipeline.submit(Segment(room_id=room_id, session_id=session_id, seq=seq), raw, decode)
+            event = done.public()
+            if event.get("room_id") != room_id:
+                raise HTTPException(status_code=500, detail="事件房間不符")
+            bus.publish(event)
+            state["history"] = bus.history(room_id)[-settings.history_limit :]
             await _broadcast(state, event)
-        state["history"] = state["history"][-settings.history_limit :]
-        return {"ok": done.status != "error", **done.public()}
+            return {"ok": done.status != "error", **event}
+        except AudioError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+        finally:
+            inflight["n"] = max(0, inflight["n"] - 1)
 
     @app.websocket("/ws/listen")
     async def listen(ws: WebSocket, room_id: str = "class") -> None:
@@ -192,11 +177,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             return
         state["listeners"].add(ws)
         try:
-            await ws.send_json({"type": "hello", "history": state["history"][-40:]})
-        except Exception:
-            state["listeners"].discard(ws)
-            return
-        try:
+            await ws.send_json({"type": "hello", "history": bus.history(room_id)[-40:]})
             while True:
                 await ws.receive_text()
         except WebSocketDisconnect:
@@ -205,7 +186,6 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             state["listeners"].discard(ws)
 
     return app
-
 
 async def _broadcast(state: dict, payload: dict) -> None:
     import asyncio
@@ -217,6 +197,5 @@ async def _broadcast(state: dict, payload: dict) -> None:
             dead.append(ws)
     for ws in dead:
         state["listeners"].discard(ws)
-
 
 app = create_app()
