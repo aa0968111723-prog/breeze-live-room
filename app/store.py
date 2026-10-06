@@ -147,6 +147,15 @@ class CaptionStore:
             conn.execute("alter table captions add column session_ord integer")
         conn.execute("create index if not exists captions_room_session_seq on captions (room_id, session_id, seq)")
         conn.execute("create index if not exists captions_updated_at on captions (updated_at)")
+        # Captions stay for host export. This marks the close, so the next open's replay can skip them.
+        conn.execute(
+            """
+            create table if not exists room_replay_floor (
+                room_id text primary key,
+                floor_at real not null
+            )
+            """
+        )
         conn.commit()
         self._conn = conn
 
@@ -359,6 +368,51 @@ class CaptionStore:
             return [dict(row) for row in rows]
         finally:
             conn.row_factory = None
+
+    def set_replay_floor(self, room_id: str, floor: float) -> None:
+        if not self.enabled:
+            return
+        if self._on_writer():
+            self._set_replay_floor_now(room_id, floor)
+            return
+        self._submit(self.set_replay_floor, room_id, float(floor)).result()
+
+    def _set_replay_floor_now(self, room_id: str, floor: float) -> None:
+        conn = self._conn
+        if conn is None:
+            return
+        with conn:
+            conn.execute(
+                """
+                insert into room_replay_floor (room_id, floor_at)
+                values (?, ?)
+                on conflict(room_id) do update set floor_at = excluded.floor_at
+                where excluded.floor_at >= room_replay_floor.floor_at
+                """,
+                (room_id, float(floor)),
+            )
+
+    def get_replay_floor(self, room_id: str) -> float | None:
+        if not self.enabled:
+            return None
+        if self._on_writer():
+            return self._get_replay_floor_now(room_id)
+        return self._submit(self.get_replay_floor, room_id).result()
+
+    def _get_replay_floor_now(self, room_id: str) -> float | None:
+        conn = self._conn
+        if conn is None:
+            return None
+        row = conn.execute(
+            "select floor_at from room_replay_floor where room_id = ?",
+            (room_id,),
+        ).fetchone()
+        if not row or row[0] is None:
+            return None
+        try:
+            return float(row[0])
+        except (TypeError, ValueError):
+            return None
 
     def flush(self) -> None:
         if not self.enabled or self._pool is None or self._closed:

@@ -41,6 +41,7 @@ li { padding: 8px 0; border-top: 1px solid var(--line); font-size: 16px; }
 <script type="module">
 import { connectRoom, createCaptionView, liveTail, orderedCaptions } from "/static/room_client.js";
 const room = location.pathname.split("/").filter(Boolean).pop();
+const listenKey = new URLSearchParams(location.search).get("k") || "";
 const view = createCaptionView(80);
 const items = view.items;
 const state = { follow: true, pinned: null };
@@ -71,7 +72,9 @@ function connect() {
     room,
     url: () => {
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      return proto + "://" + location.host + "/ws/listen?room_id=" + encodeURIComponent(room);
+      let address = proto + "://" + location.host + "/ws/listen?room_id=" + encodeURIComponent(room);
+      if (listenKey) address += "&k=" + encodeURIComponent(listenKey);
+      return address;
     },
     onState: (text) => { document.querySelector("#state").textContent = text; },
     onEvent: show,

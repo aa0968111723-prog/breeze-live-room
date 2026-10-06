@@ -19,6 +19,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -330,6 +331,17 @@ def _listen_summary(events: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _listen_key_from_setup(setup: dict) -> str:
+    key = setup.get("listen_key")
+    if isinstance(key, str) and key:
+        return key
+    url = setup.get("listen_url")
+    if not isinstance(url, str) or not url:
+        return ""
+    found = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("k") or []
+    return found[0] if found else ""
+
+
 def cmd_listen(client: HostClient, args) -> int:
     try:
         import websockets  # type: ignore
@@ -338,6 +350,12 @@ def cmd_listen(client: HostClient, args) -> int:
         return 0
     import asyncio
 
+    client.fetch_token()
+    setup = client.get_json("/api/setup?room_id=" + urllib.parse.quote(args.room))
+    key = _listen_key_from_setup(setup if isinstance(setup, dict) else {})
+    if not key:
+        print("這個房間沒有聽眾金鑰。請先在主持頁開房。不會改走匿名連線。")
+        return 1
     base = client.base
     if base.startswith("https://"):
         ws_base = "wss://" + base[len("https://"):]
@@ -345,7 +363,13 @@ def cmd_listen(client: HostClient, args) -> int:
         ws_base = "ws://" + base[len("http://"):]
     else:
         ws_base = "ws://" + base
-    url = ws_base + "/ws/listen?room_id=" + urllib.request.quote(args.room) + "&cursor=0&replay=1"
+    url = (
+        ws_base
+        + "/ws/listen?room_id="
+        + urllib.parse.quote(args.room)
+        + "&cursor=0&replay=1&k="
+        + urllib.parse.quote(key)
+    )
     events: list[dict] = []
 
     async def run() -> None:
@@ -382,7 +406,7 @@ def cmd_listen(client: HostClient, args) -> int:
     try:
         asyncio.run(run())
     except Exception as exc:
-        print(f"聽眾連線失敗：{type(exc).__name__}。沒有使用主持權杖。")
+        print(f"聽眾連線失敗：{type(exc).__name__}。WebSocket 只帶了聽眾金鑰，沒有送出主持權杖。")
         return 1
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

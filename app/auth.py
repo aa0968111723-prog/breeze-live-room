@@ -64,15 +64,38 @@ def _split_host(value: str) -> tuple[str, int | None]:
     return text, None
 
 
-def host_is_allowed(host_header: str, settings: Settings) -> bool:
+def _name_set(settings: Settings, extra_hosts: tuple[str, ...] = ()) -> set[str]:
+    names = set(_allowed_names(settings))
+    for item in extra_hosts:
+        canon = _canonical_host(item)
+        if canon:
+            names.add(canon)
+    return names
+
+
+def same_secret(supplied: str, expected: str) -> bool:
+    """Constant-time compare. Different lengths and non-text values are simply not equal."""
+    if not isinstance(supplied, str) or not isinstance(expected, str):
+        return False
+    if not supplied or not expected:
+        return False
+    try:
+        left = supplied.encode("utf-8")
+        right = expected.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return hmac.compare_digest(left, right)
+
+
+def host_is_allowed(host_header: str, settings: Settings, extra_hosts: tuple[str, ...] = ()) -> bool:
     name, port = _split_host(host_header)
-    if _canonical_host(name) not in _allowed_names(settings):
+    if _canonical_host(name) not in _name_set(settings, extra_hosts):
         return False
     # This service does not sit on port 80. A missing port is not an exact match.
     return port == settings.port
 
 
-def origin_is_allowed(origin: str, settings: Settings) -> bool:
+def origin_is_allowed(origin: str, settings: Settings, extra_hosts: tuple[str, ...] = ()) -> bool:
     parsed = urlparse(origin.strip())
     if parsed.scheme not in set(settings.allowed_schemes):
         return False
@@ -81,7 +104,7 @@ def origin_is_allowed(origin: str, settings: Settings) -> bool:
     if parsed.path not in {"", "/"}:
         return False
     host = _canonical_host(parsed.hostname or "")
-    if host not in _allowed_names(settings):
+    if host not in _name_set(settings, extra_hosts):
         return False
     try:
         port = parsed.port
@@ -90,6 +113,25 @@ def origin_is_allowed(origin: str, settings: Settings) -> bool:
     if port is None:
         return host in {_canonical_host(name) for name in LOOPBACK}
     return port == settings.port
+
+
+def audience_origin_allowed(
+    origin: str | None,
+    host_header: str,
+    settings: Settings,
+    extra_hosts: tuple[str, ...] = (),
+) -> bool:
+    """Audience sockets may use the share host printed on the QR code.
+
+    Browsers always send Origin. A missing Origin is allowed so the existing
+    non-browser clients (the test sockets and scripts/device_check.py) can connect.
+    A present Origin still has to match the allowlist, which blocks a cross-site page.
+    """
+    if not host_is_allowed(host_header, settings, extra_hosts):
+        return False
+    if origin is None or not str(origin).strip():
+        return True
+    return origin_is_allowed(str(origin), settings, extra_hosts)
 
 
 def require_local_host(request: Request, settings: Settings) -> None:
