@@ -72,7 +72,44 @@ PRESETS = {
     },
 }
 
-FAIL_TRANSLATE = {"queue_full", "timeout", "error", "skipped"}
+FAIL_TRANSLATE = {"queue_full", "timeout", "error", "skipped", "skipped_backlog"}
+_KNOWN_TRANSLATE_FAILS = ("queue_full", "timeout", "error", "skipped")
+
+
+def classify_translate_failures(rows: list[dict]) -> dict:
+    """Count Chinese lines that never received English.
+
+    ``skipped_backlog`` is the drop-oldest outcome. It is part of ``skipped``
+    and is also returned on its own, so it is not an unexplained ``other``
+    and it is not added into the total twice.
+    """
+    counts = {name: 0 for name in _KNOWN_TRANSLATE_FAILS}
+    skipped_backlog = 0
+    other = 0
+    considered = 0
+    for row in rows:
+        if row.get("en"):
+            considered += 1
+            continue
+        considered += 1
+        status = str(row.get("translate_status") or "")
+        if status == "skipped_backlog":
+            counts["skipped"] += 1
+            skipped_backlog += 1
+            continue
+        if status in counts:
+            counts[status] += 1
+            continue
+        if status or row.get("status") == "translate_failed":
+            other += 1
+    total = sum(counts.values()) + other
+    return {
+        **counts,
+        "skipped_backlog": skipped_backlog,
+        "other": other,
+        "total": total,
+        "rate": (total / considered) if considered else 0.0,
+    }
 SRT_TIME = re.compile(
     r"(\d{2}):(\d{2}):(\d{2}),(\d{3})\s+-->\s+(\d{2}):(\d{2}):(\d{2}),(\d{3})"
 )
@@ -626,18 +663,18 @@ async def _run(args) -> dict:
     # Prefer event zh, which is what listeners stored.
     segments_with_text = sorted(set(segments_with_text) | set(zh_at))
 
-    failure_counts = {name: 0 for name in ("queue_full", "timeout", "error", "skipped")}
-    other_failures = 0
+    failure_rows = []
     for seq in segments_with_text:
-        if seq in en_at:
-            continue
         status = translate_status.get(seq) or (pushes.get(seq) or {}).get("translate_status") or ""
-        if status in failure_counts:
-            failure_counts[status] += 1
-        elif status or (pushes.get(seq) or {}).get("status") == "translate_failed":
-            other_failures += 1
-    failure_total = sum(failure_counts.values()) + other_failures
-    failure_rate = (failure_total / len(segments_with_text)) if segments_with_text else 0.0
+        failure_rows.append({
+            "en": "1" if seq in en_at else "",
+            "translate_status": status,
+            "status": (pushes.get(seq) or {}).get("status") or "",
+        })
+    classified = classify_translate_failures(failure_rows)
+    failure_counts = {name: classified[name] for name in ("queue_full", "timeout", "error", "skipped")}
+    other_failures = classified["other"]
+    failure_rate = classified["rate"]
 
     last_en = max(en_at.values(), default=None)
     catch_up = real(last_en - last_end) if last_en is not None else None
@@ -747,7 +784,12 @@ async def _run(args) -> dict:
             "max": _round(max(en_latency) if en_latency else None),
             "n": len(en_latency),
         },
-        "translate_failures": {**failure_counts, "other": other_failures, "rate": _round(failure_rate, 4)},
+        "translate_failures": {
+            **failure_counts,
+            "skipped_backlog": classified["skipped_backlog"],
+            "other": other_failures,
+            "rate": _round(failure_rate, 4),
+        },
         "catch_up_s": _round(catch_up),
         "rtf_configured": args.rtf,
         "rtf_observed": _round(observed_rtf, 3),
@@ -832,7 +874,8 @@ def _print_report(report: dict) -> None:
     fails = report["translate_failures"]
     print(
         f"translate fails   queue_full={fails['queue_full']} timeout={fails['timeout']} "
-        f"error={fails['error']} skipped={fails['skipped']} other={fails['other']} rate={fails['rate']}"
+        f"error={fails['error']} skipped={fails['skipped']} "
+        f"skipped_backlog={fails.get('skipped_backlog', 0)} other={fails['other']} rate={fails['rate']}"
     )
     print(f"catch-up          {_fmt(report['catch_up_s'])} real s   (last chunk end → last English; negative means English finished during capture)")
     print(f"rtf               configured {report['rtf_configured']}  observed { _fmt(report['rtf_observed']) }")

@@ -55,6 +55,7 @@ label { display: block; margin-top: 8px; }
 <label>跳過序號 <input id="skip-seq" inputmode="numeric" value="1" style="width:5em"></label>
 <button id="skip" class="secondary" type="button">標記缺段</button>
 <button id="delete-seg" class="secondary" type="button">刪除此段</button>
+<button id="retranslate" class="secondary" type="button" hidden>重試英譯</button>
 </div>
 <div class="card" id="log"></div>
 </main>
@@ -93,12 +94,15 @@ function line(text) {
 }
 function paintCaption(fromSocket, item, prevEn) {
   const shown = applyCaption({ items: captions }, null);
+  const retryBtn = document.querySelector("#retranslate");
   if (shown.item) {
     captionEn.textContent = shown.label;
     captionZh.textContent = shown.zh;
+    if (retryBtn) retryBtn.hidden = !shown.retry;
   } else {
     captionEn.textContent = "";
     captionZh.textContent = "";
+    if (retryBtn) retryBtn.hidden = true;
   }
   if (fromSocket && item && item.en && !prevEn) {
     line(item.en + "\n" + (item.zh || item.error || ""));
@@ -426,6 +430,31 @@ document.querySelector("#delete-seg").onclick = async () => {
   view.apply({ type: "caption_deleted", id, session_id: ctl.session.id, seq });
   paintCaption(false, null, false);
   line("已刪除第 " + seq + " 段。");
+};
+document.querySelector("#retranslate").onclick = async () => {
+  const shown = applyCaption({ items: captions }, null);
+  if (!shown.retry || !shown.item) {
+    line("這一段沒有需要重試的英譯。");
+    return;
+  }
+  const item = shown.item;
+  const roomId = item.room_id || (ctl.session && ctl.session.roomId) || roomEl.value;
+  const resp = await hostFetch("/api/segment/retranslate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ room_id: roomId, session_id: item.session_id, seq: item.seq }),
+  });
+  let data = {};
+  try {
+    data = await resp.json();
+  } catch (err) {
+    data = {};
+  }
+  if (!resp.ok) {
+    line(data.detail || "無法重試英譯");
+    return;
+  }
+  line("已重送第 " + item.seq + " 段的英譯。");
 };
 document.querySelector("#export").onclick = async () => {
   const resp = await fetch("/api/export?room_id=" + encodeURIComponent(roomEl.value) + "&kind=srt", { headers: { authorization: "Bearer " + token } });

@@ -71,4 +71,46 @@ const staleFirst = applyCaption(state, {
   status: "ready",
 });
 assert.equal(staleFirst.item.id, "class:s:2");
+
+const skipped = applyCaption(state, {
+  id: "class:s:3",
+  version: 2,
+  seq: 3,
+  session_ord: 1,
+  cursor: 4,
+  zh: "被略過",
+  en: "",
+  status: "translate_failed",
+  translate_status: "skipped_backlog",
+});
+assert.equal(skipped.label, "（英譯積壓已略過，可重試）");
+assert.equal(skipped.retry, true);
+assert.equal(skipped.zh, "被略過");
+
+const failed = applyCaption({ items: new Map() }, {
+  id: "class:s:4",
+  version: 2,
+  seq: 4,
+  session_ord: 1,
+  cursor: 1,
+  zh: "失敗",
+  en: "",
+  status: "translate_failed",
+  translate_status: "timeout",
+});
+assert.equal(failed.label, "（英譯失敗，可重試）");
+assert.equal(failed.retry, true);
+
+const waiting = applyCaption({ items: new Map() }, {
+  id: "class:s:5",
+  version: 1,
+  seq: 5,
+  session_ord: 1,
+  cursor: 1,
+  zh: "還沒譯",
+  en: "",
+  status: "zh_ready",
+});
+assert.equal(waiting.label, "（尚無英譯）");
+assert.equal(waiting.retry, false);
 console.log("host caption ok");

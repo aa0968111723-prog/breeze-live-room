@@ -10,6 +10,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.asr import AsrResult
+from app.pipeline import Segment
 from app.server import create_app
 from app.settings import Settings
 from app.store import CaptionStore
@@ -429,6 +430,104 @@ def test_host_page_opts_into_async_translation_and_listens_for_english():
     assert "/ws/listen?room_id=" in text
     assert "mergeCaptionUpdate" in text
     assert "throw new Error" in upload
+
+
+def test_host_retry_button_uses_host_fetch_for_skipped_english():
+    text = Path("app/static/host.html").read_text(encoding="utf-8")
+    assert "重試英譯" in text
+    handler = text.split('querySelector("#retranslate").onclick', 1)[1].split('querySelector("#export")', 1)[0]
+    assert "/api/segment/retranslate" in handler
+    assert "hostFetch(" in handler
+    assert "await fetch(" not in handler
+    script = Path("app/static/host_caption.js").read_text(encoding="utf-8")
+    assert "英譯積壓已略過，可重試" in script
+    assert "英譯失敗，可重試" in script
+
+
+class _BlockOneEnglish(Translator):
+    def __init__(self):
+        super().__init__(enabled=True, key="k")
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def translate(self, zh, glossary=None, context=None, deadline=None, cancel=None):
+        del glossary, context, deadline, cancel
+        self.calls += 1
+        self.started.set()
+        self.release.wait(3)
+        return TranslateResult("EN " + zh, "ok")
+
+
+@pytest.mark.anyio
+async def test_skipped_backlog_segment_can_be_retranslated():
+    translator = _BlockOneEnglish()
+    app = app_for(
+        translator=translator,
+        settings=settings_with(
+            allow_testclient=True,
+            translate_workers=1,
+            translate_queue=1,
+            translate_timeout_s=3,
+        ),
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            headers = {**auth(token), "content-type": "application/json"}
+            first = asyncio.create_task(push(
+                client, token, "class", "s", 1, "新".encode(),
+                wait_translation="0", async_header=True,
+            ))
+            assert await asyncio.to_thread(translator.started.wait, 2)
+            pipe = app.state.pipeline
+            extra = Segment(room_id="class", session_id="s", seq=9, zh="重", status="zh_ready", version=1)
+            pipe._stamp_gen(extra)
+            pipe.results[extra.key] = extra
+            pipe._emitted_segs.add(extra.key)
+            pipe._put_translation(extra)
+            pipe._put_translation(extra)
+            pipe._drop_queued(extra.key)
+            second = await push(
+                client, token, "class", "s", 2, "舊".encode(),
+                wait_translation="0", async_header=True,
+            )
+            third = await push(
+                client, token, "class", "s", 3, "最新".encode(),
+                wait_translation="0", async_header=True,
+            )
+            assert second.status_code == 200 and third.status_code == 200, (second.text, third.text)
+            await asyncio.sleep(0.05)
+            skipped = [
+                item for item in app.state.bus.caption_state("class")
+                if item.get("translate_status") == "skipped_backlog"
+            ]
+            assert skipped and skipped[0]["zh"] == "舊"
+            assert skipped[0]["status"] == "translate_failed"
+            assert skipped[0]["en"] == ""
+            translator.release.set()
+            await asyncio.wait_for(first, 2)
+            revived = await client.post(
+                "/api/segment/retranslate",
+                json={"room_id": "class", "session_id": "s", "seq": 2},
+                headers=headers,
+            )
+            assert revived.status_code == 200, revived.text
+            deadline = asyncio.get_running_loop().time() + 2
+            latest = {}
+            while asyncio.get_running_loop().time() < deadline:
+                latest = {item["seq"]: item for item in app.state.bus.caption_state("class")}
+                row = latest.get(2) or {}
+                if row.get("status") == "ready" and row.get("en"):
+                    break
+                await asyncio.sleep(0.02)
+            row = latest.get(2) or {}
+            assert row.get("status") == "ready", row
+            assert row.get("en") == "EN 舊"
+            assert row.get("translate_status") != "skipped_backlog"
+    finally:
+        translator.release.set()
+        await stop(app)
 
 
 def test_host_upload_failure_throws_and_delete_control_is_present():
