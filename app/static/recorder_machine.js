@@ -90,9 +90,40 @@ export function createCaptureController(deps) {
     return job.finally(() => inflight.delete(job));
   }
 
+  const schedule = deps.schedule || ((fn, ms) => setTimeout(fn, ms));
+  const clearSchedule = deps.clearSchedule || ((id) => clearTimeout(id));
+  const uploadTimeoutMs = Number(deps.uploadTimeoutMs) > 0 ? Number(deps.uploadTimeoutMs) : 300000;
+
+  function waitFor(promise, ms) {
+    let timer = null;
+    let timedOut = false;
+    const timeout = new Promise((resolve) => {
+      timer = schedule(() => {
+        timedOut = true;
+        resolve("timeout");
+      }, ms);
+    });
+    return Promise.race([
+      Promise.resolve(promise).then(() => "done", () => "done"),
+      timeout,
+    ]).finally(() => {
+      if (timer != null) clearSchedule(timer);
+    }).then((result) => result === "timeout" || timedOut);
+  }
+
   async function settleUploads() {
+    const deadline = Date.now() + uploadTimeoutMs;
     while (inflight.size) {
-      await Promise.allSettled([...inflight]);
+      const left = deadline - Date.now();
+      if (left <= 0) {
+        lastError = lastError || "上傳逾時，已停止等待";
+        break;
+      }
+      const timedOut = await waitFor(Promise.allSettled([...inflight]), left);
+      if (timedOut) {
+        lastError = lastError || "上傳逾時，已停止等待";
+        break;
+      }
     }
   }
 
@@ -234,7 +265,8 @@ export function createCaptureController(deps) {
       setState("draining");
       clearTimer();
       try {
-        await finishCurrent();
+        const timedOut = await waitFor(finishCurrent(), uploadTimeoutMs);
+        if (timedOut) lastError = lastError || "上傳逾時，已停止等待";
         releaseStream();
         recorder = null;
         await settleUploads();

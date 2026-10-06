@@ -310,4 +310,50 @@ failedRelease();
 await new Promise((resolve) => setTimeout(resolve, 0));
 assert.equal(failedCtl.uploads.length, 1);
 assert.equal(failedCtl.uploads[0].meta.sessionId, "fail-sess");
+
+async function testStopNeverHangsWhenUploadStalls() {
+  const pending = [];
+  const stall = createCaptureController({
+    periodMs: 60000,
+    uploadTimeoutMs: 5000,
+    schedule(fn, ms) {
+      const item = { fn, ms, cleared: false };
+      pending.push(item);
+      return item;
+    },
+    clearSchedule(item) {
+      if (item) item.cleared = true;
+    },
+    openMic: async () => fakeStream(),
+    createRecorder: factory.createRecorder,
+    newId: () => "stall",
+    roomId: () => "class",
+    upload: () => new Promise(() => {}),
+  });
+  await stall.start();
+  const stopping = stall.stop();
+  const winner = await Promise.race([
+    (async () => {
+      const deadline = Date.now() + 1000;
+      while (Date.now() < deadline) {
+        // finishCurrent and settleUploads each arm their own timer. Fire every one that is still pending.
+        for (const timer of pending) {
+          if (!timer.cleared) timer.fn();
+        }
+        const status = await Promise.race([
+          stopping.then(() => "done"),
+          new Promise((resolve) => setTimeout(() => resolve("wait"), 0)),
+        ]);
+        if (status === "done") return "done";
+      }
+      return "hung-inner";
+    })(),
+    new Promise((resolve) => setTimeout(() => resolve("hung"), 500)),
+  ]);
+  assert.equal(winner, "done");
+  assert.equal(stall.state, "idle");
+  assert.ok(stall.inflight >= 1, "a stalled upload must not be required to resolve");
+  assert.match(stall.lastError, /逾時/);
+}
+await testStopNeverHangsWhenUploadStalls();
 console.log("recorder machine ok");
