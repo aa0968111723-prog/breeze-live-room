@@ -121,7 +121,8 @@ def test_install_shortcut_script_guards_non_ascii_temp_and_desktop_path():
     for name in ("Breeze Live Room", "Breeze Update", "Breeze Doctor", "start.bat", "update.bat", "doctor.bat"):
         assert name in text
     assert "IBreezeShellLinkW" in text
-    assert "WScript.Shell" in text
+    code = "\n".join(line for line in text.splitlines() if not line.strip().startswith("#"))
+    assert "WScript.Shell" not in code
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows PowerShell")
