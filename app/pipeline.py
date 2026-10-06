@@ -477,6 +477,17 @@ class Pipeline:
         for key in [key for key in self._tr_epoch if key[0] == room_id]:
             self._tr_epoch[key] = self._tr_epoch.get(key, 0) + 1
 
+    def caption_known(self, room_id: str, session_id: str, seq: int) -> bool:
+        """True when this seq is still in pipeline state. A sealed id that was removed is not known."""
+        key = (room_id, session_id, seq)
+        if key in self.results or key in self._index or key in self._active or key in self._reserved:
+            return True
+        flight = self._flight.get(key)
+        if flight is not None and not flight.done():
+            return True
+        held = self._held.get((room_id, session_id))
+        return bool(held and seq in held)
+
     def delete_segment(self, room_id: str, session_id: str, seq: int) -> None:
         key = (room_id, session_id, seq)
         self._sealed.setdefault(room_id, set()).add(f"{room_id}:{session_id}:{seq}")

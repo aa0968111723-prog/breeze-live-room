@@ -613,6 +613,16 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         room_id = validate_room_id(room_id)
         if id or session_id or seq:
             segment_id, parsed_session, parsed_seq = _caption_target(room_id, id, session_id, seq)
+            await ensure_hydrated(room_id)
+            known = pipeline.caption_known(room_id, parsed_session, parsed_seq) or bus.has_caption(room_id, segment_id)
+            if not known and store.enabled:
+                try:
+                    known = await asyncio.to_thread(store.has_id, room_id, segment_id)
+                except Exception as exc:
+                    logging.getLogger("breeze.server").exception("caption lookup failed")
+                    raise HTTPException(status_code=503, detail="字幕儲存暫時無法讀取，沒有刪除") from exc
+            if not known:
+                raise HTTPException(status_code=404, detail="找不到這段字幕")
             pipeline.delete_segment(room_id, parsed_session, parsed_seq)
             # Queue the delete before yielding so a save already in flight runs first
             # and a caption accepted after this point is not removed with it.

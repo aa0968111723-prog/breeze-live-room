@@ -1012,6 +1012,49 @@ async def test_emitted_segment_index_respects_caption_cap():
 
 
 @pytest.mark.anyio
+async def test_delete_unknown_caption_does_not_seal_the_seq(tmp_path):
+    """Deleting an id that was never uploaded must 404 and leave that seq usable."""
+    app = app_for(settings=settings_with(
+        allow_testclient=True,
+        translate=False,
+        data_path=str(tmp_path / "captions.sqlite3"),
+    ))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            missing = await client.delete(
+                "/api/captions",
+                params={"room_id": "class", "id": "class:s:4"},
+                headers=auth(token),
+            )
+            assert missing.status_code == 404, missing.text
+            assert "class:s:4" not in app.state.pipeline._sealed.get("class", ())
+            pushed = await push(client, token, "class", "s", 4, "後來才到".encode(), t0_ms=0, t1_ms=1000)
+            assert pushed.status_code == 200, pushed.text
+            exported = await export_of(client, token, "class", "txt")
+            assert "後來才到" in exported.text
+            deleted = await client.delete(
+                "/api/captions",
+                params={"room_id": "class", "session_id": "s", "seq": 4},
+                headers=auth(token),
+            )
+            assert deleted.status_code == 200, deleted.text
+            again = await push(client, token, "class", "s", 4, "後來才到".encode(), t0_ms=0, t1_ms=1000, retry=True)
+            assert again.status_code == 409
+            exported = await export_of(client, token, "class", "txt")
+            assert "後來才到" not in exported.text
+            second = await client.delete(
+                "/api/captions",
+                params={"room_id": "class", "id": "class:s:4"},
+                headers=auth(token),
+            )
+            assert second.status_code == 404
+            assert "class:s:4" in app.state.pipeline._sealed.get("class", ())
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
 async def test_reopen_after_close_or_idle_keeps_session_order(tmp_path):
     """Closing or idle-reclaiming a room must not hand the next session ordinal 1."""
     app = app_for(settings=settings_with(

@@ -146,6 +146,17 @@ class RoomBus:
     def has_captions(self, room_id: str) -> bool:
         return bool(self._state.get(room_id))
 
+    def has_caption(self, room_id: str, seg_id: str) -> bool:
+        seg_id = str(seg_id or "")
+        if not seg_id:
+            return False
+        if seg_id in self._state.get(room_id, {}):
+            return True
+        for item in self.by_room.get(room_id, ()):
+            if str(item.get("id") or "") == seg_id and item.get("type") not in _CONTROL:
+                return True
+        return False
+
     def caption_age(self, room_id: str, now: float | None = None) -> float:
         stamp = self._state_at.get(room_id)
         if stamp is None:

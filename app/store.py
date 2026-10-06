@@ -280,6 +280,23 @@ class CaptionStore:
             cur = conn.execute("delete from captions where updated_at < ?", (cutoff,))
             return int(cur.rowcount or 0)
 
+    def has_id(self, room_id: str, seg_id: str) -> bool:
+        if not self.enabled:
+            return False
+        if self._on_writer():
+            return self._has_id_now(room_id, seg_id)
+        return bool(self._submit(self.has_id, room_id, seg_id).result())
+
+    def _has_id_now(self, room_id: str, seg_id: str) -> bool:
+        conn = self._conn
+        if conn is None:
+            return False
+        row = conn.execute(
+            "select 1 from captions where room_id = ? and id = ? limit 1",
+            (room_id, seg_id),
+        ).fetchone()
+        return row is not None
+
     def has_room(self, room_id: str) -> bool:
         if not self.enabled:
             return False
