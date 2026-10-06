@@ -54,11 +54,15 @@ label { display: block; margin-top: 8px; }
 <button id="export" class="secondary" type="button">匯出 SRT</button>
 <label>跳過序號 <input id="skip-seq" inputmode="numeric" value="1" style="width:5em"></label>
 <button id="skip" class="secondary" type="button">標記缺段</button>
+<button id="delete-seg" class="secondary" type="button">刪除此段</button>
+<button id="retranslate" class="secondary" type="button" hidden>重試英譯</button>
 </div>
 <div class="card" id="log"></div>
 </main>
 <script type="module">
 import { createCaptureController } from "/static/recorder_machine.js";
+import { connectRoom, createCaptionView, mergeCaptionUpdate } from "/static/room_client.js";
+import { applyCaption } from "/static/host_caption.js";
 const roomEl = document.querySelector("#room");
 const log = document.querySelector("#log");
 const status = document.querySelector("#status");
@@ -72,6 +76,10 @@ const lines = [];
 let token = "";
 let ready = false;
 let holdRoom = "";
+let captionConn = null;
+let listenedRoom = "";
+const view = createCaptionView(80);
+const captions = view.items;
 const phaseLabels = {
   idle: "待命",
   preparing: "準備麥克風",
@@ -83,6 +91,96 @@ const phaseLabels = {
 function line(text) {
   lines.unshift(text);
   log.textContent = lines.slice(0, 40).join("\n");
+}
+function paintCaption(fromSocket, item, prevEn) {
+  const shown = applyCaption({ items: captions }, null);
+  const retryBtn = document.querySelector("#retranslate");
+  if (shown.item) {
+    captionEn.textContent = shown.label;
+    captionZh.textContent = shown.zh;
+    if (retryBtn) retryBtn.hidden = !shown.retry;
+  } else {
+    captionEn.textContent = "";
+    captionZh.textContent = "";
+    if (retryBtn) retryBtn.hidden = true;
+  }
+  if (fromSocket && item && item.en && !prevEn) {
+    line(item.en + "\n" + (item.zh || item.error || ""));
+  }
+}
+function showCaption(incoming, fromSocket) {
+  if (!incoming || incoming.id == null || incoming.id === "") return;
+  const prev = captions.get(incoming.id) || null;
+  const merged = mergeCaptionUpdate(prev, incoming);
+  if (!merged || merged === prev) return;
+  view.apply(merged);
+  if (view.deleted.has(incoming.id) && !captions.has(incoming.id)) {
+    paintCaption(false, null, false);
+    return;
+  }
+  paintCaption(fromSocket, merged, prev && prev.en);
+}
+function listenCaptions(roomId, force) {
+  if (!token) return;
+  const room = (roomId || roomEl.value || "class").trim() || "class";
+  if (!force && captionConn && listenedRoom === room) return;
+  if (captionConn) captionConn.stop();
+  if (listenedRoom !== room) view.reset();
+  listenedRoom = room;
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  captionConn = connectRoom({
+    room,
+    url: () => scheme + "://" + location.host + "/ws/listen?room_id=" + encodeURIComponent(room),
+    onState: () => {},
+    onEvent: (item) => showCaption(item, true),
+    onDelete: (item) => {
+      view.apply(item);
+      paintCaption(false, null, false);
+      line("已刪除一段字幕。");
+    },
+    onClear: (data) => {
+      view.apply(data && data.type ? data : { type: "captions_cleared" });
+      paintCaption(false, null, false);
+      line("這個房間的字幕已清除。");
+    },
+    onBackfill: (rows) => { view.replace(rows); paintCaption(false, null, false); },
+    onReset: () => { view.reset(); paintCaption(false, null, false); },
+  });
+}
+let authJob = null;
+async function recoverAuth() {
+  if (authJob) return authJob;
+  authJob = (async () => {
+    const resp = await fetch("/api/host-token", { cache: "no-store" });
+    if (!resp.ok) throw new Error("無法重新取得主持權限");
+    const data = await resp.json();
+    if (!data || typeof data.token !== "string" || !data.token) throw new Error("無法重新取得主持權限");
+    token = data.token;
+    const room = (ctl.session && ctl.session.roomId) || (roomEl.value || "class").trim() || "class";
+    const sessionId = (ctl.session && ctl.session.id) || "pending";
+    const headers = { authorization: "Bearer " + token, "content-type": "application/json" };
+    await fetch("/api/rooms/open", { method: "POST", headers, body: JSON.stringify({ room_id: room }) });
+    await fetch("/api/glossary", { method: "POST", headers, body: JSON.stringify({ room_id: room, session_id: sessionId, text: document.querySelector("#glossary").value }) });
+    listenCaptions(room, true);
+  })();
+  try {
+    await authJob;
+  } finally {
+    authJob = null;
+  }
+}
+async function hostFetch(url, options) {
+  const build = () => {
+    const opts = { ...(options || {}) };
+    const headers = { ...(opts.headers || {}) };
+    if (token) headers.authorization = "Bearer " + token;
+    opts.headers = headers;
+    return opts;
+  };
+  let resp = await fetch(url, build());
+  if (resp.status !== 401) return resp;
+  await recoverAuth();
+  return fetch(url, build());
 }
 function micError(err) {
   const name = err && err.name;
@@ -130,6 +228,7 @@ async function setup() {
     ? ("還缺：" + missing.join("、") + "。不會改走雲端辨識。")
     : (data.translate_label + "。模型模式：" + data.asr_mode + (data.model_reloads_each_segment ? "，每段會重新載入。" : "，常駐服務已就緒。") + (data.storage ? "逐字稿已啟用儲存，可匯出保存期限內的完整內容。" : "逐字稿未啟用儲存；重開服務會清空，只可匯出近期字幕。"));
   go.disabled = !ready || !token || !ctl.canEditRoom();
+  listenCaptions(roomEl.value);
 }
 async function refreshMetrics() {
   if (!token) return;
@@ -165,6 +264,7 @@ const ctl = createCaptureController({
       body.append("t0_ms", String(meta.t0_ms || 0));
       body.append("t1_ms", String(meta.t1_ms || 0));
       if (retryFlag) body.append("retry", "1");
+      body.append("wait_translation", "0");
       body.append("audio", blob, "segment.webm");
       return body;
     }
@@ -176,27 +276,39 @@ const ctl = createCaptureController({
           method: "POST",
           body: formFor(retryFlag),
           signal: abort.signal,
-          headers: { authorization: "Bearer " + token, ...(retryFlag ? { "x-breeze-retry": "1" } : {}) },
+          headers: {
+            authorization: "Bearer " + token,
+            "x-breeze-async-translation": "1",
+            ...(retryFlag ? { "x-breeze-retry": "1" } : {}),
+          },
         });
       } finally {
         clearTimeout(timeout);
       }
     }
     let resp = await post(false);
+    if (resp.status === 401) {
+      await recoverAuth();
+      resp = await post(false);
+    }
     let data = await resp.json();
     if (resp.status === 429) {
       line("佇列已滿，稍後重送這一段：" + meta.seq);
       await new Promise((resolve) => setTimeout(resolve, 800));
       resp = await post(true);
+      if (resp.status === 401) {
+        await recoverAuth();
+        resp = await post(true);
+      }
       data = await resp.json();
     }
     if (!resp.ok || !data.ok) {
-      line("失敗：" + (data.detail || data.error || "辨識失敗"));
-      return data;
+      const message = data.detail || data.error || "辨識失敗";
+      line("失敗：" + message);
+      throw new Error(message);
     }
-    captionEn.textContent = data.en || "（尚無英譯）";
-    captionZh.textContent = data.zh || data.error || "";
-    line((data.en || "（尚無英譯）") + "\n" + (data.zh || data.error || ""));
+    showCaption(data, false);
+    if (data.zh || data.error) line(data.zh || data.error);
     return data;
   },
   onPhase(next) {
@@ -227,13 +339,14 @@ go.onclick = async () => {
   roomEl.disabled = true;
   go.disabled = true;
   try {
-    await fetch("/api/rooms/open", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ room_id: room }) });
-    await fetch("/api/glossary", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ room_id: room, session_id: "pending", text: document.querySelector("#glossary").value }) });
+    await hostFetch("/api/rooms/open", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: room }) });
+    listenCaptions(room, true);
+    await hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: room, session_id: "pending", text: document.querySelector("#glossary").value }) });
     await ctl.start();
     const activeRoom = ctl.session ? ctl.session.roomId : room;
-    await fetch("/api/session/active", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ room_id: activeRoom, active: true }) });
+    await hostFetch("/api/session/active", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: activeRoom, active: true }) });
     if (ctl.session) {
-      await fetch("/api/glossary", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ room_id: ctl.session.roomId, session_id: ctl.session.id, text: document.querySelector("#glossary").value }) });
+      await hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: ctl.session.roomId, session_id: ctl.session.id, text: document.querySelector("#glossary").value }) });
     }
     line("開始聽了。每一段都是完整錄音。");
   } catch (err) {
@@ -249,7 +362,8 @@ stopBtn.onclick = async () => {
   const current = ctl.session;
   await ctl.stop();
   if (current) {
-    await fetch("/api/session/end", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ room_id: current.roomId, session_id: current.id }) });
+    const endBody = { room_id: current.roomId, session_id: current.id, last_seq: ctl.lastSeq || 0 };
+    await hostFetch("/api/session/end", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(endBody) });
   }
   lockRoom();
   line(ctl.lastError ? ("已停止：" + ctl.lastError) : "已停止。收音已停，送出的尾段也處理完了。");
@@ -281,7 +395,7 @@ document.querySelector("#try").onclick = async () => {
 };
 document.querySelector("#save-terms").onclick = async () => {
   if (!token || !ctl.session) { line("開始聽之後才會把術語套到這一場。"); return; }
-  await fetch("/api/glossary", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ room_id: ctl.session.roomId, session_id: ctl.session.id, text: document.querySelector("#glossary").value }) });
+  await hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: ctl.session.roomId, session_id: ctl.session.id, text: document.querySelector("#glossary").value }) });
   line("已儲存這一場的術語。");
 };
 document.querySelector("#skip").onclick = async () => {
@@ -297,6 +411,50 @@ document.querySelector("#skip").onclick = async () => {
   });
   const data = await resp.json();
   line(resp.ok ? "已標記缺段 " + seq : (data.detail || "無法標記缺段"));
+};
+document.querySelector("#delete-seg").onclick = async () => {
+  if (!token || !ctl.session) {
+    line("還沒開始聽，不能刪除字幕。");
+    return;
+  }
+  const seq = Number(document.querySelector("#skip-seq").value);
+  const id = ctl.session.roomId + ":" + ctl.session.id + ":" + seq;
+  const resp = await hostFetch("/api/captions?room_id=" + encodeURIComponent(ctl.session.roomId) + "&id=" + encodeURIComponent(id), {
+    method: "DELETE",
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    line(data.detail || "無法刪除這段");
+    return;
+  }
+  view.apply({ type: "caption_deleted", id, session_id: ctl.session.id, seq });
+  paintCaption(false, null, false);
+  line("已刪除第 " + seq + " 段。");
+};
+document.querySelector("#retranslate").onclick = async () => {
+  const shown = applyCaption({ items: captions }, null);
+  if (!shown.retry || !shown.item) {
+    line("這一段沒有需要重試的英譯。");
+    return;
+  }
+  const item = shown.item;
+  const roomId = item.room_id || (ctl.session && ctl.session.roomId) || roomEl.value;
+  const resp = await hostFetch("/api/segment/retranslate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ room_id: roomId, session_id: item.session_id, seq: item.seq }),
+  });
+  let data = {};
+  try {
+    data = await resp.json();
+  } catch (err) {
+    data = {};
+  }
+  if (!resp.ok) {
+    line(data.detail || "無法重試英譯");
+    return;
+  }
+  line("已重送第 " + item.seq + " 段的英譯。");
 };
 document.querySelector("#export").onclick = async () => {
   const resp = await fetch("/api/export?room_id=" + encodeURIComponent(roomEl.value) + "&kind=srt", { headers: { authorization: "Bearer " + token } });
@@ -328,7 +486,10 @@ roomEl.addEventListener("change", () => {
   }
   setup();
 });
-window.addEventListener("pagehide", () => { ctl.stop(); });
+window.addEventListener("pagehide", () => {
+  if (captionConn) captionConn.stop();
+  ctl.stop();
+});
 const tokenResp = await fetch("/api/host-token");
 if (!tokenResp.ok) {
   status.className = "warn";

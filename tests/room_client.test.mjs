@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { connectRoom, liveTail } from "../app/static/room_client.js";
+import { connectRoom, createCaptionView, liveTail, mergeCaptionUpdate } from "../app/static/room_client.js";
 
 function tick() {
   return new Promise((resolve) => setTimeout(resolve, 0));
@@ -161,4 +161,265 @@ resumed[1].onmessage({ data: JSON.stringify({ type: "ping" }) });
 assert.equal(JSON.parse(resumed[1].sent[0]).type, "pong");
 resumeConn.stop();
 await resumeConn.done;
+
+const kept = { id: "class:s:1", version: 2, zh: "中", en: "old" };
+assert.equal(mergeCaptionUpdate(kept, { id: "class:s:1", version: 1, zh: "中", en: "" }), kept);
+assert.equal(mergeCaptionUpdate(kept, { id: "class:s:1", version: 2, zh: "中", en: "same" }), kept);
+assert.equal(mergeCaptionUpdate(kept, { id: "", version: 3, en: "nope" }), kept);
+assert.equal(mergeCaptionUpdate(null, { id: "", version: 1 }), null);
+const newer = mergeCaptionUpdate(kept, { id: "class:s:1", version: 3, zh: "中", en: "new" });
+assert.equal(newer.en, "new");
+assert.equal(newer.version, 3);
+assert.equal(mergeCaptionUpdate(null, { id: "class:s:2", zh: "下一句" }).zh, "下一句");
+
+const removed = [];
+const cleared = [];
+const resetNotes = [];
+const live = [];
+const deleteSockets = [];
+const deleteConn = connectRoom({
+  room: "class",
+  url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
+  openSocket(address) {
+    const ws = fakeSocket(address);
+    deleteSockets.push(ws);
+    return ws;
+  },
+  onState: () => {},
+  onEvent: (item) => live.push(item),
+  onDelete: (item) => removed.push(item),
+  onClear: (item) => cleared.push(item),
+  onReset: () => resetNotes.push("reset"),
+});
+await tick();
+deleteSockets[0].onopen();
+deleteSockets[0].onmessage({
+  data: JSON.stringify({ type: "hello", latest_cursor: 1, history: [{ id: "class:s:1", session_id: "s", seq: 1, version: 1, cursor: 1, zh: "留下" }] }),
+});
+deleteSockets[0].onmessage({
+  data: JSON.stringify({ type: "caption_deleted", id: "class:s:1", session_id: "s", seq: 1, version: 9, cursor: 2, zh: "" }),
+});
+assert.equal(removed.length, 1);
+assert.equal(removed[0].id, "class:s:1");
+assert.equal(live.filter((item) => item.type === "caption_deleted").length, 0);
+assert.equal(live.filter((item) => item.zh === "留下").length, 1);
+deleteSockets[0].onmessage({
+  data: JSON.stringify({ type: "captions_cleared", room_id: "class", epoch: 2, cursor: 3 }),
+});
+assert.equal(cleared.length, 1);
+assert.equal(live.filter((item) => item.type === "captions_cleared").length, 0);
+assert.equal(deleteConn.cursor, 3);
+deleteConn.stop();
+await deleteConn.done;
+
+const captionView = createCaptionView();
+captionView.apply({ id: "class:s:1", session_id: "s", seq: 1, version: 1, zh: "甲" });
+captionView.apply({ type: "caption_deleted", id: "class:s:1", session_id: "s", seq: 1 });
+captionView.apply({ id: "class:s:1", session_id: "s", seq: 1, version: 4, zh: "甲復活" });
+assert.equal(captionView.items.has("class:s:1"), false);
+captionView.apply({ id: "class:s:2", session_id: "s", seq: 2, version: 1, zh: "乙" });
+captionView.apply({ type: "captions_cleared" });
+assert.equal(captionView.items.size, 0);
+captionView.apply({ id: "class:s:2", session_id: "s", seq: 2, version: 3, zh: "乙復活" });
+assert.equal(captionView.items.has("class:s:2"), false);
+captionView.reset();
+captionView.apply({ id: "class:s:2", session_id: "s", seq: 2, version: 1, zh: "乙" });
+assert.equal(captionView.items.get("class:s:2").zh, "乙");
+
+const rewindSockets = [];
+const rewindEvents = [];
+const rewindConn = connectRoom({
+  room: "class",
+  url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
+  openSocket(address) {
+    const ws = fakeSocket(address);
+    rewindSockets.push(ws);
+    return ws;
+  },
+  sleep: () => Promise.resolve(),
+  onState: () => {},
+  onEvent: (item) => rewindEvents.push(item),
+  onReset: () => resetNotes.push("rewind"),
+});
+await tick();
+rewindSockets[0].onopen();
+rewindSockets[0].onmessage({
+  data: JSON.stringify({
+    type: "hello",
+    latest_cursor: 50,
+    history: [{ id: "class:s:9", session_id: "s", seq: 9, version: 1, cursor: 50, zh: "舊游標" }],
+  }),
+});
+assert.equal(rewindConn.cursor, 50);
+rewindSockets[0].onclose();
+await tick();
+assert.match(rewindSockets[1].address, /cursor=50/);
+rewindSockets[1].onopen();
+rewindSockets[1].onmessage({
+  data: JSON.stringify({
+    type: "hello",
+    latest_cursor: 2,
+    history: [],
+    events: [],
+  }),
+});
+await tick();
+assert.ok(resetNotes.includes("rewind"));
+assert.match(rewindSockets.at(-1).address, /cursor=0/);
+const resumedSocket = rewindSockets.at(-1);
+resumedSocket.onopen();
+resumedSocket.onmessage({
+  data: JSON.stringify({
+    type: "hello",
+    latest_cursor: 2,
+    history: [{ id: "class:s:1", session_id: "s", seq: 1, version: 1, cursor: 2, zh: "重來" }],
+  }),
+});
+assert.equal(rewindEvents.filter((item) => item.zh === "重來").length, 1);
+assert.equal(rewindConn.cursor, 2);
+rewindConn.stop();
+await rewindConn.done;
+
+async function testEpochResetRequestsReplayAndGapBackfill() {
+  const sockets = [];
+  const events = [];
+  const backfills = [];
+  const resets = [];
+  const conn = connectRoom({
+    room: "class",
+    url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
+    openSocket(address) {
+      const ws = fakeSocket(address);
+      sockets.push(ws);
+      return ws;
+    },
+    sleep: () => Promise.resolve(),
+    onState: () => {},
+    onEvent: (item) => events.push(item),
+    onBackfill: (rows) => backfills.push(rows),
+    onReset: () => resets.push("reset"),
+  });
+  await tick();
+  sockets[0].onopen();
+  sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "hello",
+      epoch: 4,
+      latest_cursor: 3,
+      history: [{ id: "class:s:1", session_id: "s", seq: 1, version: 2, cursor: 3, zh: "舊" }],
+    }),
+  });
+  assert.equal(conn.cursor, 3);
+  sockets[0].onclose();
+  await tick();
+  assert.match(sockets[1].address, /cursor=3/);
+  sockets[1].onopen();
+  sockets[1].onmessage({
+    data: JSON.stringify({
+      type: "hello",
+      epoch: 9,
+      latest_cursor: 1,
+      history: [],
+      events: [],
+      gap: true,
+      backfill: [{ id: "class:s:1", session_id: "s", seq: 1, version: 2, zh: "舊" }],
+    }),
+  });
+  await tick();
+  assert.ok(resets.includes("reset"));
+  assert.match(sockets.at(-1).address, /cursor=0/);
+  assert.match(sockets.at(-1).address, /replay=1/);
+  const replay = sockets.at(-1);
+  replay.onopen();
+  replay.onmessage({
+    data: JSON.stringify({
+      type: "hello",
+      epoch: 9,
+      latest_cursor: 2,
+      backfill: [
+        { id: "class:s:1", session_id: "s", seq: 1, version: 2, cursor: 1, zh: "甲" },
+        { id: "class:s:2", session_id: "s", seq: 2, version: 1, cursor: 2, zh: "乙" },
+      ],
+      history: [{ id: "class:s:1", session_id: "s", seq: 1, version: 2, cursor: 1, zh: "甲" }],
+    }),
+  });
+  assert.equal(backfills.at(-1).map((item) => item.zh).join(","), "甲,乙");
+  assert.equal(events.filter((item) => item.zh === "甲").length, 1);
+  replay.onmessage({
+    data: JSON.stringify({ id: "class:s:1", session_id: "s", seq: 1, version: 2, zh: "甲" }),
+  });
+  assert.equal(events.filter((item) => item.zh === "甲").length, 1);
+  conn.stop();
+  await conn.done;
+}
+await testEpochResetRequestsReplayAndGapBackfill();
+
+async function testRoomUnavailableDoesNotResetBackoff() {
+  const sockets = [];
+  const waits = [];
+  const states = [];
+  const conn = connectRoom({
+    room: "class",
+    url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
+    openSocket(address) {
+      const ws = fakeSocket(address);
+      sockets.push(ws);
+      return ws;
+    },
+    sleep: (ms) => {
+      waits.push(ms);
+      return Promise.resolve();
+    },
+    onState: (text) => states.push(text),
+    onEvent: () => {},
+  });
+  await tick();
+  for (let i = 0; i < 3; i += 1) {
+    const ws = sockets[i];
+    assert.ok(ws);
+    ws.onopen();
+    ws.onmessage({ data: JSON.stringify({ type: "room_unavailable", reason: "unknown_or_ended" }) });
+    await tick();
+  }
+  assert.deepEqual(waits.slice(0, 3), [800, 1600, 3200]);
+  assert.ok(states.includes("房間已結束"));
+  conn.stop();
+  await conn.done;
+}
+await testRoomUnavailableDoesNotResetBackoff();
+
+async function testStaleNudgeReconnectsFromLastMessageTime() {
+  let now = 10000;
+  const sockets = [];
+  const conn = connectRoom({
+    room: "class",
+    url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
+    now: () => now,
+    staleMs: 1000,
+    openSocket(address) {
+      const ws = fakeSocket(address);
+      sockets.push(ws);
+      return ws;
+    },
+    sleep: () => Promise.resolve(),
+    onState: () => {},
+    onEvent: () => {},
+  });
+  await tick();
+  sockets[0].onopen();
+  sockets[0].onmessage({ data: JSON.stringify({ type: "ping" }) });
+  now = 10500;
+  conn.nudge();
+  await tick();
+  assert.equal(sockets.length, 1);
+  assert.equal(sockets[0].closed, undefined);
+  now = 12000;
+  conn.nudge();
+  await tick();
+  assert.equal(sockets[0].closed, true);
+  assert.match(sockets.at(-1).address, /cursor=/);
+  conn.stop();
+  await conn.done;
+}
+await testStaleNudgeReconnectsFromLastMessageTime();
 console.log("room client ok");

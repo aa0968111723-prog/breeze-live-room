@@ -310,4 +310,107 @@ failedRelease();
 await new Promise((resolve) => setTimeout(resolve, 0));
 assert.equal(failedCtl.uploads.length, 1);
 assert.equal(failedCtl.uploads[0].meta.sessionId, "fail-sess");
+
+async function testStopNeverHangsWhenUploadStalls() {
+  const pending = [];
+  const stall = createCaptureController({
+    periodMs: 60000,
+    uploadTimeoutMs: 5000,
+    schedule(fn, ms) {
+      const item = { fn, ms, cleared: false };
+      pending.push(item);
+      return item;
+    },
+    clearSchedule(item) {
+      if (item) item.cleared = true;
+    },
+    openMic: async () => fakeStream(),
+    createRecorder: factory.createRecorder,
+    newId: () => "stall",
+    roomId: () => "class",
+    upload: () => new Promise(() => {}),
+  });
+  await stall.start();
+  const stopping = stall.stop();
+  const winner = await Promise.race([
+    (async () => {
+      const deadline = Date.now() + 1000;
+      while (Date.now() < deadline) {
+        // finishCurrent and settleUploads each arm their own timer. Fire every one that is still pending.
+        for (const timer of pending) {
+          if (!timer.cleared) timer.fn();
+        }
+        const status = await Promise.race([
+          stopping.then(() => "done"),
+          new Promise((resolve) => setTimeout(() => resolve("wait"), 0)),
+        ]);
+        if (status === "done") return "done";
+      }
+      return "hung-inner";
+    })(),
+    new Promise((resolve) => setTimeout(() => resolve("hung"), 500)),
+  ]);
+  assert.equal(winner, "done");
+  assert.equal(stall.state, "idle");
+  assert.ok(stall.inflight >= 1, "a stalled upload must not be required to resolve");
+  assert.match(stall.lastError, /逾時/);
+}
+await testStopNeverHangsWhenUploadStalls();
+
+async function testTimedOutUploadDoesNotWedgeNextSession() {
+  let releaseOld = () => {};
+  const seen = [];
+  let sessionNum = 0;
+  const ctl = createCaptureController({
+    periodMs: 60000,
+    maxInflight: 1,
+    uploadTimeoutMs: 40,
+    openMic: async () => fakeStream(),
+    createRecorder: factory.createRecorder,
+    newId: () => "sess-" + (++sessionNum),
+    roomId: () => "class",
+    upload(meta) {
+      seen.push(meta.sessionId + ":" + meta.seq);
+      if (meta.sessionId === "sess-1") {
+        return new Promise((resolve) => { releaseOld = resolve; });
+      }
+      return Promise.resolve({ ok: true });
+    },
+  });
+  await ctl.start();
+  const stopping = ctl.stop();
+  const winner = await Promise.race([
+    stopping.then(() => "done"),
+    new Promise((resolve) => setTimeout(() => resolve("hung"), 500)),
+  ]);
+  assert.equal(winner, "done");
+  assert.equal(ctl.state, "idle");
+  assert.ok(ctl.inflight >= 1, "timed-out upload stays tracked until the next start");
+  const started = ctl.start();
+  const startWinner = await Promise.race([
+    started.then(() => "started"),
+    new Promise((resolve) => setTimeout(() => resolve("wedged"), 200)),
+  ]);
+  assert.equal(startWinner, "started");
+  assert.equal(ctl.state, "recording");
+  assert.equal(ctl.inflight, 0);
+  const stoppingNext = ctl.stop();
+  const nextWinner = await Promise.race([
+    stoppingNext.then(() => "done"),
+    new Promise((resolve) => setTimeout(() => resolve("hung"), 500)),
+  ]);
+  assert.equal(nextWinner, "done");
+  assert.ok(seen.includes("sess-2:1"), seen.join(","));
+  assert.equal(ctl.inflight, 0);
+  const uploadsBefore = ctl.uploads.length;
+  releaseOld({ ok: true });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(ctl.inflight, 0);
+  assert.equal(ctl.uploads.length, uploadsBefore);
+  await ctl.start();
+  await ctl.stop();
+  assert.ok(seen.includes("sess-3:1"), seen.join(","));
+  assert.equal(ctl.inflight, 0);
+}
+await testTimedOutUploadDoesNotWedgeNextSession();
 console.log("recorder machine ok");
