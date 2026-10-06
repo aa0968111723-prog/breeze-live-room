@@ -999,6 +999,11 @@ class Pipeline:
                 raise PipelineError(409, "同一段的內容不同，已拒絕替換")
             if slot_held:
                 self.release_slot()
+            existing = self.results.get(segment.key)
+            if existing is not None and self._result_ready(existing, wait_translation=wait_translation):
+                return existing
+            if not wait_translation:
+                return await self._wait_result(existing or segment, wait_translation=False)
             return await inflight
         existing = self.results.get(segment.key)
         if existing is None and segment.key in self._index:
@@ -1015,7 +1020,7 @@ class Pipeline:
             if not reprocess:
                 if slot_held:
                     self.release_slot()
-                return await self._wait_result(existing)
+                return await self._wait_result(existing, wait_translation=wait_translation)
             segment.version = max(existing.version + 1, 1)
         elif existing and stored != digest:
             # Restored rows have no audio hash. Returning the saved caption
@@ -1027,7 +1032,7 @@ class Pipeline:
                 floor = self._version_floor.get(segment.key, 0)
                 if floor and existing.version < floor:
                     existing.version = floor
-                return await self._wait_result(existing)
+                return await self._wait_result(existing, wait_translation=wait_translation)
             if not salvage:
                 if slot_held:
                     self.release_slot()
@@ -1078,17 +1083,33 @@ class Pipeline:
             setattr(fut, "room_gen", segment.room_gen)
         return fut
 
-    def _result_ready(self, segment: Segment) -> bool:
+    def _result_ready(self, segment: Segment, *, wait_translation: bool = True) -> bool:
         if self._stale(segment):
             return True
         if segment.status in TERMINAL and segment.status != "zh_ready":
             return True
-        # Ordered Chinese with no translation queued will never wake a waiter.
-        return segment.status == "zh_ready" and segment.key in self._emitted_segs and not segment.translate_queued
+        if segment.status != "zh_ready" or segment.key not in self._emitted_segs:
+            return False
+        # Async opt-in returns as soon as ordered Chinese is published.
+        return (not wait_translation) or (not segment.translate_queued)
 
-    async def _wait_result(self, segment: Segment) -> Segment:
-        if self._result_ready(segment):
+    async def _wait_result(self, segment: Segment, *, wait_translation: bool = True) -> Segment:
+        if self._result_ready(segment, wait_translation=wait_translation):
             return segment
+        if not wait_translation:
+            try:
+                if segment.key not in self._emitted_segs:
+                    await self._wait_emitted(segment)
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    raise
+            current = self.results.get(segment.key)
+            current = current if current is not None else segment
+            if self._result_ready(current, wait_translation=False):
+                return current
+            if self._stale(current) or current.status in TERMINAL:
+                return current
         fut = self._future(segment)
         self._waiters.setdefault(segment.key, []).append(fut)
         try:
