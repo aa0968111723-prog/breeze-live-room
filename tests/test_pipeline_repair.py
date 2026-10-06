@@ -437,6 +437,9 @@ def test_host_upload_failure_throws_and_delete_control_is_present():
     assert "throw new Error" in upload
     assert "刪除此段" in text
     assert "onDelete" in text
+    delete_handler = text.split('querySelector("#delete-seg")', 1)[1].split('querySelector("#export")', 1)[0]
+    assert "hostFetch(" in delete_handler
+    assert "await fetch(" not in delete_handler
     assert "captions_cleared" in text
     room = Path("app/static/room.html").read_text(encoding="utf-8")
     assert "onDelete" in room

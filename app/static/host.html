@@ -415,9 +415,8 @@ document.querySelector("#delete-seg").onclick = async () => {
   }
   const seq = Number(document.querySelector("#skip-seq").value);
   const id = ctl.session.roomId + ":" + ctl.session.id + ":" + seq;
-  const resp = await fetch("/api/captions?room_id=" + encodeURIComponent(ctl.session.roomId) + "&id=" + encodeURIComponent(id), {
+  const resp = await hostFetch("/api/captions?room_id=" + encodeURIComponent(ctl.session.roomId) + "&id=" + encodeURIComponent(id), {
     method: "DELETE",
-    headers: { authorization: "Bearer " + token },
   });
   const data = await resp.json();
   if (!resp.ok) {
