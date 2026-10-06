@@ -6,10 +6,15 @@
     [switch]$NoVerify
 )
 $ErrorActionPreference = 'Stop'
-# Read the three Breeze shortcuts with WScript.Shell and write a UTF-8 (no BOM)
-# JSON array to -Out. Unless -NoVerify, exit 1 when a link is missing, its target
-# is not InstallDir joined with the bat name, its working directory is not
-# InstallDir, or its arguments are non-empty. Messages name the link and are ASCII.
+# Read the three Breeze shortcuts with Shell.Application (ShellLinkObject) and
+# write a UTF-8 (no BOM) JSON array to -Out. WScript.Shell is not used for
+# verification: on English Windows its TargetPath and WorkingDirectory come back
+# empty when the target contains characters outside the ANSI code page, even
+# though the link itself is valid. Each row still records that TargetPath as
+# wscript_target so the limitation stays visible. wscript_target is never compared.
+# Unless -NoVerify, exit 1 when a link is missing, its target is not InstallDir
+# joined with the bat name, its working directory is not InstallDir, or its
+# arguments are non-empty. Messages name the link and are ASCII.
 
 if ([string]::IsNullOrEmpty($InstallDir)) {
     # Two levels above this file: the install root when invoked as .\scripts\ci\read_shortcuts.ps1.
@@ -25,32 +30,58 @@ $entries = @(
     @{ Name = 'Breeze Doctor'; Bat = 'doctor.bat' }
 )
 
-$shell = New-Object -ComObject WScript.Shell
+$app = New-Object -ComObject Shell.Application
+$folder = $app.Namespace($DesktopPath)
+$wscript = New-Object -ComObject WScript.Shell
 $rows = @()
 $failures = New-Object 'System.Collections.Generic.List[string]'
 foreach ($entry in $entries) {
     $linkName = [string]$entry.Name
     $batName = [string]$entry.Bat
-    $shortcutPath = Join-Path $DesktopPath ($linkName + '.lnk')
+    $linkFileName = $linkName + '.lnk'
+    $shortcutPath = Join-Path $DesktopPath $linkFileName
     $exists = Test-Path -LiteralPath $shortcutPath
     $target = ''
     $workdir = ''
     $linkArgs = ''
     $icon = ''
+    $wscriptTarget = ''
     if ($exists) {
-        $link = $shell.CreateShortcut($shortcutPath)
-        $target = [string]$link.TargetPath
-        $workdir = [string]$link.WorkingDirectory
-        $linkArgs = [string]$link.Arguments
-        $icon = [string]$link.IconLocation
+        $item = $null
+        if ($null -ne $folder) {
+            $item = $folder.ParseName($linkFileName)
+        }
+        if ($null -ne $item) {
+            $link = $item.GetLink
+            if ($null -ne $link) {
+                $target = [string]$link.Path
+                $workdir = [string]$link.WorkingDirectory
+                $linkArgs = [string]$link.Arguments
+                try {
+                    $iconPath = ''
+                    $idx = $link.GetIconLocation([ref]$iconPath)
+                    $icon = "$iconPath,$idx"
+                } catch {
+                    $icon = ''
+                }
+            }
+        }
+        try {
+            $wshLink = $wscript.CreateShortcut($shortcutPath)
+            $wscriptTarget = [string]$wshLink.TargetPath
+        } catch {
+            $wscriptTarget = ''
+        }
     }
     $rows += [pscustomobject]@{
-        path    = $shortcutPath
-        exists  = [bool]$exists
-        target  = $target
-        workdir = $workdir
-        args    = $linkArgs
-        icon    = $icon
+        path           = $shortcutPath
+        exists         = [bool]$exists
+        target         = $target
+        workdir        = $workdir
+        args           = $linkArgs
+        icon           = $icon
+        reader         = 'Shell.Application'
+        wscript_target = $wscriptTarget
     }
     if ($NoVerify) { continue }
     if (-not $exists) {

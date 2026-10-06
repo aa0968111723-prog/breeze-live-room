@@ -185,6 +185,40 @@ def _tree(path: Path) -> list[str]:
     return sorted(item.relative_to(path).as_posix() for item in path.rglob("*"))
 
 
+# shell32 itself writes Microsoft\Windows\Caches\*.db under the overridden
+# %ProgramData% when a shortcut is created. That cache is not this script.
+_SHELL32_CACHE = "Microsoft/Windows/Caches"
+_SHELL32_CACHE_DIRS = {"Microsoft", "Microsoft/Windows", _SHELL32_CACHE}
+_BREEZE_TEMP_DIR_NAMES = {"BreezeLiveRoom", "BreezeLiveRoomTmp"}
+
+
+def _assert_rejected_dir_has_no_breeze_temp(path: Path, before: list[str], detail: str) -> None:
+    """A rejected non-ASCII dir must not keep a Breeze temp directory.
+
+    The only permitted tree change is shell32's Microsoft\\Windows\\Caches
+    files (and the ancestor directories that hold them). Nothing named
+    BreezeLiveRoom or BreezeLiveRoomTmp may appear anywhere under ``path``.
+    """
+    after = _tree(path)
+    for rel in after:
+        overlap = set(rel.split("/")) & _BREEZE_TEMP_DIR_NAMES
+        assert not overlap, f"{rel} names {sorted(overlap)}\n{detail}"
+    before_set = set(before)
+    after_set = set(after)
+
+    def _is_shell32_cache(rel: str) -> bool:
+        return rel in _SHELL32_CACHE_DIRS or rel.startswith(_SHELL32_CACHE + "/")
+
+    for rel in after:
+        if rel in before_set:
+            continue
+        assert _is_shell32_cache(rel), f"added outside Microsoft\\Windows\\Caches: {rel}\n{detail}"
+    for rel in before:
+        if rel in after_set:
+            continue
+        assert _is_shell32_cache(rel), f"removed outside Microsoft\\Windows\\Caches: {rel}\n{detail}"
+
+
 def _compile_artifacts(path: Path) -> list[Path]:
     if not path.exists():
         return []
@@ -374,7 +408,7 @@ def test_fallback_public_when_programdata_unusable(install_dir, desktop, non_asc
     assert proc.returncode == 0, detail
     _assert_links(desktop, detail)
     _assert_used_ascii_temp(proc, r"pub_ascii\BreezeLiveRoom\tmp")
-    assert _tree(program_data) == before, detail
+    _assert_rejected_dir_has_no_breeze_temp(program_data, before, detail)
     assert not (program_data / "BreezeLiveRoom").exists(), detail
     assert not (public / "BreezeLiveRoom").exists(), detail
 
@@ -414,8 +448,8 @@ def test_fallback_systemdrive_when_programdata_and_public_unusable(
     _assert_links(desktop, detail)
     _assert_used_ascii_temp(proc, r"sysdrv\BreezeLiveRoomTmp")
     assert not (system_drive / "BreezeLiveRoomTmp").exists(), detail
-    assert _tree(program_data) == program_before, detail
-    assert _tree(public) == public_before, detail
+    _assert_rejected_dir_has_no_breeze_temp(program_data, program_before, detail)
+    _assert_rejected_dir_has_no_breeze_temp(public, public_before, detail)
     assert not (program_data / "BreezeLiveRoom").exists(), detail
     assert not (public / "BreezeLiveRoom").exists(), detail
 
@@ -537,17 +571,31 @@ def test_install_root_chinese_space_on_c_drive(tmp_path):
             shutil.rmtree(root)
 
 
-def test_links_read_back_via_wscript_shell(install_dir, desktop, non_ascii_temp_env):
-    """A-11: WScript.Shell read-back keeps the Chinese target, workdir, and empty args.
+def test_links_read_back_unicode(install_dir, desktop, non_ascii_temp_env):
+    """A-11: Shell.Application ShellLinkObject read-back keeps the Chinese target.
 
-    The script does not call SetIconLocation. IconLocation is whatever WScript
-    reports today: an empty string or ",0".
+    WScript.Shell returns an empty TargetPath for Chinese targets on English
+    Windows, as the spec's fallback clause anticipated, so read-back uses
+    Shell.Application ShellLinkObject. IShellLinkW -CheckOnly is also asserted.
+    Target and working directory match exactly, including Chinese, and args are
+    empty. The install script sets no icon. The observed WScript value was
+    ",0"; Shell.Application must report exactly "" or ",0".
     """
     created = run_ps(install_dir, "-DesktopPath", str(desktop), env=non_ascii_temp_env)
     assert created.returncode == 0, _detail(created)
+    checked = run_ps(
+        install_dir,
+        "-CheckOnly",
+        "-DesktopPath",
+        str(desktop),
+        env=non_ascii_temp_env,
+    )
+    assert checked.returncode == 0, _detail(checked)
     links = read_links(desktop)
     for name, bat in zip(LINKS, TARGETS):
         row = links[name]
+        assert row["reader"] == "Shell.Application", row
+        assert "wscript_target" in row, row
         assert row["target"] == str(install_dir / bat), row
         assert row["workdir"] == str(install_dir), row
         assert row["args"] == "", row
@@ -681,6 +729,8 @@ def test_read_shortcuts_verifies_created_links(install_dir, desktop, non_ascii_t
     for name, bat in zip(LINKS, TARGETS):
         row = by_name[name]
         assert row["exists"] is True, row
+        assert row["reader"] == "Shell.Application", row
+        assert "wscript_target" in row, row
         assert row["target"] == str(install_dir / bat), row
         assert row["workdir"] == str(install_dir), row
         assert row["args"] == "", row

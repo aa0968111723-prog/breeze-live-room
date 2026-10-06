@@ -158,7 +158,9 @@ def test_read_shortcuts_script_has_utf8_bom():
     assert raw.startswith(b"\xef\xbb\xbf"), "read_shortcuts.ps1 must start with a UTF-8 BOM"
     text = raw.decode("utf-8-sig")
     assert text.isascii()
+    assert "Shell.Application" in text
     assert "WScript.Shell" in text
+    assert "wscript_target" in text
     assert "NoVerify" in text
     assert "$Out" in text
     assert "$InstallDir" in text
