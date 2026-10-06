@@ -1,5 +1,7 @@
 # Windows 安裝與操作
 
+App 安裝：雙擊 `Breeze-Live-Room-Setup.exe`。不必先裝 Python。設定與字幕在更新時保留，關閉視窗會停止辨識服務。下面是原始碼 ZIP 的安裝方式。
+
 這個候選版包含完整安裝、辨識自檢及長場次匯出修正。請從 [候選版分支](https://github.com/aa0968111723-prog/breeze-live-room/tree/codex/windows-readiness-20261005) 選 Code → Download ZIP，再解壓縮。修正在 [PR #3](https://github.com/aa0968111723-prog/breeze-live-room/pull/3)，目標為 main，目前仍是驗收候選版。
 
 ## 執行環境

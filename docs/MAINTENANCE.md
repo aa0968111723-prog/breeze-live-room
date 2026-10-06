@@ -21,6 +21,8 @@
 
 Dependabot 每週提出 Python 依賴更新，每月檢查 Actions；仍需維護者審查、更新鎖檔與實機驗收後發布。Python/模型/ffmpeg 的更新不會由 Dependabot 自動完成。不能把自動化設定視為永遠不需人維護。
 
-`python scripts/package_release.py` 可離線建包；同一份檔案會產生相同 ZIP。更新器只接受本儲存庫正式 Release 的固定檔名，核對 ZIP 及逐檔 SHA256，拒絕路徑穿越、重複檔名與私人資料路徑。HTTPS 與 GitHub 帳號是信任邊界，SHA256 不等同獨立數位簽章。
+`python scripts/build_setup.py --assets <已有模型與工具的目錄> --sdk <WebView2 SDK 目錄>` 產生 `dist/Breeze-Live-Room-Setup.exe` 與同名 `.sha256`。正式發布時兩個檔案都要放上 Release，檔名不可改。安裝檔不含 `.env`、字幕與日誌。App 內的檢查更新只認這兩個檔案。
+
+`python scripts/package_release.py` 可離線建原始碼包；同一份檔案會產生相同 ZIP。更新器只接受本儲存庫正式 Release 的固定檔名，核對 ZIP 及逐檔 SHA256，拒絕路徑穿越、重複檔名與私人資料路徑。HTTPS 與 GitHub 帳號是信任邊界，SHA256 不等同獨立數位簽章。
 
 更新先建立新虛擬環境，再備份來源、模型和工具。失敗恢復前版；回復不修改字幕資料或設定。遇到斷電／強制關機，保留 `.updates/backup-*`，修復後再試 `rollback.bat`；目前不保證突然斷電時的完整交易恢復，也不支援資料庫格式的跨版本逆向遷移。

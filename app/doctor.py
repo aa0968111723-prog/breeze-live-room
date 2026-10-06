@@ -28,7 +28,12 @@ def inspect(settings: Settings, root: Path = ROOT, verify_model: bool = False, p
             add(package, True, importlib.metadata.version(package))
         except importlib.metadata.PackageNotFoundError:
             add(package, False, "請執行 install.bat 安裝套件")
-    add("asr_mode", settings.asr_mode in {"cli", "resident"}, settings.asr_mode)
+    add("asr_mode", settings.asr_mode in {"cli", "resident", "native"}, settings.asr_mode)
+    if settings.asr_mode == 'native':
+        try:
+            add('native_binding', True, importlib.metadata.version('pywhispercpp'))
+        except importlib.metadata.PackageNotFoundError:
+            add('native_binding', False, '請重新安裝 App 或執行 install.bat')
     model = Path(settings.model_path) if settings.model_path else root / "models" / "ggml-breeze-asr-25-q5_0.bin"
     add("model", model.is_file() and model.stat().st_size > 0, "模型存在" if model.is_file() else "缺少模型，請執行 install.bat")
     if verify_model and model.is_file():

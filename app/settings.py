@@ -133,8 +133,8 @@ class Settings:
             raise ValueError("歷史、翻譯佇列與聽眾佇列至少為 1")
         if self.gap_wait_s < 0 or self.room_idle_s < 0:
             raise ValueError("等待時間不能是負數")
-        if self.asr_mode not in {"cli", "resident"}:
-            raise ValueError("BREEZE_ASR 只接受 cli 或 resident")
+        if self.asr_mode not in {"cli", "resident", "native"}:
+            raise ValueError("BREEZE_ASR 只接受 cli、resident 或 native")
         if self.resident_startup_s <= 0 or self.asr_timeout_s <= 0:
             raise ValueError("辨識啟動及推論逾時必須大於零")
         if self.asr_audio_context != 0 and not 128 <= self.asr_audio_context <= 1500:

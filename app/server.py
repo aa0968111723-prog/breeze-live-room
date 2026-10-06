@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.asr import CliAsr, ResidentAsr
+from app.native_asr import NativeResidentAsr
 from app.audio import AudioError, convert_to_wav, ffmpeg_bin, wav_duration_seconds
 from app.auth import new_host_token, require_host, require_local_host
 from app.dispatch import ListenerSlot, RoomBus
@@ -150,7 +151,14 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
     bus = RoomBus(settings.history_limit)
     store = CaptionStore(settings.data_path or None)
     if asr is None:
-        if settings.asr_mode == "resident":
+        if settings.asr_mode == "native":
+            asr = NativeResidentAsr(model, threads=settings.asr_threads,
+                startup_timeout_s=settings.resident_startup_s, inference_timeout_s=settings.asr_timeout_s,
+                audio_context=settings.asr_audio_context, beam_size=settings.asr_beam_size, best_of=settings.asr_best_of)
+            started = asr.start()
+            if not started.ok:
+                resident_error = started.error
+        elif settings.asr_mode == "resident":
             resident = ResidentAsr(
                 settings.resident_url,
                 server_bin=Path(settings.server_path) if settings.server_path else DEFAULT_SERVER,
@@ -295,7 +303,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             "translate_configured": bool(translator.key) and settings.translate,
             "translate_verified": False,
             "translate_label": translator.status_label(),
-            "asr_mode": "resident" if isinstance(asr, ResidentAsr) else "cli",
+            "asr_mode": "native" if isinstance(asr, NativeResidentAsr) else ("resident" if isinstance(asr, ResidentAsr) else "cli"),
             "asr_ready": asr_ready,
             "model_reloads_each_segment": isinstance(asr, CliAsr),
             "resident_error": getattr(asr, "last_error", "") or resident_error,
@@ -309,7 +317,8 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
     async def health() -> Response:
         asr_ready = await asyncio.to_thread(asr.health) if isinstance(asr, ResidentAsr) else (whisper.is_file() and model.is_file() if isinstance(asr, CliAsr) else True)
         ready = asr_ready and (decoder is not None or ffmpeg_bin(ROOT) is not None)
-        return JSONResponse({"service": "breeze-live-room", "ready": ready, "asr_ready": asr_ready}, status_code=200 if ready else 503, headers={"Cache-Control": "no-store"})
+        error = getattr(asr, "last_error", "") or resident_error
+        return JSONResponse({"service": "breeze-live-room", "ready": ready, "asr_ready": asr_ready, "error": error, "instance_id": os.getenv("BREEZE_DESKTOP_INSTANCE", "")}, status_code=200 if ready else 503, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/qr")
     async def qr(room_id: str = "class") -> Response:

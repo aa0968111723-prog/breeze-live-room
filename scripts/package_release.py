@@ -12,13 +12,14 @@ FILES = ('VERSION', 'README.md', '.env.example', 'requirements.txt', 'requiremen
          'runtime-manifest.json', 'bootstrap-manifest.json', 'install.bat', 'install.ps1',
          'install-shortcut.ps1', 'start.bat', 'doctor.bat', 'verify.bat', 'update.bat',
          'update.ps1', 'rollback.bat')
-DIRECTORIES = ('app', 'scripts', 'docs')
+DIRECTORIES = ('app', 'scripts', 'docs', 'desktop')
 
 def source_files(root=ROOT):
     files = [root / name for name in FILES]
     for directory in DIRECTORIES:
         files.extend(p for p in (root / directory).rglob('*')
-                     if p.is_file() and '__pycache__' not in p.parts and p.suffix != '.pyc')
+                     if p.is_file() and '__pycache__' not in p.parts and p.suffix != '.pyc'
+                     and not (directory == 'desktop' and p.suffix.lower() in {'.exe', '.dll'}))
     return sorted(files, key=lambda p: p.relative_to(root).as_posix())
 
 def build(root=ROOT, output=None):
