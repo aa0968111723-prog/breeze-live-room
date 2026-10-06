@@ -867,7 +867,11 @@ class Pipeline:
         self._drain(group)
 
     def _seq_settled(self, key: tuple[str, str, int]) -> bool:
-        """True once this seq has arrived and is no longer decoding or queued for English."""
+        """True once this seq has arrived and left decoding.
+
+        English may still be queued. The host already opted out of waiting for
+        it on upload, and stop should not sit out the flush window for a translation.
+        """
         if key in self._active or key in self._reserved:
             return False
         flight = self._flight.get(key)
@@ -878,14 +882,6 @@ class Pipeline:
             current = self._rehydrate(key)
         if current is None or current.status in {"queued", "decoding", "transcribing"}:
             return False
-        if current.translate_queued:
-            return False
-        if self._translate_q is not None:
-            room_id, session_id, seq = key
-            for item in list(self._translate_q._queue):
-                segment = item[2]
-                if segment.room_id == room_id and segment.session_id == session_id and segment.seq == seq:
-                    return False
         return True
 
     def _through_seq_settled(self, group: tuple[str, str], last_seq: int) -> bool:
