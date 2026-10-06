@@ -35,9 +35,10 @@ li { padding: 8px 0; border-top: 1px solid var(--line); }
 <p id="hist-label">最近字幕</p>
 <ul id="history"></ul>
 <script type="module">
-import { connectRoom, liveTail, orderedCaptions } from "/static/room_client.js";
+import { connectRoom, createCaptionView, liveTail, orderedCaptions } from "/static/room_client.js";
 const room = location.pathname.split("/").filter(Boolean).pop();
-const items = new Map();
+const view = createCaptionView(80);
+const items = view.items;
 const state = { follow: true, pinned: null };
 const en = document.querySelector("#en");
 const zh = document.querySelector("#zh");
@@ -57,11 +58,7 @@ function render() {
   }
 }
 function show(item) {
-  if (!item || item.seq == null || !item.id) return;
-  const prev = items.get(item.id);
-  if (prev && (prev.version || 1) >= (Number(item.version) || 1)) return;
-  items.set(item.id, item);
-  while (items.size > 80) items.delete(items.keys().next().value);
+  view.apply(item);
   render();
 }
 let conn = connect();
@@ -74,6 +71,10 @@ function connect() {
     },
     onState: (text) => { document.querySelector("#state").textContent = text; },
     onEvent: show,
+    onDelete: show,
+    onClear: (data) => { view.apply(data && data.type ? data : { type: "captions_cleared" }); render(); },
+    onBackfill: (rows) => { view.replace(rows); render(); },
+    onReset: () => { view.reset(); render(); },
     onGap: () => { document.querySelector("#state").textContent = "補償窗口不足，只補到伺服器還留著的字幕"; },
   });
 }

@@ -54,12 +54,13 @@ label { display: block; margin-top: 8px; }
 <button id="export" class="secondary" type="button">匯出 SRT</button>
 <label>跳過序號 <input id="skip-seq" inputmode="numeric" value="1" style="width:5em"></label>
 <button id="skip" class="secondary" type="button">標記缺段</button>
+<button id="delete-seg" class="secondary" type="button">刪除此段</button>
 </div>
 <div class="card" id="log"></div>
 </main>
 <script type="module">
 import { createCaptureController } from "/static/recorder_machine.js";
-import { connectRoom, liveTail, mergeCaptionUpdate } from "/static/room_client.js";
+import { connectRoom, createCaptionView, liveTail, mergeCaptionUpdate } from "/static/room_client.js";
 const roomEl = document.querySelector("#room");
 const log = document.querySelector("#log");
 const status = document.querySelector("#status");
@@ -75,7 +76,8 @@ let ready = false;
 let holdRoom = "";
 let captionConn = null;
 let listenedRoom = "";
-const captions = new Map();
+const view = createCaptionView(80);
+const captions = view.items;
 const phaseLabels = {
   idle: "待命",
   preparing: "準備麥克風",
@@ -88,27 +90,37 @@ function line(text) {
   lines.unshift(text);
   log.textContent = lines.slice(0, 40).join("\n");
 }
+function paintCaption(fromSocket, item, prevEn) {
+  const live = liveTail(captions);
+  if (live) {
+    captionEn.textContent = live.en || "（尚無英譯）";
+    captionZh.textContent = live.zh || live.error || "";
+  } else {
+    captionEn.textContent = "";
+    captionZh.textContent = "";
+  }
+  if (fromSocket && item && item.en && !prevEn) {
+    line(item.en + "\n" + (item.zh || item.error || ""));
+  }
+}
 function showCaption(incoming, fromSocket) {
   if (!incoming || incoming.id == null || incoming.id === "") return;
   const prev = captions.get(incoming.id) || null;
   const merged = mergeCaptionUpdate(prev, incoming);
   if (!merged || merged === prev) return;
-  captions.set(incoming.id, merged);
-  const live = liveTail(captions);
-  if (live) {
-    captionEn.textContent = live.en || "（尚無英譯）";
-    captionZh.textContent = live.zh || live.error || "";
+  view.apply(merged);
+  if (view.deleted.has(incoming.id) && !captions.has(incoming.id)) {
+    paintCaption(false, null, false);
+    return;
   }
-  if (fromSocket && merged.en && !(prev && prev.en)) {
-    line(merged.en + "\n" + (merged.zh || merged.error || ""));
-  }
+  paintCaption(fromSocket, merged, prev && prev.en);
 }
 function listenCaptions(roomId, force) {
   if (!token) return;
   const room = (roomId || roomEl.value || "class").trim() || "class";
   if (!force && captionConn && listenedRoom === room) return;
   if (captionConn) captionConn.stop();
-  if (listenedRoom !== room) captions.clear();
+  if (listenedRoom !== room) view.reset();
   listenedRoom = room;
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   captionConn = connectRoom({
@@ -116,6 +128,18 @@ function listenCaptions(roomId, force) {
     url: () => scheme + "://" + location.host + "/ws/listen?room_id=" + encodeURIComponent(room),
     onState: () => {},
     onEvent: (item) => showCaption(item, true),
+    onDelete: (item) => {
+      view.apply(item);
+      paintCaption(false, null, false);
+      line("已刪除一段字幕。");
+    },
+    onClear: (data) => {
+      view.apply(data && data.type ? data : { type: "captions_cleared" });
+      paintCaption(false, null, false);
+      line("這個房間的字幕已清除。");
+    },
+    onBackfill: (rows) => { view.replace(rows); paintCaption(false, null, false); },
+    onReset: () => { view.reset(); paintCaption(false, null, false); },
   });
 }
 function micError(err) {
@@ -231,8 +255,9 @@ const ctl = createCaptureController({
       data = await resp.json();
     }
     if (!resp.ok || !data.ok) {
-      line("失敗：" + (data.detail || data.error || "辨識失敗"));
-      return data;
+      const message = data.detail || data.error || "辨識失敗";
+      line("失敗：" + message);
+      throw new Error(message);
     }
     showCaption(data, false);
     if (data.zh || data.error) line(data.zh || data.error);
@@ -337,6 +362,26 @@ document.querySelector("#skip").onclick = async () => {
   });
   const data = await resp.json();
   line(resp.ok ? "已標記缺段 " + seq : (data.detail || "無法標記缺段"));
+};
+document.querySelector("#delete-seg").onclick = async () => {
+  if (!token || !ctl.session) {
+    line("還沒開始聽，不能刪除字幕。");
+    return;
+  }
+  const seq = Number(document.querySelector("#skip-seq").value);
+  const id = ctl.session.roomId + ":" + ctl.session.id + ":" + seq;
+  const resp = await fetch("/api/captions?room_id=" + encodeURIComponent(ctl.session.roomId) + "&id=" + encodeURIComponent(id), {
+    method: "DELETE",
+    headers: { authorization: "Bearer " + token },
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    line(data.detail || "無法刪除這段");
+    return;
+  }
+  view.apply({ type: "caption_deleted", id, session_id: ctl.session.id, seq });
+  paintCaption(false, null, false);
+  line("已刪除第 " + seq + " 段。");
 };
 document.querySelector("#export").onclick = async () => {
   const resp = await fetch("/api/export?room_id=" + encodeURIComponent(roomEl.value) + "&kind=srt", { headers: { authorization: "Bearer " + token } });
