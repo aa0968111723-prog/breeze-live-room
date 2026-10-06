@@ -1011,7 +1011,7 @@ class Pipeline:
             if not reprocess:
                 if slot_held:
                     self.release_slot()
-                return await self._wait_result(existing)
+                return await self._wait_result(existing, wait_translation=wait_translation)
             segment.version = max(existing.version + 1, 1)
         elif existing and stored != digest:
             # Restored rows have no audio hash. Returning the saved caption
@@ -1023,7 +1023,7 @@ class Pipeline:
                 floor = self._version_floor.get(segment.key, 0)
                 if floor and existing.version < floor:
                     existing.version = floor
-                return await self._wait_result(existing)
+                return await self._wait_result(existing, wait_translation=wait_translation)
             if not salvage:
                 if slot_held:
                     self.release_slot()
@@ -1074,17 +1074,33 @@ class Pipeline:
             setattr(fut, "room_gen", segment.room_gen)
         return fut
 
-    def _result_ready(self, segment: Segment) -> bool:
+    def _result_ready(self, segment: Segment, *, wait_translation: bool = True) -> bool:
         if self._stale(segment):
             return True
         if segment.status in TERMINAL and segment.status != "zh_ready":
             return True
-        # Ordered Chinese with no translation queued will never wake a waiter.
-        return segment.status == "zh_ready" and segment.key in self._emitted_segs and not segment.translate_queued
+        if segment.status != "zh_ready" or segment.key not in self._emitted_segs:
+            return False
+        # Async opt-in returns as soon as ordered Chinese is published.
+        return (not wait_translation) or (not segment.translate_queued)
 
-    async def _wait_result(self, segment: Segment) -> Segment:
-        if self._result_ready(segment):
+    async def _wait_result(self, segment: Segment, *, wait_translation: bool = True) -> Segment:
+        if self._result_ready(segment, wait_translation=wait_translation):
             return segment
+        if not wait_translation:
+            try:
+                if segment.key not in self._emitted_segs:
+                    await self._wait_emitted(segment)
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    raise
+            current = self.results.get(segment.key)
+            current = current if current is not None else segment
+            if self._result_ready(current, wait_translation=False):
+                return current
+            if self._stale(current) or current.status in TERMINAL:
+                return current
         fut = self._future(segment)
         self._waiters.setdefault(segment.key, []).append(fut)
         try:
@@ -1653,7 +1669,10 @@ class Pipeline:
             self._max_seq[group] = int(info["max_seq"])
             # Past the saved seqs, so a continuing session does not invent 1..N gaps.
             self._next[group] = int(info["max_seq"]) + 1
-            for seq in range(1, int(info["max_seq"]) + 1):
+            # Seq below the oldest saved caption were expired or purged, not missing.
+            # Filling 1..max_seq would resurrect them as blank captions with a new TTL.
+            oldest = min(info["seqs"]) if info["seqs"] else 1
+            for seq in range(oldest, int(info["max_seq"]) + 1):
                 if seq not in info["seqs"]:
                     self.mark_missing(room_id, session_id, seq, "缺段：這段沒有留在逐字稿裡")
         if max_ord:

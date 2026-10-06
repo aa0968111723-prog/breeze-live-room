@@ -74,6 +74,48 @@ async def test_restart_replays_store_into_history_with_versions(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_restart_does_not_resurrect_expired_seq_as_missing(tmp_path):
+    """Early captions expire on their own TTL. Restart must not fill those holes as missing."""
+    path = tmp_path / "captions.sqlite3"
+    first = app_for(settings=_settings(path), translator=Translator(enabled=False))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=first), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(first, client)
+            await _push_lines(client, token, [(1, "甲"), (2, "乙"), (3, "丙")])
+            await asyncio.to_thread(first.state.store.flush)
+    finally:
+        await stop(first)
+
+    with sqlite3.connect(path) as conn:
+        conn.execute("update captions set updated_at = ? where seq = 1", (time.time() - 90_000,))
+        conn.commit()
+
+    resumed = app_for(settings=_settings(path), translator=Translator(enabled=False))
+    try:
+        async with _serving(resumed):
+            async with AsyncClient(transport=ASGITransport(app=resumed), base_url="http://127.0.0.1:8780") as client:
+                token = await token_of(resumed, client)
+                del token
+                await resumed.state.sweep_once()
+                await asyncio.to_thread(resumed.state.store.flush)
+                bus = {item["seq"]: item for item in resumed.state.bus.caption_state("class")}
+                stored = {row["seq"]: row for row in resumed.state.store.room_rows("class")}
+                history_seqs = {
+                    item["seq"]
+                    for item in resumed.state.bus.history("class")
+                    if item.get("seq") is not None
+                }
+                assert 1 not in bus
+                assert 1 not in stored
+                assert 1 not in history_seqs
+                assert [bus[seq]["zh"] for seq in (2, 3)] == ["乙", "丙"]
+                assert bus[2]["status"] != "missing" and bus[3]["status"] != "missing"
+                assert stored[2]["status"] != "missing" and stored[3]["status"] != "missing"
+    finally:
+        await stop(resumed)
+
+
+@pytest.mark.anyio
 async def test_restart_continuing_session_has_no_fake_missing_gaps(tmp_path):
     path = tmp_path / "captions.sqlite3"
     first = app_for(settings=_settings(path, gap_wait_s=30), translator=Translator(enabled=False))
