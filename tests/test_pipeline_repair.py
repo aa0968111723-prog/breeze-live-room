@@ -1009,3 +1009,98 @@ async def test_emitted_segment_index_respects_caption_cap():
             assert 1 not in kept
     finally:
         await stop(app)
+
+
+class _DelayAsr(EchoAsr):
+    def __init__(self, delay: float):
+        self.delay = delay
+
+    def transcribe(self, wav, prompt: str):
+        time.sleep(self.delay)
+        return super().transcribe(wav, prompt)
+
+
+@pytest.mark.anyio
+async def test_stop_flush_admits_chunk_inside_window_and_last_seq_returns_early():
+    """A chunk still in transit after /api/session/end is exported, not 409 or missing.
+
+    Without last_seq an idle session that has not seen a seq stays open for the
+    flush window. With last_seq the call stays open until that seq settles and
+    then returns, instead of sitting out the rest of the window.
+    """
+    app = app_for(
+        asr=_DelayAsr(0.05),
+        settings=settings_with(
+            allow_testclient=True,
+            translate=False,
+            gap_wait_s=30,
+            stop_flush_s=1.2,
+        ),
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            headers = {**auth(token), "content-type": "application/json"}
+            ending = asyncio.create_task(client.post(
+                "/api/session/end",
+                json={"room_id": "class", "session_id": "live"},
+                headers=headers,
+            ))
+            await asyncio.sleep(0.35)
+            assert not ending.done(), "end returned before the flush window; an in-transit chunk would be 409"
+            late = await push(client, token, "class", "live", 1, "路上".encode(), t0_ms=0, t1_ms=400)
+            assert late.status_code == 200, late.text
+            assert late.json()["zh"] == "路上"
+            assert late.json()["status"] != "missing"
+            done = await asyncio.wait_for(ending, 2)
+            assert done.status_code == 200, done.text
+            exported = await export_of(client, token, "class", "json")
+            rows = {row["seq"]: row for row in exported.json()}
+            assert rows[1]["zh"] == "路上"
+            assert rows[1]["status"] != "missing"
+            refused = await push(client, token, "class", "live", 2, "太晚".encode())
+            assert refused.status_code == 409
+            assert refused.json()["detail"] == "這個會話已結束"
+
+            prior = await push(client, token, "class", "held", 1, "已到".encode(), t0_ms=0, t1_ms=400)
+            assert prior.status_code == 200, prior.text
+            held_end = asyncio.create_task(client.post(
+                "/api/session/end",
+                json={"room_id": "class", "session_id": "held"},
+                headers=headers,
+            ))
+            await asyncio.sleep(0.35)
+            assert not held_end.done(), "a landed session must stay open for the flush window"
+            held_late = await push(client, token, "class", "held", 2, "後到".encode(), t0_ms=400, t1_ms=800)
+            assert held_late.status_code == 200, held_late.text
+            assert held_late.json()["zh"] == "後到"
+            assert held_late.json()["status"] != "missing"
+            held_done = await asyncio.wait_for(held_end, 2)
+            assert held_done.status_code == 200, held_done.text
+            held_export = await export_of(client, token, "class", "json")
+            held_rows = {(row["session_id"], row["seq"]): row for row in held_export.json()}
+            assert held_rows[("held", 2)]["zh"] == "後到"
+            assert held_rows[("held", 2)]["status"] != "missing"
+
+            started = time.monotonic()
+            named = asyncio.create_task(client.post(
+                "/api/session/end",
+                json={"room_id": "class", "session_id": "named", "last_seq": 1},
+                headers=headers,
+            ))
+            await asyncio.sleep(0.25)
+            assert not named.done()
+            arrived = await push(client, token, "class", "named", 1, "尾段".encode(), t0_ms=0, t1_ms=500)
+            assert arrived.status_code == 200, arrived.text
+            assert arrived.json()["zh"] == "尾段"
+            finished = await asyncio.wait_for(named, 2)
+            elapsed = time.monotonic() - started
+            assert finished.status_code == 200, finished.text
+            assert elapsed < 0.9, elapsed
+            named_rows = await export_of(client, token, "class", "json")
+            body = named_rows.json()
+            assert any(row["session_id"] == "named" and row["seq"] == 1 and row["zh"] == "尾段" for row in body)
+            after = await push(client, token, "class", "named", 2, "不收".encode())
+            assert after.status_code == 409
+    finally:
+        await stop(app)

@@ -215,6 +215,7 @@ export function createCaptureController(deps) {
     get pendingRoom() { return pendingRoom; },
     get lastError() { return lastError; },
     get inflight() { return inflight.size; },
+    get lastSeq() { return seq; },
     get gaps() { return gaps; },
     canEditRoom() { return state === "idle" || state === "error"; },
     fail,

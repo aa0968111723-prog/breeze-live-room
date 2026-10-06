@@ -358,7 +358,8 @@ stopBtn.onclick = async () => {
   const current = ctl.session;
   await ctl.stop();
   if (current) {
-    await hostFetch("/api/session/end", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: current.roomId, session_id: current.id }) });
+    const endBody = { room_id: current.roomId, session_id: current.id, last_seq: ctl.lastSeq || 0 };
+    await hostFetch("/api/session/end", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(endBody) });
   }
   lockRoom();
   line(ctl.lastError ? ("已停止：" + ctl.lastError) : "已停止。收音已停，送出的尾段也處理完了。");

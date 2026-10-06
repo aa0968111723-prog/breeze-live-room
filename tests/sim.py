@@ -475,7 +475,11 @@ class VirtualHost:
             await asyncio.wait(self._tasks)
         resp = await self.client.post(
             "/api/session/end",
-            json={"room_id": self.room, "session_id": self.session},
+            json={
+                "room_id": self.room,
+                "session_id": self.session,
+                "last_seq": len(self._all),
+            },
             headers={**auth(self.token), "content-type": "application/json"},
         )
         self.stop_elapsed_v = (time.monotonic() - real) / self.scale

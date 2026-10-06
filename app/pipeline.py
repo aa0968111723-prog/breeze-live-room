@@ -668,28 +668,84 @@ class Pipeline:
             seq += 1
         self._drain(group)
 
-    async def end_session(self, room_id: str, session_id: str, *, flush_s: float | None = None) -> None:
-        """Finish in-flight audio and queued English, then close the session.
+    def _seq_settled(self, key: tuple[str, str, int]) -> bool:
+        """True once this seq has arrived and is no longer decoding or queued for English."""
+        if key in self._active or key in self._reserved:
+            return False
+        flight = self._flight.get(key)
+        if flight is not None and not flight.done():
+            return False
+        current = self.results.get(key)
+        if current is None and key in self._index:
+            current = self._rehydrate(key)
+        if current is None or current.status in {"queued", "decoding", "transcribing"}:
+            return False
+        if current.translate_queued:
+            return False
+        if self._translate_q is not None:
+            room_id, session_id, seq = key
+            for item in list(self._translate_q._queue):
+                segment = item[2]
+                if segment.room_id == room_id and segment.session_id == session_id and segment.seq == seq:
+                    return False
+        return True
 
-        New chunks are still accepted until this returns, so the last upload
-        that races the stop button is not answered 409. The wait is bounded.
+    def _through_seq_settled(self, group: tuple[str, str], last_seq: int) -> bool:
+        if last_seq <= 0:
+            return not self._session_busy(group)
+        room_id, session_id = group
+        for seq in range(1, last_seq + 1):
+            if not self._seq_settled((room_id, session_id, seq)):
+                return False
+        return True
+
+    async def end_session(
+        self,
+        room_id: str,
+        session_id: str,
+        *,
+        flush_s: float | None = None,
+        last_seq: int | None = None,
+    ) -> None:
+        """Finish in-flight audio, then close the session.
+
+        Chunks are admitted until this returns. With ``last_seq`` (the host
+        page sends the last seq it produced) the wait ends as soon as every
+        seq up to that number has arrived and settled, or the flush deadline
+        passes. Without it, old clients stay open for the whole flush window
+        unless audio or English was already in flight — that work is finished
+        and the call returns, so a stop is not pinned to the deadline. Holes
+        are filled only after admission closes.
         """
         group = (room_id, session_id)
         if group in self._closed and group not in self._flushing:
             return
         timeout = self.settings.stop_flush_s if flush_s is None else max(0.0, float(flush_s))
+        expected: int | None
+        if last_seq is None:
+            expected = None
+        else:
+            try:
+                expected = int(last_seq)
+            except (TypeError, ValueError):
+                expected = None
+            if expected is not None and expected < 0:
+                expected = None
         deadline = time.monotonic() + timeout
-        # Short window so a chunk posted immediately after /api/session/end still enters.
-        grace_until = time.monotonic() + min(0.2, timeout)
+        # In-flight work at the start of stop (a translation already running)
+        # is flushed, then the call returns. Sitting out the rest of the window
+        # would fail callers that bound the stop by stop_flush_s. If nothing is
+        # in flight, hold the whole window: the next chunk may still be on the
+        # wire, and closing after the old 0.2s grace answered it 409.
+        busy_at_start = self._session_busy(group)
         self._flushing.add(group)
         try:
-            while time.monotonic() < grace_until:
-                remaining = grace_until - time.monotonic()
-                if remaining <= 0:
+            while time.monotonic() < deadline:
+                if expected is not None:
+                    if self._through_seq_settled(group, expected):
+                        break
+                elif busy_at_start and not self._session_busy(group):
                     break
-                await asyncio.sleep(min(0.02, remaining))
-            self._fill_session_holes(room_id, session_id)
-            while time.monotonic() < deadline and self._session_busy(group):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -750,8 +806,14 @@ class Pipeline:
         if existing is None and segment.key in self._index:
             existing = self._rehydrate(segment.key)
         stored = self._hashes.get(segment.key)
+        replace_missing = (
+            group in self._flushing
+            and existing is not None
+            and existing.status == "missing"
+            and segment.key not in self._active
+        )
         if existing and stored == digest:
-            reprocess = retry and existing.status in FAILURES and segment.key not in self._active
+            reprocess = (retry or replace_missing) and existing.status in FAILURES and segment.key not in self._active
             if not reprocess:
                 if slot_held:
                     self.release_slot()
@@ -760,19 +822,20 @@ class Pipeline:
         elif existing and stored != digest:
             # Restored rows have no audio hash. Returning the saved caption
             # keeps a restart from rejecting the same seq or rewriting it.
-            if stored is None and not (retry and existing.status in FAILURES and segment.key not in self._active):
+            salvage = (retry or replace_missing) and existing.status in FAILURES and segment.key not in self._active
+            if stored is None and not salvage:
                 if slot_held:
                     self.release_slot()
                 floor = self._version_floor.get(segment.key, 0)
                 if floor and existing.version < floor:
                     existing.version = floor
                 return await self._wait_result(existing)
-            if not (retry and existing.status in FAILURES and segment.key not in self._active):
+            if not salvage:
                 if slot_held:
                     self.release_slot()
                 raise PipelineError(409, "同一段的內容不同，已拒絕替換")
             segment.version = max(existing.version + 1, self._version_floor.get(segment.key, 0) + 1, 1)
-        if retry and (existing is None or (existing.status in FAILURES and segment.key not in self._active)):
+        if (retry or replace_missing) and (existing is None or (existing.status in FAILURES and segment.key not in self._active)):
             self._cancel.discard(segment.key)
         floor = self._version_floor.get(segment.key, 0)
         if floor and segment.version <= floor and (existing is None or segment.version != existing.version):
@@ -1259,7 +1322,7 @@ class Pipeline:
             await asyncio.sleep(tick)
             now = time.monotonic()
             for group, max_seq in list(self._max_seq.items()):
-                if group in self._closed:
+                if group in self._closed or group in self._flushing:
                     continue
                 nxt = self._next.get(group, 1)
                 if nxt > max_seq or nxt in self._held.get(group, {}):

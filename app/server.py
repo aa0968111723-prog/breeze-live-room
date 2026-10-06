@@ -495,7 +495,13 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 flush_s = None
         if str(body.get("flush", "1")).strip().lower() in {"0", "false", "no"}:
             flush_s = 0.0
-        await pipeline.end_session(room_id, session_id, flush_s=flush_s)
+        last_seq = None
+        if "last_seq" in body and body.get("last_seq") is not None:
+            try:
+                last_seq = int(body.get("last_seq"))
+            except (TypeError, ValueError):
+                last_seq = None
+        await pipeline.end_session(room_id, session_id, flush_s=flush_s, last_seq=last_seq)
         await asyncio.to_thread(store.flush)
         book.set_session_active(room_id, False)
         return {"ok": True}
