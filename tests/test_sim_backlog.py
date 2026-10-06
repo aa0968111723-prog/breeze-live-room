@@ -195,16 +195,17 @@ async def test_429_retry_lands_once():
     later lands, and each seq is exported once.
 
     Opt-in matches host.html (wait_translation=0, x-breeze-async-translation: 1). On this
-    branch the admit slot is released at Chinese, not after English. The one 800ms-scaled
-    retry stays in flight, and the recorder does not start another slice while it is
-    pending, or that slice would take the only queue slot.
+    branch the admit slot is released at Chinese, not after English. hold_for_retry
+    keeps the recorder from starting another slice while the one 800ms retry is
+    in flight, or that slice would take the only queue slot. The 100-minute host
+    does not set it: maxInflight is what host.html waits on.
     """
     from tests.sim import Listener, TextAsr, VirtualHost, export_json, open_room, serving, sim_settings
 
     async with serving(settings=sim_settings(max_queue=1, translate=False), asr=TextAsr(4.0)) as (app, client, token):
         await open_room(client, token, "class")
         async with Listener(app, "class") as listener:
-            host = VirtualHost(client, token, "class", "retry", period_v=3.5)
+            host = VirtualHost(client, token, "class", "retry", period_v=3.5, hold_for_retry=True)
             await host.run(30)
             assert host.retries, "expected at least one 429"
             assert await listener.wait_for(

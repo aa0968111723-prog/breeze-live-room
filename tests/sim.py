@@ -362,7 +362,10 @@ async def post_segment(client, token, room, session, seq, payload: bytes, t0_ms:
 class VirtualHost:
     """recorder_machine.js with the host page's async-translation opt-in."""
 
-    def __init__(self, client, token, room, session, scale=None, max_inflight=2, period_v=6.0, retry_429_v=0.8):
+    def __init__(
+        self, client, token, room, session, scale=None, max_inflight=2, period_v=6.0, retry_429_v=0.8,
+        hold_for_retry: bool = False,
+    ):
         self.client = client
         self.token = token
         self.room = room
@@ -371,6 +374,10 @@ class VirtualHost:
         self.max_inflight = max_inflight
         self.period_v = period_v
         self.retry_429_v = retry_429_v
+        # host.html retries a 429 inside the upload and keeps recording until
+        # maxInflight uploads are out. Only a one-slot queue must hold the
+        # recorder for that retry, or the next slice takes the slot.
+        self.hold_for_retry = hold_for_retry
         # Cleared only around a stop-the-world sample so that sample is not
         # inside the upload whose latency we measure. Set means slices may start.
         self._release_slice = asyncio.Event()
@@ -411,17 +418,19 @@ class VirtualHost:
         try:
             resp = await post_segment(self.client, self.token, self.room, self.session, seq, payload, t0_ms, t1_ms)
             if resp.status_code == 429:
-                # host.html awaits this same upload through one 800ms retry. While that
-                # promise is in flight the recorder must not open another slice: with
-                # max_queue=1 the new slice would take the slot the retry is waiting for.
+                # host.html sleeps 800ms and posts this same upload once more.
+                # With max_queue=1 that retry has to wait until the other upload
+                # releases the only slot, and the recorder must not start a slice
+                # that would take it. A wider queue retries immediately.
                 self.retries.append(seq)
                 current = asyncio.current_task()
-                if current is not None:
+                if current is not None and self.hold_for_retry:
                     self._retry_tasks.add(current)
                 try:
-                    holders = [task for task in self._active_tasks() if task not in self._retry_tasks]
-                    if holders:
-                        await asyncio.wait(holders)
+                    if self.hold_for_retry:
+                        holders = [task for task in self._active_tasks() if task not in self._retry_tasks]
+                        if holders:
+                            await asyncio.wait(holders)
                     await asyncio.sleep(self.retry_429_v * self.scale)
                     resp = await post_segment(
                         self.client, self.token, self.room, self.session, seq, payload, t0_ms, t1_ms, retry=True,
