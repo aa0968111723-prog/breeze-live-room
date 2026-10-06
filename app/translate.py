@@ -132,11 +132,18 @@ class Translator:
                 if delay > remaining:
                     delay = remaining
             self.attempts_slept.append(delay)
-            if cancel is not None:
+            # A cancel that already fired must not sleep and must not look like a backoff.
+            # An injected sleeper is the test clock: call it instead of blocking the worker,
+            # including when the pipeline also passed a cancel event.
+            if _cancelled(cancel) or _deadline_hit(deadline):
+                return TranslateResult("", "timeout", "英譯逾時，不假設沒有計費。中文仍保留")
+            if self.sleeper is not None:
+                self.sleeper(delay)
+            elif cancel is not None:
                 if cancel.wait(delay):
                     return TranslateResult("", "timeout", "英譯逾時，不假設沒有計費。中文仍保留")
             else:
-                (self.sleeper or time.sleep)(delay)
+                time.sleep(delay)
         return last
 
     def _once(self, zh: str, glossary, context, timeout: float = 40) -> TranslateResult:

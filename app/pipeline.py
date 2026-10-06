@@ -385,6 +385,9 @@ class Pipeline:
         for key in keys[: len(keys) - cap]:
             self._index.pop(key, None)
             self._hashes.pop(key, None)
+            # Same cap as the compact index. The set used to live until drop_room,
+            # so a long class kept one tuple per segment forever.
+            self._emitted_segs.discard(key)
 
     def _rehydrate(self, key: tuple[str, str, int]) -> Segment | None:
         row = self._index.get(key)
@@ -681,10 +684,16 @@ class Pipeline:
         self._flushing.add(group)
         try:
             while time.monotonic() < grace_until:
-                await asyncio.sleep(0.02)
+                remaining = grace_until - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(0.02, remaining))
             self._fill_session_holes(room_id, session_id)
             while time.monotonic() < deadline and self._session_busy(group):
-                await asyncio.sleep(0.02)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(0.02, remaining))
         finally:
             self._flushing.discard(group)
             self._closed.add(group)

@@ -664,8 +664,13 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             retry = _field(form, request, "retry") == "1" or request.headers.get("x-breeze-retry") == "1"
             t0_ms = _optional_ms(form, request, "t0_ms")
             t1_ms = _optional_ms(form, request, "t1_ms")
-            if t0_ms is not None and t1_ms is not None and t1_ms < t0_ms:
-                t1_ms = t0_ms
+            # Both ends are present: keep a positive duration. Equal ends (and a
+            # negative span that clamped to the same instant) would export a cue
+            # with end == start, which is not a valid subtitle interval.
+            if t0_ms is not None and t1_ms is not None and t1_ms <= t0_ms:
+                if t0_ms >= _MAX_SEGMENT_MS:
+                    t0_ms = _MAX_SEGMENT_MS - 1
+                t1_ms = t0_ms + 1
             segment = Segment(
                 room_id=room_id,
                 session_id=session_id,

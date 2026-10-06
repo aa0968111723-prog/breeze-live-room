@@ -208,6 +208,9 @@ export function connectRoom({ room, url, onState, onEvent, onGap, onDelete, onCl
           }
           if (data.type === "room_unavailable") {
             onState(data.reason === "full" ? "房間已滿，稍後再連" : "房間已結束");
+            // "ended" is the host closing the room. Stop. unknown_or_ended still
+            // retries: that reason is also what a not-yet-opened room sends.
+            if (data.reason === "ended") stopped = true;
             try { ws.close(); } catch { /* reconnect uses the attempt counter */ }
             return;
           }

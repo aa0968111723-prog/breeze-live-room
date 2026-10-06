@@ -986,3 +986,26 @@ async def test_listener_error_does_not_stall_later_segments():
             assert any(item.get("zh") == "第二" for item in rows)
     finally:
         await stop(app)
+
+
+@pytest.mark.anyio
+async def test_emitted_segment_index_respects_caption_cap():
+    """_emitted_segs used to grow for the life of the process. It now drops with the caption index."""
+    app = app_for(settings=settings_with(allow_testclient=True, translate=False, room_caption_cap=3))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            for seq in range(1, 6):
+                resp = await push(
+                    client, token, "class", "s", seq, f"第{seq}句".encode(),
+                    async_header=True, wait_translation="0", t0_ms=(seq - 1) * 1000, t1_ms=seq * 1000,
+                )
+                assert resp.status_code == 200, resp.text
+            pipe = app.state.pipeline
+            assert len(pipe._index) <= 3
+            assert len(pipe._emitted_segs) <= 3
+            kept = {key[2] for key in pipe._emitted_segs}
+            assert kept <= {3, 4, 5}
+            assert 1 not in kept
+    finally:
+        await stop(app)

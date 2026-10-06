@@ -60,7 +60,8 @@ label { display: block; margin-top: 8px; }
 </main>
 <script type="module">
 import { createCaptureController } from "/static/recorder_machine.js";
-import { connectRoom, createCaptionView, liveTail, mergeCaptionUpdate } from "/static/room_client.js";
+import { connectRoom, createCaptionView, mergeCaptionUpdate } from "/static/room_client.js";
+import { applyCaption } from "/static/host_caption.js";
 const roomEl = document.querySelector("#room");
 const log = document.querySelector("#log");
 const status = document.querySelector("#status");
@@ -91,10 +92,10 @@ function line(text) {
   log.textContent = lines.slice(0, 40).join("\n");
 }
 function paintCaption(fromSocket, item, prevEn) {
-  const live = liveTail(captions);
-  if (live) {
-    captionEn.textContent = live.en || "（尚無英譯）";
-    captionZh.textContent = live.zh || live.error || "";
+  const shown = applyCaption({ items: captions }, null);
+  if (shown.item) {
+    captionEn.textContent = shown.label;
+    captionZh.textContent = shown.zh;
   } else {
     captionEn.textContent = "";
     captionZh.textContent = "";
