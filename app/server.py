@@ -238,12 +238,30 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         if retained:
             pipeline.note_retained_order(room_id, retained)
 
+    def _split_kept_id(room_id: str, seg_id: str) -> tuple[str, int]:
+        prefix = room_id + ":"
+        if not str(seg_id).startswith(prefix):
+            return "", 0
+        session, sep, seq_text = str(seg_id)[len(prefix):].rpartition(":")
+        if not sep:
+            return "", 0
+        try:
+            seq = int(seq_text)
+        except ValueError:
+            return "", 0
+        if seq < 1 or not session:
+            return "", 0
+        return session, seq
+
     def _expire_captions() -> None:
-        now = time.time()
-        for room_id in list(bus._state_at):
-            if book.get(room_id) is not None:
-                continue
-            if bus.caption_age(room_id, now) < settings.caption_ttl_s:
+        # Each caption expires on its own updated time, including in an open room.
+        # SQLite purge uses the same rule. An empty idle room then drops its runtime.
+        for room_id, seg_id in bus.prune_expired(settings.caption_ttl_s):
+            session_id, seq = _split_kept_id(room_id, seg_id)
+            if session_id and seq:
+                pipeline.forget_expired(room_id, session_id, seq)
+        for room_id in list(bus._state):
+            if bus.has_captions(room_id) or book.get(room_id) is not None:
                 continue
             bus.drop(room_id)
             pipeline.drop_room(room_id)

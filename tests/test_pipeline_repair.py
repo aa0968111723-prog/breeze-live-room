@@ -1384,6 +1384,55 @@ async def test_store_delete_failure_keeps_captions_and_reports_failure(tmp_path)
         await stop(restarted)
 
 
+@pytest.mark.anyio
+async def test_active_room_expires_each_caption_not_the_whole_room():
+    """An open room must drop captions older than the ttl without sealing the seq."""
+    app = app_for(settings=settings_with(
+        allow_testclient=True, translate=False, caption_ttl_s=30, room_idle_s=3600,
+    ))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            headers = {**auth(token), "content-type": "application/json"}
+            first = await push(client, token, "class", "s", 1, "舊".encode(), async_header=True, wait_translation="0")
+            second = await push(client, token, "class", "s", 2, "新".encode(), async_header=True, wait_translation="0")
+            assert first.status_code == 200 and second.status_code == 200
+            assert app.state.room_book.get("class") is not None
+            app.state.bus._caption_at["class"]["class:s:1"] = time.time() - 90
+            await app.state.sweep_once()
+            state = {row["id"]: row for row in app.state.bus.caption_state("class")}
+            assert "class:s:1" not in state
+            assert state["class:s:2"]["zh"] == "新"
+            assert app.state.room_book.get("class") is not None
+            exported = await export_of(client, token, "class", "json")
+            texts = [row["zh"] for row in exported.json()]
+            assert texts == ["新"]
+            revived = await client.post(
+                "/api/segment/retranslate",
+                json={"room_id": "class", "session_id": "s", "seq": 1},
+                headers=headers,
+            )
+            assert revived.status_code == 404
+            again = await push(client, token, "class", "s", 1, "再來".encode(), async_header=True, wait_translation="0")
+            assert again.status_code == 200, again.text
+            assert again.json()["zh"] == "再來"
+
+            idle_a = await push(client, token, "quiet", "s", 1, "甲".encode(), async_header=True, wait_translation="0")
+            idle_b = await push(client, token, "quiet", "s", 2, "乙".encode(), async_header=True, wait_translation="0")
+            assert idle_a.status_code == 200 and idle_b.status_code == 200
+            closed = await client.post("/api/rooms/close", json={"room_id": "quiet"}, headers=headers)
+            assert closed.status_code == 200, closed.text
+            app.state.bus._caption_at["quiet"]["quiet:s:1"] = time.time() - 90
+            await app.state.sweep_once()
+            quiet = {row["id"]: row for row in app.state.bus.caption_state("quiet")}
+            assert "quiet:s:1" not in quiet
+            assert quiet["quiet:s:2"]["zh"] == "乙"
+            quiet_export = await export_of(client, token, "quiet", "json")
+            assert [row["zh"] for row in quiet_export.json()] == ["乙"]
+    finally:
+        await stop(app)
+
+
 def test_device_acceptance_storage_off_export_covers_a_class():
     """A 100-minute export fits in the room caption cap. Storage is for restart, not for that export."""
     text = Path("docs/DEVICE-ACCEPTANCE.md").read_text(encoding="utf-8")

@@ -493,6 +493,26 @@ class Pipeline:
         held = self._held.get((room_id, session_id))
         return bool(held and seq in held)
 
+    def forget_expired(self, room_id: str, session_id: str, seq: int) -> None:
+        """Drop one caption that aged out. Do not seal it; that seq can be uploaded again."""
+        key = (room_id, session_id, seq)
+        ident = f"{room_id}:{session_id}:{seq}"
+        if ident in self._sealed.get(room_id, ()):
+            return
+        if key in self._active:
+            return
+        flight = self._flight.get(key)
+        if flight is not None and not flight.done():
+            return
+        self._tr_epoch[key] = self._tr_epoch.get(key, 0) + 1
+        self.results.pop(key, None)
+        self._index.pop(key, None)
+        self._hashes.pop(key, None)
+        self._emitted_segs.discard(key)
+        held = self._held.get((room_id, session_id))
+        if held is not None:
+            held.pop(seq, None)
+
     def mute_room(self, room_id: str) -> None:
         """Hold publishes while a room delete is waiting on the store."""
         self._muted.add(room_id)

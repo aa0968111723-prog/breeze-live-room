@@ -37,6 +37,7 @@ class RoomBus:
         self._state: dict[str, dict[str, dict]] = {}
         self._state_order: dict[str, list[str]] = {}
         self._state_at: dict[str, float] = {}
+        self._caption_at: dict[str, dict[str, float]] = {}
         self._tomb: dict[str, set[str]] = {}
 
     def epoch(self, room_id: str) -> int:
@@ -49,6 +50,7 @@ class RoomBus:
 
     def publish(self, event: dict) -> dict | None:
         room = str(event.get("room_id") or "")
+        raw_updated = event.get("updated_at")
         snap = {key: event.get(key) for key in _PASS}
         snap["type"] = snap.get("type") or "caption"
         snap["room_id"] = room
@@ -79,7 +81,7 @@ class RoomBus:
         if kind == "caption_deleted":
             self._remove_id(room, seg_id)
             return dict(stored)
-        self._remember_state(room, stored)
+        self._remember_state(room, stored, raw_updated)
         rows = self.by_room.setdefault(room, [])
         replaced = False
         for index, item in enumerate(rows):
@@ -96,7 +98,7 @@ class RoomBus:
         self.by_room[room] = rows
         return dict(stored)
 
-    def _remember_state(self, room: str, stored: dict) -> None:
+    def _remember_state(self, room: str, stored: dict, updated_at=None) -> None:
         seg_id = str(stored.get("id") or "")
         if not seg_id:
             return
@@ -108,14 +110,26 @@ class RoomBus:
         if seg_id not in bucket:
             order.append(seg_id)
         bucket[seg_id] = dict(stored)
-        self._state_at[room] = time.time()
+        stamp = time.time()
+        if updated_at not in (None, ""):
+            try:
+                parsed = float(updated_at)
+            except (TypeError, ValueError):
+                parsed = 0.0
+            if parsed > 0:
+                stamp = parsed
+        self._caption_at.setdefault(room, {})[seg_id] = stamp
+        self._state_at[room] = max(self._state_at.get(room, 0.0), stamp)
         extra = len(order) - self.caption_cap
         if extra > 0:
             versions = self._ver.get(room)
+            stamps = self._caption_at.get(room)
             for old in order[:extra]:
                 bucket.pop(old, None)
                 if versions is not None:
                     versions.pop(old, None)
+                if stamps is not None:
+                    stamps.pop(old, None)
             del order[:extra]
 
     def _remove_id(self, room: str, seg_id: str) -> None:
@@ -136,6 +150,11 @@ class RoomBus:
                 item for item in log
                 if str(item.get("id") or "") != seg_id or item.get("type") == "caption_deleted"
             ]
+        stamps = self._caption_at.get(room)
+        if stamps is not None:
+            stamps.pop(seg_id, None)
+            if not stamps:
+                self._caption_at.pop(room, None)
 
     def history(self, room_id: str) -> list[dict]:
         return [dict(item) for item in self.by_room.get(room_id, [])]
@@ -165,6 +184,24 @@ class RoomBus:
             return 0.0
         current = time.time() if now is None else now
         return current - stamp
+
+    def prune_expired(self, ttl_s: float, now: float | None = None) -> list[tuple[str, str]]:
+        """Drop captions older than ttl, including ones in a room that is still open.
+
+        SQLite purge deletes each row by its own updated_at. The room's newest
+        caption must not keep an older line alive.
+        """
+        current = time.time() if now is None else float(now)
+        cutoff = current - float(ttl_s)
+        removed: list[tuple[str, str]] = []
+        for room, stamps in list(self._caption_at.items()):
+            stale = [seg_id for seg_id, stamp in list(stamps.items()) if float(stamp) < cutoff]
+            for seg_id in stale:
+                self._remove_id(room, seg_id)
+                removed.append((room, seg_id))
+            if not self._state.get(room):
+                self._state_at.pop(room, None)
+        return removed
 
     def since(self, room_id: str, cursor: int) -> dict:
         log = self._log.get(room_id, [])
@@ -203,6 +240,8 @@ class RoomBus:
             event["type"] = "caption"
             event["room_id"] = room_id
             event["epoch"] = self.epoch(room_id)
+            if row.get("updated_at") not in (None, ""):
+                event["updated_at"] = row.get("updated_at")
             self.publish(event)
 
     def latest_cursor(self, room_id: str) -> int:
@@ -219,6 +258,7 @@ class RoomBus:
         self._state.pop(room_id, None)
         self._state_order.pop(room_id, None)
         self._state_at.pop(room_id, None)
+        self._caption_at.pop(room_id, None)
         self._ver.pop(room_id, None)
         self.by_room.pop(room_id, None)
         self._log[room_id] = []
@@ -258,6 +298,7 @@ class RoomBus:
         self._state.pop(room_id, None)
         self._state_order.pop(room_id, None)
         self._state_at.pop(room_id, None)
+        self._caption_at.pop(room_id, None)
         self._tomb.pop(room_id, None)
         self._epoch[room_id] = self.epoch(room_id) + 1
 
