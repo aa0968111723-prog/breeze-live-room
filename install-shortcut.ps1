@@ -1,8 +1,60 @@
-﻿param([switch]$CheckOnly)
+﻿param(
+    [switch]$CheckOnly,
+    [string]$DesktopPath
+)
 $ErrorActionPreference = 'Stop'
 # Use the Unicode Shell Link interface. WScript.Shell loses characters on an
 # English Windows installation when a target contains a Chinese directory.
-Add-Type -TypeDefinition @'
+
+function Test-BreezeNonAsciiText([string]$Value) {
+    if ([string]::IsNullOrEmpty($Value)) { return $false }
+    foreach ($ch in $Value.ToCharArray()) {
+        if ([int]$ch -gt 127) { return $true }
+    }
+    return $false
+}
+
+function Test-BreezeWritableDirectory([string]$Path) {
+    try {
+        $null = [System.IO.Directory]::CreateDirectory($Path)
+        $probe = Join-Path $Path ([guid]::NewGuid().ToString('n') + '.tmp')
+        [System.IO.File]::WriteAllText($probe, 'ok')
+        try { [System.IO.File]::Delete($probe) } catch { }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Resolve-BreezeAsciiPath([string]$Root, [string]$Leaf) {
+    if ([string]::IsNullOrEmpty($Root)) { return '' }
+    if ($Root -match '^[A-Za-z]:$') { $Root = $Root + '\' }
+    try {
+        $candidate = [System.IO.Path]::GetFullPath((Join-Path $Root $Leaf))
+    } catch {
+        return ''
+    }
+    if (Test-BreezeNonAsciiText $candidate) { return '' }
+    return $candidate
+}
+
+function Get-BreezeAsciiTemp {
+    # csc.exe (Windows PowerShell 5.1) fails when TEMP is not pure ASCII.
+    foreach ($candidate in @(
+        (Resolve-BreezeAsciiPath $env:ProgramData 'BreezeLiveRoom\tmp'),
+        (Resolve-BreezeAsciiPath $env:PUBLIC 'BreezeLiveRoom\tmp'),
+        (Resolve-BreezeAsciiPath $env:SystemDrive 'BreezeLiveRoomTmp')
+    )) {
+        if ([string]::IsNullOrEmpty($candidate)) { continue }
+        if (Test-BreezeWritableDirectory $candidate) { return $candidate }
+    }
+    throw 'No ASCII-only writable directory is available for shortcut compilation.'
+}
+
+$breezeOriginalTemp = $env:TEMP
+$breezeOriginalTmp = $env:TMP
+try {
+    Add-Type -TypeDefinition @'
 using System;
 using System.Text;
 using System.Runtime.InteropServices;
@@ -60,8 +112,17 @@ public static class BreezeDesktopShortcut {
     }
 }
 '@
+} finally {
+    $env:TEMP = $breezeOriginalTemp
+    $env:TMP = $breezeOriginalTmp
+}
+
 $WorkingDirectory = $PSScriptRoot
-$desktop = [Environment]::GetFolderPath('Desktop')
+if ([string]::IsNullOrEmpty($DesktopPath)) {
+    $desktop = [Environment]::GetFolderPath('Desktop')
+} else {
+    $desktop = $DesktopPath
+}
 if (-not $desktop) { exit 1 }
 [System.IO.Directory]::CreateDirectory($desktop) | Out-Null
 foreach ($entry in @(@('Breeze Live Room', 'start.bat'), @('Breeze Update', 'update.bat'), @('Breeze Doctor', 'doctor.bat'))) {
@@ -69,6 +130,14 @@ foreach ($entry in @(@('Breeze Live Room', 'start.bat'), @('Breeze Update', 'upd
     $target = Join-Path $WorkingDirectory $entry[1]
     if (-not $CheckOnly) {
         [BreezeDesktopShortcut]::Create($target, $WorkingDirectory, $shortcutPath)
+    } elseif (-not (Test-Path -LiteralPath $shortcutPath)) {
+        Write-Output ("Shortcut not found: " + $shortcutPath)
+        exit 2
     }
-    [BreezeDesktopShortcut]::Verify($target, $WorkingDirectory, $shortcutPath)
+    try {
+        [BreezeDesktopShortcut]::Verify($target, $WorkingDirectory, $shortcutPath)
+    } catch {
+        Write-Output ('Shortcut target or directory is incorrect: ' + $shortcutPath + ' (' + $_.Exception.Message + ')')
+        exit 1
+    }
 }
