@@ -119,6 +119,28 @@ def port_in_use(port: int) -> bool:
     return False
 
 
+def install_shortcut(root, runner=subprocess.run) -> int:
+    """Create desktop shortcuts. Failure is non-fatal unless BREEZE_REQUIRE_SHORTCUT=1."""
+    if os.getenv("BREEZE_SKIP_SHORTCUT") == "1":
+        return 0
+    try:
+        shortcut = runner(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ".\\install-shortcut.ps1"],
+            cwd=root,
+        )
+    except (FileNotFoundError, OSError):
+        print("無法執行 powershell.exe。")
+        print("桌面捷徑未建立，仍可雙擊 start.bat。")
+        if os.getenv("BREEZE_REQUIRE_SHORTCUT") == "1":
+            return 1
+        return 0
+    if shortcut.returncode:
+        print("桌面捷徑未建立，仍可雙擊 start.bat。")
+        if os.getenv("BREEZE_REQUIRE_SHORTCUT") == "1":
+            return shortcut.returncode or 1
+    return 0
+
+
 def main() -> int:
     if os.name != "nt" or platform.machine().lower() not in {"amd64", "x86_64"}:
         print("此安裝入口適用 Windows 64 位元 Intel／AMD 電腦。")
@@ -170,10 +192,9 @@ def main() -> int:
     doctor = subprocess.run([sys.executable, "-m", "app.doctor", "--verify-model"], cwd=ROOT)
     if doctor.returncode:
         return doctor.returncode
-    if os.getenv('BREEZE_SKIP_SHORTCUT') != '1':
-        shortcut = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ".\\install-shortcut.ps1"], cwd=ROOT)
-        if shortcut.returncode:
-            print("桌面捷徑未建立，仍可雙擊 start.bat。")
+    shortcut_code = install_shortcut(ROOT)
+    if shortcut_code:
+        return shortcut_code
     print("安裝及啟動前檢查完成。請雙擊 start.bat，再進行麥克風試錄。")
     return 0
 
