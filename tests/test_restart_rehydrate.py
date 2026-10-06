@@ -234,3 +234,55 @@ async def test_corrupt_store_is_quarantined_not_deleted(tmp_path):
         await stop(app)
     assert path.exists()
     assert app.state.store.quarantine_path.exists()
+
+
+def test_corrupt_store_connection_is_closed_before_quarantine(tmp_path, monkeypatch):
+    """Windows refuses to rename a file with an open handle (WinError 32).
+
+    The first PRAGMA on a non-SQLite file raises inside CaptionStore._connect.
+    That connection must be closed before the file is moved aside, otherwise the
+    quarantine rename fails on Windows. Linux allows the rename, so this checks
+    the handle directly.
+    """
+    import sqlite3 as _sqlite3
+
+    from app import store as store_mod
+
+    opened = []
+    real_connect = _sqlite3.connect
+
+    class Tracked:
+        def __init__(self, conn):
+            self._conn = conn
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+            return self._conn.close()
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def tracking_connect(*args, **kwargs):
+        conn = Tracked(real_connect(*args, **kwargs))
+        opened.append(conn)
+        return conn
+
+    path = tmp_path / "captions.sqlite3"
+    path.write_bytes(b"this is not sqlite")
+    monkeypatch.setattr(store_mod.sqlite3, "connect", tracking_connect)
+    renamed_while_open = []
+    real_quarantine = store_mod.CaptionStore._quarantine
+
+    def checking_quarantine(self, p):
+        renamed_while_open.extend(c for c in opened if not c.closed)
+        return real_quarantine(self, p)
+
+    monkeypatch.setattr(store_mod.CaptionStore, "_quarantine", checking_quarantine)
+    store = store_mod.CaptionStore(path)
+    try:
+        assert store.recovered is True
+        assert store.quarantine_path is not None and store.quarantine_path.exists()
+        assert renamed_while_open == []
+    finally:
+        store.close()

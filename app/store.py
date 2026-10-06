@@ -44,10 +44,44 @@ class CaptionStore:
 
     def _connect(self, path: Path) -> sqlite3.Connection:
         conn = sqlite3.connect(path, check_same_thread=False)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+        except BaseException:
+            # Windows cannot rename a file that still has an open handle, so a
+            # corrupt store must be closed here before it is quarantined.
+            conn.close()
+            raise
         return conn
+
+    @staticmethod
+    def _probe(path: Path) -> bool:
+        """Check an existing file without a writable handle or WAL.
+
+        Closing a writable connection on a corrupt file can make SQLite remove
+        the -wal sidecar, and Windows cannot rename a file that is still open.
+        An immutable read-only probe touches neither, so the corrupt file and
+        its sidecars can be moved aside intact.
+        """
+        try:
+            if not path.exists() or path.stat().st_size == 0:
+                return True
+        except OSError:
+            return True
+        conn = None
+        try:
+            conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+            check = conn.execute("pragma quick_check").fetchone()
+            return check is not None and str(check[0]).lower() == "ok"
+        except sqlite3.Error:
+            return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def _quarantine(self, path: Path) -> None:
         stamp = time.strftime("%Y%m%d%H%M%S")
@@ -69,6 +103,8 @@ class CaptionStore:
         assert self.path is not None
         conn = None
         try:
+            if not self._probe(self.path):
+                raise sqlite3.DatabaseError("caption store failed a read-only check")
             conn = self._connect(self.path)
             check = conn.execute("pragma quick_check").fetchone()
             if check is None or str(check[0]).lower() != "ok":
