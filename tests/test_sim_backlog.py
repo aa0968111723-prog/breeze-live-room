@@ -114,6 +114,54 @@ def test_emitted_segs_bounded(report):
 
 
 @pytest.mark.anyio
+async def test_sample_stall_does_not_drop_english_in_flight():
+    """A loop hold longer than the scaled translate budget must not drop English.
+
+    The paced run samples the server heap at slice boundaries. On Python 3.11
+    that walk is longer than 40s of virtual time. A line the worker has already
+    started still has to come back in English; the sample waits for it first.
+    """
+    import time
+
+    from tests.sim import (
+        Listener,
+        ScriptedTranslator,
+        TextAsr,
+        VirtualHost,
+        export_json,
+        open_room,
+        sample_after_translations,
+        serving,
+    )
+
+    def plan(zh: str):
+        # Longer than the 6s slice gap, shorter than the 40s budget, so the
+        # next boundary still finds this line in flight.
+        del zh
+        return ("ok", 8.0)
+
+    async with serving(asr=TextAsr(0.2), translator=ScriptedTranslator(plan)) as (app, client, token):
+        await open_room(client, token, "class")
+
+        async def before(seq: int) -> None:
+            if seq != 8:
+                return
+            await sample_after_translations(app.state.pipeline, lambda: time.sleep(0.6))
+
+        async with Listener(app, "class") as listener:
+            host = VirtualHost(client, token, "class", "sample")
+            await host.run(12, pace=True, before_slice=before)
+            assert await listener.wait_for(
+                lambda: len({m.get("seq") for m in listener.captions() if m.get("en")}) >= 12,
+                30,
+            )
+        rows = await export_json(client, token, "class")
+        assert [int(row["seq"]) for row in rows] == list(range(1, 13))
+        missing = [int(row["seq"]) for row in rows if not row.get("en")]
+        assert missing == [], missing
+
+
+@pytest.mark.anyio
 async def test_forced_backlog_reports_waiting_and_recovers():
     """B-a5. ASR slower than the 6s cut produces a waiting interval, then every line is exported."""
     from tests.sim import Listener, ScriptedTranslator, TextAsr, VirtualHost, export_json, open_room, serving
