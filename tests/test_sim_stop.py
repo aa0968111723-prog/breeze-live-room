@@ -116,7 +116,10 @@ async def test_pagehide_without_session_end_fills_missing():
             assert await listener.wait_for(seen, 20)
             missing = next(m for m in listener.messages if m.get("seq") == 3 and m.get("status") == "missing")
             assert (missing["_recv_mono"] - marked) / SCALE <= vlimit(6)
-            assert any(m.get("seq") == 4 and m.get("zh") for m in listener.messages)
+            # Seq 4 is released right after the missing line; the pump may not have read it yet.
+            assert await listener.wait_for(
+                lambda: any(m.get("seq") == 4 and m.get("zh") for m in listener.messages), 5,
+            )
 
 
 @pytest.mark.anyio

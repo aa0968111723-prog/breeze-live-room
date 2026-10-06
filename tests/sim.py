@@ -17,6 +17,7 @@ import io
 import json
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -35,9 +36,13 @@ from app.translate import Translator
 from tests.test_round2 import Socket, auth, copy_decoder, open_room, stop, token_of
 
 # 0.01 rather than the spec's 0.005: a 6s slice is then 60ms, so a few milliseconds of
-# ASGI overhead cannot fill maxInflight and look like the recorder paused. Thresholds
-# stay in virtual seconds. Set BREEZE_SIM_SCALE=0.005 to use the tighter clock.
-SCALE = float(os.getenv("BREEZE_SIM_SCALE", "0.01"))
+# ASGI overhead cannot fill maxInflight and look like the recorder paused. Windows
+# uses 0.02: its default timer tick is about 15.6ms, so at 0.01 one virtual second is
+# shorter than one clock tick and a push that sleeps through four ticks (ASR thread,
+# decode, loop wakeups) already exceeds a 6s slice. Thresholds stay in virtual
+# seconds either way; BREEZE_SIM_SCALE overrides the default.
+_DEFAULT_SCALE = "0.02" if sys.platform == "win32" else "0.01"
+SCALE = float(os.getenv("BREEZE_SIM_SCALE", _DEFAULT_SCALE))
 SEGMENTS = int(os.getenv("BREEZE_SIM_SEGMENTS", "1000"))
 
 _RUN_CACHE: dict[tuple, "SimReport"] = {}
