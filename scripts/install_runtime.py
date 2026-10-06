@@ -123,10 +123,17 @@ def install_shortcut(root, runner=subprocess.run) -> int:
     """Create desktop shortcuts. Failure is non-fatal unless BREEZE_REQUIRE_SHORTCUT=1."""
     if os.getenv("BREEZE_SKIP_SHORTCUT") == "1":
         return 0
-    shortcut = runner(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ".\\install-shortcut.ps1"],
-        cwd=root,
-    )
+    try:
+        shortcut = runner(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ".\\install-shortcut.ps1"],
+            cwd=root,
+        )
+    except (FileNotFoundError, OSError):
+        print("無法執行 powershell.exe。")
+        print("桌面捷徑未建立，仍可雙擊 start.bat。")
+        if os.getenv("BREEZE_REQUIRE_SHORTCUT") == "1":
+            return 1
+        return 0
     if shortcut.returncode:
         print("桌面捷徑未建立，仍可雙擊 start.bat。")
         if os.getenv("BREEZE_REQUIRE_SHORTCUT") == "1":

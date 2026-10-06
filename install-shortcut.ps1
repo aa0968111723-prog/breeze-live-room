@@ -38,6 +38,38 @@ function Resolve-BreezeAsciiPath([string]$Root, [string]$Leaf) {
     return $candidate
 }
 
+function Get-BreezeTopmostMissingAncestor([string]$Path) {
+    # Top-most path component that does not exist yet. Empty when the whole path exists.
+    # Never returns a drive root; that directory was not created by this script.
+    if ([string]::IsNullOrEmpty($Path)) { return '' }
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $current = $full
+    $topMissing = ''
+    while (-not [string]::IsNullOrEmpty($current) -and -not [System.IO.Directory]::Exists($current)) {
+        $root = [System.IO.Path]::GetPathRoot($current)
+        if ([string]::IsNullOrEmpty($root)) { break }
+        if ($current.TrimEnd('\') -eq $root.TrimEnd('\')) { break }
+        $topMissing = $current
+        $parent = [System.IO.Path]::GetDirectoryName($current)
+        if ([string]::IsNullOrEmpty($parent) -or $parent -eq $current) { break }
+        $current = $parent
+    }
+    return $topMissing
+}
+
+function Remove-BreezeCreatedDirectory([string]$Path) {
+    # Best-effort. Cleanup must not fail shortcut creation, and must not remove a drive root.
+    if ([string]::IsNullOrEmpty($Path)) { return }
+    try {
+        $full = [System.IO.Path]::GetFullPath($Path)
+        $root = [System.IO.Path]::GetPathRoot($full)
+        if ([string]::IsNullOrEmpty($root) -or $full.TrimEnd('\') -eq $root.TrimEnd('\')) { return }
+        if ([System.IO.Directory]::Exists($full)) {
+            [System.IO.Directory]::Delete($full, $true)
+        }
+    } catch { }
+}
+
 function Get-BreezeAsciiTemp {
     # csc.exe (Windows PowerShell 5.1) fails when TEMP is not pure ASCII.
     foreach ($candidate in @(
@@ -46,16 +78,23 @@ function Get-BreezeAsciiTemp {
         (Resolve-BreezeAsciiPath $env:SystemDrive 'BreezeLiveRoomTmp')
     )) {
         if ([string]::IsNullOrEmpty($candidate)) { continue }
-        if (Test-BreezeWritableDirectory $candidate) { return $candidate }
+        $missingRoot = Get-BreezeTopmostMissingAncestor $candidate
+        if (Test-BreezeWritableDirectory $candidate) {
+            $script:BreezeCreatedTempRoot = $missingRoot
+            return $candidate
+        }
+        Remove-BreezeCreatedDirectory $missingRoot
     }
     throw 'No ASCII-only writable directory is available for shortcut compilation.'
 }
 
 $breezeOriginalTemp = $env:TEMP
 $breezeOriginalTmp = $env:TMP
+$script:BreezeCreatedTempRoot = $null
 try {
     if ((Test-BreezeNonAsciiText $env:TEMP) -or (Test-BreezeNonAsciiText $env:TMP)) {
         $breezeAsciiTemp = Get-BreezeAsciiTemp
+        Write-Host ('Using ASCII TEMP for shortcut helper: ' + $breezeAsciiTemp)
         $env:TEMP = $breezeAsciiTemp
         $env:TMP = $breezeAsciiTemp
     }
@@ -120,6 +159,7 @@ public static class BreezeDesktopShortcut {
 } finally {
     $env:TEMP = $breezeOriginalTemp
     $env:TMP = $breezeOriginalTmp
+    Remove-BreezeCreatedDirectory $script:BreezeCreatedTempRoot
 }
 
 $WorkingDirectory = $PSScriptRoot
