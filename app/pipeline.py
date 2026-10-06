@@ -999,11 +999,6 @@ class Pipeline:
                 raise PipelineError(409, "同一段的內容不同，已拒絕替換")
             if slot_held:
                 self.release_slot()
-            existing = self.results.get(segment.key)
-            if existing is not None and self._result_ready(existing, wait_translation=wait_translation):
-                return existing
-            if not wait_translation:
-                return await self._wait_result(existing or segment, wait_translation=False)
             return await inflight
         existing = self.results.get(segment.key)
         if existing is None and segment.key in self._index:
