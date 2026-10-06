@@ -30,7 +30,7 @@ from pathlib import Path
 from httpx import ASGITransport, AsyncClient
 
 from app.asr import AsrResult
-from app.server import create_app
+from app.server import create_app, rss_bytes
 from app.settings import Settings
 from app.translate import Translator
 from tests.test_round2 import Socket, auth, copy_decoder, open_room, stop, token_of
@@ -108,15 +108,19 @@ def sim_settings(**over) -> Settings:
 class TextAsr:
     """Audio bytes are the Chinese line. delay_v is virtual seconds."""
 
-    def __init__(self, delay_v: float = 1.5, gate=None):
+    def __init__(self, delay_v: float = 1.5, gate=None, on_start=None):
         self.delay_v = delay_v
         self.gate = gate
+        self.on_start = on_start
         self.calls = 0
         self.done_at: list[float] = []
         self.seen: list[str] = []
 
     def transcribe(self, wav: Path, prompt: str = "") -> AsrResult:
         del prompt
+        # The admit slot is still held here. Callers use this to observe pending.
+        if self.on_start is not None:
+            self.on_start()
         text = wav.read_bytes().decode()
         self.seen.append(text)
         self.calls += 1
@@ -550,7 +554,15 @@ class SimReport:
     missing: int = 0
     silent: int = 0
     tracemalloc_500: int = 0
+    tracemalloc_750: int = 0
     tracemalloc_1000: int = 0
+    rss_500: int = 0
+    rss_750: int = 0
+    rss_1000: int = 0
+    pending_peak: int = 0
+    storm_rejects: int = 0
+    retries: list[int] = field(default_factory=list)
+    translate_skipped: int = 0
 
 
 def _zh_ready_times(listeners: list[Listener]) -> dict[int, float]:
@@ -583,9 +595,57 @@ async def _wait_translations(app, translator, count: int) -> None:
         # _translate_busy is this branch's worker counter. Main has no such attribute;
         # the queue size is enough to know the scripted translator has finished.
         busy = getattr(app.state.pipeline, "_translate_busy", 0)
-        if done >= count and stats.get("translate_queued", 0) == 0 and busy <= 0:
+        # A full translate queue drops the oldest line. That line never calls
+        # the translator, so it is not in ``finished``; it still left the queue.
+        skipped = int(getattr(app.state.pipeline, "translate_skipped", 0) or 0)
+        if done + skipped >= count and stats.get("translate_queued", 0) == 0 and busy <= 0:
             return
         await asyncio.sleep(0.01)
+
+
+def _seq_of(zh: str) -> int:
+    digits = "".join(ch for ch in zh if ch.isdigit())
+    return int(digits) if digits else 0
+
+
+def _app_traced_bytes() -> int:
+    """Live bytes allocated from app/. The sim client is not included."""
+    if not tracemalloc.is_tracing():
+        return 0
+    root = (Path(__file__).resolve().parents[1] / "app").resolve()
+    total = 0
+    for stat in tracemalloc.take_snapshot().statistics("filename"):
+        raw = stat.traceback[0].filename
+        if not raw or raw.startswith("<"):
+            continue
+        filename = Path(raw).resolve()
+        if filename == root or root in filename.parents:
+            total += stat.size
+    return total
+
+
+def _sample_server_memory() -> tuple[int, int]:
+    """One collection with GC enabled, then server heap and process RSS.
+
+    The paced run leaves automatic GC off so a collection cannot be booked as
+    a recorder pause. This turns it on for the sample only.
+    """
+    was = gc.isenabled()
+    gc.enable()
+    gc.collect()
+    traced = _app_traced_bytes()
+    rss = rss_bytes()
+    if not was:
+        gc.disable()
+    return traced, rss
+
+
+def _class_plan(zh: str):
+    """2s English, except a 40s window on segments 300-330 (the translate timeout)."""
+    seq = _seq_of(zh)
+    if 300 <= seq <= 330:
+        return ("ok", 40.0)
+    return ("ok", 2.0)
 
 
 async def _run_100min_async() -> SimReport:
@@ -593,10 +653,40 @@ async def _run_100min_async() -> SimReport:
     session = "sim100"
     root = Path(tempfile.mkdtemp(prefix="breeze-sim-"))
     db_path = root / "class.sqlite3"
-    translator = ScriptedTranslator(lambda zh: ("ok", 2.0))
-    asr = TextAsr(1.5)
+    translator = ScriptedTranslator(_class_plan)
+    observed = {"pipe": None, "pending": 0}
+
+    def on_start() -> None:
+        pipe = observed["pipe"]
+        if pipe is None:
+            return
+        pending = int(pipe.stats()["pending"])
+        if pending > observed["pending"]:
+            observed["pending"] = pending
+
+    asr = TextAsr(1.5, on_start=on_start)
     settings = sim_settings(data_path=str(db_path))
     app = create_app(settings, asr=asr, translator=translator, decoder=copy_decoder)
+    observed["pipe"] = app.state.pipeline
+    # At segment 600 the next 16 admits fail once each. The following admit
+    # (the host's single retry) is let through. rejected counts those 429s.
+    storm = {"rounds": 0, "let_pass": False, "rejects": 0}
+    pipe = app.state.pipeline
+    orig_admit = pipe.try_admit_count
+
+    def storm_admit() -> bool:
+        if storm["let_pass"]:
+            storm["let_pass"] = False
+            return orig_admit()
+        if storm["rounds"] > 0:
+            storm["rounds"] -= 1
+            storm["let_pass"] = True
+            pipe.rejected += 1
+            storm["rejects"] += 1
+            return False
+        return orig_admit()
+
+    pipe.try_admit_count = storm_admit
     tracing = tracemalloc.is_tracing()
     if not tracing:
         tracemalloc.start()
@@ -607,13 +697,24 @@ async def _run_100min_async() -> SimReport:
     # server never see. Freeze what exists before the class, turn automatic GC off
     # for the paced run, and collect at slice boundaries before the slot check,
     # where a pause is not inside any measured wait.
+    # A Windows 3.11 run booked 109 real ms (5.45 virtual s at scale 0.02) as
+    # waiting and as the same SRT end drift. That is a stall while a slot was
+    # still held, not a recorder backlog. Collecting before the slot check keeps
+    # the pause out of the measured wait; the zero-wait and ±2s SRT bounds stay exact.
     gc_was_enabled = gc.isenabled()
     gc.collect()
     gc.freeze()
     gc.disable()
+    mem_at: dict[int, tuple[int, int]] = {}
 
     def collect_between_slices(seq: int) -> None:
-        if seq % 50 == 0:
+        # The upload for seq-1 is created at the end of the previous slice and
+        # admits on the next yield. Arming here makes that upload the first 429.
+        if seq == 601:
+            storm["rounds"] = 16
+        if seq in (500, 750):
+            mem_at[seq] = _sample_server_memory()
+        elif seq % 50 == 0:
             gc.collect()
     snapshots: list[dict] = []
     listeners: list[Listener] = []
@@ -646,12 +747,16 @@ async def _run_100min_async() -> SimReport:
                 pending_snaps.append(asyncio.create_task(_snapshot(app, client, token, seq, snapshots)))
 
             await host.run(SEGMENTS, pace=True, on_each=on_each, before_slice=collect_between_slices)
-            if gc_was_enabled:
-                gc.enable()
             if pending_snaps:
                 await asyncio.gather(*pending_snaps)
             await _snapshot(app, client, token, SEGMENTS, snapshots)
+            # Settle English before the end sample. The sample blocks this thread
+            # on a collection and a tracemalloc snapshot; doing that while the last
+            # line is still queued trips the translate timeout (40s virtual).
             await _wait_translations(app, translator, SEGMENTS + 1)
+            mem_at[1000] = _sample_server_memory()
+            if gc_was_enabled:
+                gc.enable()
             # flush is this branch's async store. Main writes each row before publish returns.
             flush = getattr(app.state.store, "flush", None)
             if flush is not None:
@@ -663,6 +768,9 @@ async def _run_100min_async() -> SimReport:
             final = (await client.get("/api/metrics", headers=auth(token))).json()
             state = caption_rows(app, room)
             pipe = app.state.pipeline
+            traced_500, rss_500 = mem_at.get(500, (0, 0))
+            traced_750, rss_750 = mem_at.get(750, (0, 0))
+            traced_1000, rss_1000 = mem_at.get(1000, (0, 0))
             report = SimReport(
                 segments=SEGMENTS,
                 room=room,
@@ -684,8 +792,16 @@ async def _run_100min_async() -> SimReport:
                 state_count=len(state),
                 missing=sum(1 for row in state if row.get("status") == "missing"),
                 silent=sum(1 for row in state if row.get("status") == "silent"),
-                tracemalloc_500=next((int(item["traced"]) for item in snapshots if int(item["seq"]) == 500), 0),
-                tracemalloc_1000=next((int(item["traced"]) for item in reversed(snapshots) if int(item["seq"]) >= 1000), 0),
+                tracemalloc_500=traced_500,
+                tracemalloc_750=traced_750,
+                tracemalloc_1000=traced_1000,
+                rss_500=rss_500,
+                rss_750=rss_750,
+                rss_1000=rss_1000,
+                pending_peak=int(observed["pending"]),
+                storm_rejects=int(storm["rejects"]),
+                retries=list(host.retries),
+                translate_skipped=int(getattr(pipe, "translate_skipped", 0) or 0),
             )
             await host.stop()
     finally:
@@ -715,7 +831,7 @@ async def _snapshot(app, client, token, seq: int, snapshots: list[dict]) -> None
 
 def run_100min() -> SimReport:
     """One paced 100-minute class per process. Shared by backlog, SRT, and limit tests."""
-    key = (SEGMENTS, SCALE, "100min-v1")
+    key = (SEGMENTS, SCALE, "100min-v2")
     cached = _RUN_CACHE.get(key)
     if cached is not None:
         return cached
