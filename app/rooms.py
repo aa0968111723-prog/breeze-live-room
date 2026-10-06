@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import secrets
 import time
 
 from fastapi import HTTPException
@@ -52,6 +53,8 @@ class RoomBook:
             "last_active": time.monotonic(),
             "ended": False,
             "session_active": False,
+            # New secret every open. An old QR cannot read the next class.
+            "listen_key": secrets.token_urlsafe(16),
         }
         self.rooms[room_id] = room
         return room
