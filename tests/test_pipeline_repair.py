@@ -616,15 +616,21 @@ class GateEnglish(Translator):
 
 
 class Socket:
-    def __init__(self, app, path: str):
+    def __init__(self, app, path: str, client=("127.0.0.1", 5000), headers=None, with_key: bool = True):
         self.app = app
         self.path = path
+        self.client = client
+        self.headers = headers
+        self.with_key = with_key
         self.out: asyncio.Queue = asyncio.Queue()
         self.inc: asyncio.Queue = asyncio.Queue()
         self.task: asyncio.Task | None = None
 
     async def __aenter__(self):
-        path, _, query = self.path.partition("?")
+        from tests.test_round2 import append_listen_key
+
+        path = append_listen_key(self.app, self.path) if self.with_key else self.path
+        path, _, query = path.partition("?")
         scope = {
             "type": "websocket",
             "asgi": {"version": "3.0"},
@@ -633,8 +639,8 @@ class Socket:
             "path": path,
             "raw_path": path.encode(),
             "query_string": query.encode(),
-            "headers": [(b"host", b"127.0.0.1:8780")],
-            "client": ("127.0.0.1", 5000),
+            "headers": self.headers if self.headers is not None else [(b"host", b"127.0.0.1:8780")],
+            "client": self.client,
             "server": ("127.0.0.1", 8780),
             "subprotocols": [],
         }

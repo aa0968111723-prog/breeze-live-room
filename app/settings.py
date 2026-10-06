@@ -109,6 +109,8 @@ class Settings:
     silence_rms: float = 0.0
     caption_ttl_s: float = 86400.0
     room_caption_cap: int = 5000
+    # Full replay/backfill responses per client IP per minute. Live captions are not counted.
+    replay_per_minute: int = 8
     stop_flush_s: float = 8.0
     shutdown_flush_s: float = 2.0
     token_budget: int = 0
@@ -137,6 +139,8 @@ class Settings:
             raise ValueError("歷史、翻譯佇列與聽眾佇列至少為 1")
         if self.room_caption_cap < 1:
             raise ValueError("BREEZE_ROOM_CAPTION_CAP 至少為 1")
+        if self.replay_per_minute < 1:
+            raise ValueError("BREEZE_REPLAY_PER_MINUTE 至少為 1")
         if self.translate_workers < 1:
             raise ValueError("BREEZE_TRANSLATE_WORKERS 至少為 1")
         if self.gap_wait_s < 0 or self.room_idle_s < 0 or self.stop_flush_s < 0 or self.shutdown_flush_s < 0:
@@ -198,6 +202,7 @@ class Settings:
             silence_rms=_raw_float(env, "BREEZE_SILENCE_RMS", 0.0),
             caption_ttl_s=_raw_float(env, "BREEZE_CAPTION_TTL", 86400.0),
             room_caption_cap=_raw_int(env, "BREEZE_ROOM_CAPTION_CAP", 5000),
+            replay_per_minute=_raw_int(env, "BREEZE_REPLAY_PER_MINUTE", 8),
             stop_flush_s=_raw_float(env, "BREEZE_STOP_FLUSH", 8.0),
             shutdown_flush_s=_raw_float(env, "BREEZE_SHUTDOWN_FLUSH", 2.0),
             token_budget=_raw_int(env, "BREEZE_TOKEN_BUDGET", 0),

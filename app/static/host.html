@@ -88,6 +88,7 @@ let ready = false;
 let holdRoom = "";
 let captionConn = null;
 let listenedRoom = "";
+let listenKey = "";
 const view = createCaptionView(80);
 const captions = view.items;
 const phaseLabels = {
@@ -101,6 +102,18 @@ const phaseLabels = {
 function line(text) {
   lines.unshift(text);
   log.textContent = lines.slice(0, 40).join("\n");
+}
+function rememberRoom(data) {
+  if (!data || typeof data !== "object") return;
+  if (typeof data.listen_key === "string" && data.listen_key) {
+    listenKey = data.listen_key;
+    return;
+  }
+  if (typeof data.listen_url !== "string" || !data.listen_url) return;
+  try {
+    const found = new URL(data.listen_url).searchParams.get("k");
+    if (found) listenKey = found;
+  } catch (err) { /* listen_url is not always a full URL */ }
 }
 function paintCaption(fromSocket, item, prevEn) {
   const shown = applyCaption({ items: captions }, null);
@@ -140,7 +153,11 @@ function listenCaptions(roomId, force) {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   captionConn = connectRoom({
     room,
-    url: () => scheme + "://" + location.host + "/ws/listen?room_id=" + encodeURIComponent(room),
+    url: () => {
+      let address = scheme + "://" + location.host + "/ws/listen?room_id=" + encodeURIComponent(room);
+      if (listenKey) address += "&k=" + encodeURIComponent(listenKey);
+      return address;
+    },
     onState: () => {},
     onEvent: (item) => showCaption(item, true),
     onDelete: (item) => {
@@ -169,7 +186,8 @@ async function recoverAuth() {
     const room = (ctl.session && ctl.session.roomId) || (roomEl.value || "class").trim() || "class";
     const sessionId = (ctl.session && ctl.session.id) || "pending";
     const headers = { authorization: "Bearer " + token, "content-type": "application/json" };
-    await fetch("/api/rooms/open", { method: "POST", headers, body: JSON.stringify({ room_id: room }) });
+    const opened = await fetch("/api/rooms/open", { method: "POST", headers, body: JSON.stringify({ room_id: room }) });
+    if (opened.ok) rememberRoom(await opened.json());
     await fetch("/api/glossary", { method: "POST", headers, body: JSON.stringify({ room_id: room, session_id: sessionId, text: document.querySelector("#glossary").value }) });
     listenCaptions(room, true);
   })();
@@ -204,14 +222,25 @@ function deviceId() {
   return value ? { deviceId: { exact: value } } : true;
 }
 async function setup() {
-  const data = await fetch("/api/setup?room_id=" + encodeURIComponent(roomEl.value)).then((r) => r.json());
+  const headers = token ? { authorization: "Bearer " + token } : {};
+  const data = await fetch("/api/setup?room_id=" + encodeURIComponent(roomEl.value), { headers, cache: "no-store" }).then((r) => r.json());
+  rememberRoom(data);
   const qr = document.querySelector("#qr");
   if (!data.share_ready) {
     qr.removeAttribute("src");
     document.querySelector("#url").textContent = data.share_message || "尚無可供其他裝置使用的連結";
   } else {
-    qr.src = "/api/qr?room_id=" + encodeURIComponent(roomEl.value) + "&t=" + Date.now();
     document.querySelector("#url").textContent = data.listen_url;
+    const qrResp = await fetch("/api/qr?room_id=" + encodeURIComponent(roomEl.value) + "&t=" + Date.now(), { headers, cache: "no-store" });
+    if (qrResp.ok) {
+      const blob = await qrResp.blob();
+      if (qr.dataset.objectUrl) URL.revokeObjectURL(qr.dataset.objectUrl);
+      const objectUrl = URL.createObjectURL(blob);
+      qr.dataset.objectUrl = objectUrl;
+      qr.src = objectUrl;
+    } else {
+      qr.removeAttribute("src");
+    }
   }
   const nic = document.querySelector("#nic");
   nic.textContent = "";
@@ -349,7 +378,8 @@ go.onclick = async () => {
   roomEl.disabled = true;
   go.disabled = true;
   try {
-    await hostFetch("/api/rooms/open", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: room }) });
+    const opened = await hostFetch("/api/rooms/open", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: room }) });
+    if (opened.ok) rememberRoom(await opened.json());
     listenCaptions(room, true);
     await hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: room, session_id: "pending", text: document.querySelector("#glossary").value }) });
     await ctl.start();
@@ -476,7 +506,8 @@ document.querySelector("#export").onclick = async () => {
   link.click();
 };
 document.querySelector("#nic").onchange = async (ev) => {
-  await fetch("/api/share-host", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ host: ev.target.value, room_id: roomEl.value }) });
+  const resp = await fetch("/api/share-host", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ host: ev.target.value, room_id: roomEl.value }) });
+  if (resp.ok) rememberRoom(await resp.json());
   setup();
 };
 roomEl.addEventListener("input", () => {
@@ -507,7 +538,8 @@ if (!tokenResp.ok) {
   go.disabled = true;
 } else {
   token = (await tokenResp.json()).token;
-  await fetch("/api/rooms/open", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ room_id: roomEl.value || "class" }) });
+  const opened = await fetch("/api/rooms/open", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ room_id: roomEl.value || "class" }) });
+  if (opened.ok) rememberRoom(await opened.json());
 }
 if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
   const devices = await navigator.mediaDevices.enumerateDevices();
