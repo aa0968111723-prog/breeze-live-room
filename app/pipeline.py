@@ -1657,7 +1657,10 @@ class Pipeline:
             self._max_seq[group] = int(info["max_seq"])
             # Past the saved seqs, so a continuing session does not invent 1..N gaps.
             self._next[group] = int(info["max_seq"]) + 1
-            for seq in range(1, int(info["max_seq"]) + 1):
+            # Seq below the oldest saved caption were expired or purged, not missing.
+            # Filling 1..max_seq would resurrect them as blank captions with a new TTL.
+            oldest = min(info["seqs"]) if info["seqs"] else 1
+            for seq in range(oldest, int(info["max_seq"]) + 1):
                 if seq not in info["seqs"]:
                     self.mark_missing(room_id, session_id, seq, "缺段：這段沒有留在逐字稿裡")
         if max_ord:
