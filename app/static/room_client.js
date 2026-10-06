@@ -23,6 +23,15 @@ function noteCursor(current, value) {
   return Math.max(current, n);
 }
 
+export function mergeCaptionUpdate(prev, incoming) {
+  if (!incoming || incoming.id == null || incoming.id === "") return prev ?? null;
+  const version = Number(incoming.version) || 1;
+  const next = { ...incoming, version };
+  if (!prev) return next;
+  if ((Number(prev.version) || 1) >= version) return prev;
+  return next;
+}
+
 export function connectRoom({ room, url, onState, onEvent, onGap, openSocket, sleep }) {
   const versions = new Map();
   let cursor = 0;

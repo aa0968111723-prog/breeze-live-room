@@ -542,8 +542,15 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
             if not held and (key in pipeline._reserved or key in pipeline._active):
                 await _wait_until_join_ready(pipeline, key)
+            # Default still waits for English. Opt in to return at Chinese: form
+            # wait_translation=0 and/or header x-breeze-async-translation: 1.
+            opt_out = _field(form, request, "wait_translation").strip().lower() in {"0", "false"}
+            if request.headers.get("x-breeze-async-translation") == "1":
+                opt_out = True
             try:
-                done = await pipeline.submit(segment, raw, decode, slot_held=held, retry=retry, owner=held)
+                done = await pipeline.submit(
+                    segment, raw, decode, slot_held=held, retry=retry, owner=held, wait_translation=not opt_out,
+                )
             except AudioError as exc:
                 recorded = pipeline.get(segment.room_id, segment.session_id, segment.seq)
                 if recorded is not None and recorded.status in {"error", "timeout", "cancelled"}:

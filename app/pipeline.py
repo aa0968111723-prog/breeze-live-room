@@ -7,7 +7,9 @@ import shutil
 import time
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 from app.asr import AsrResult
@@ -115,6 +117,9 @@ class Pipeline:
         self.oldest_wait_started: float | None = None
         self.last_process_s: float | None = None
         self._translate_q: asyncio.Queue | None = None
+        self._translate_pool: ThreadPoolExecutor | None = None
+        self._tr_epoch: dict[tuple[str, str, int], int] = {}
+        self._recent_zh: dict[tuple[str, str], deque] = {}
         self._tasks: list[asyncio.Task] = []
         self._workers = False
         self.glossary: dict[tuple[str, str], list[dict]] = {}
@@ -191,8 +196,15 @@ class Pipeline:
         if self._workers:
             return
         self._workers = True
-        self._translate_q = asyncio.Queue(maxsize=self.settings.translate_queue)
-        self._tasks.append(asyncio.create_task(self._translate_loop()))
+        workers = max(1, int(self.settings.translate_workers))
+        # translate_queue stays the configured floor. The internal bound is larger
+        # so a short English stall queues instead of failing Chinese that is already out.
+        backlog = max(self.settings.translate_queue, workers * 8)
+        self._translate_q = asyncio.Queue(maxsize=backlog)
+        # Own pool: translation must not occupy the default executor that decode and ASR share.
+        self._translate_pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="breeze-translate")
+        for _ in range(workers):
+            self._tasks.append(asyncio.create_task(self._translate_loop()))
         self._tasks.append(asyncio.create_task(self._gap_loop()))
 
     async def aclose(self) -> None:
@@ -202,6 +214,10 @@ class Pipeline:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
         self._workers = False
+        pool = self._translate_pool
+        self._translate_pool = None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
         for waiters in list(self._waiters.values()):
             for fut in waiters:
                 if not fut.done():
@@ -261,6 +277,10 @@ class Pipeline:
         self._room_sessions.pop(room_id, None)
         for stamp in [stamp for stamp in self._gap_since if stamp[0] == room_id]:
             self._gap_since.pop(stamp, None)
+        for key in [key for key in self._tr_epoch if key[0] == room_id]:
+            self._tr_epoch.pop(key, None)
+        for group in [group for group in self._recent_zh if group[0] == room_id]:
+            self._recent_zh.pop(group, None)
 
     def _ord(self, room_id: str, session_id: str) -> int:
         key = (room_id, session_id)
@@ -310,6 +330,7 @@ class Pipeline:
         if marker in self._seen_versions:
             self._mark_emitted(segment)
             return
+        self._remember_zh(segment)
         self._seen_versions.add(marker)
         self._seen_order.append(marker)
         while len(self._seen_order) > self.settings.max_results * 4:
@@ -454,7 +475,7 @@ class Pipeline:
             status="cancelled",
         )
 
-    async def submit(self, segment: Segment, audio: bytes, decoder, *, slot_held: bool, retry: bool = False, owner: bool = False) -> Segment:
+    async def submit(self, segment: Segment, audio: bytes, decoder, *, slot_held: bool, retry: bool = False, owner: bool = False, wait_translation: bool = True) -> Segment:
         del owner  # Admission is synchronous; the flight future replaces the old owner spin.
         self.ensure_workers()
         if (segment.room_id, segment.session_id) in self._closed:
@@ -501,7 +522,7 @@ class Pipeline:
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
         self._flight[segment.key] = fut
-        holder = {"held": slot_held, "bytes": len(audio)}
+        holder = {"held": slot_held, "bytes": len(audio), "wait_translation": wait_translation}
         try:
             result = await self._process(segment, audio, decoder, holder)
             if not fut.done():
@@ -678,6 +699,20 @@ class Pipeline:
             self._trim_results()
         if segment.status != "zh_ready" or self._stale(segment):
             return segment
+        if not holder.get("wait_translation", True):
+            try:
+                if segment.key not in self._emitted_segs:
+                    await self._wait_emitted(segment)
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    raise
+                if self._stale(segment):
+                    return segment
+                raise
+            if self._stale(segment):
+                return segment
+            return self.results.get(segment.key, segment)
         fut = self._future(segment)
         self._waiters.setdefault(segment.key, []).append(fut)
         try:
@@ -699,24 +734,38 @@ class Pipeline:
             return segment
         return self.results.get(segment.key, segment)
 
+    def _epoch_current(self, segment: Segment, epoch: int) -> bool:
+        return not self._stale(segment) and self._tr_epoch.get(segment.key) == epoch
+
+    def _put_translation(self, segment: Segment) -> None:
+        assert self._translate_q is not None
+        epoch = self._tr_epoch.get(segment.key, 0) + 1
+        self._tr_epoch[segment.key] = epoch
+        # Epoch travels with the queue item. The segment object is shared, so a
+        # later retranslate must not change which attempt a worker already holds.
+        self._translate_q.put_nowait((epoch, time.monotonic(), segment))
+        segment.translate_queued = True
+
+    def _fail_translation(self, segment: Segment, translate_status: str, error: str) -> None:
+        if self._stale(segment) or segment.key not in self._emitted_segs:
+            return
+        segment.translate_queued = False
+        segment.en = ""
+        segment.translate_status = translate_status
+        segment.error = error
+        segment.status = "translate_failed"
+        segment.version += 1
+        self.results[segment.key] = segment
+        self._emit(segment)
+
     def _queue_translate(self, segment: Segment) -> None:
         if self._stale(segment):
             return
         self.ensure_workers()
-        assert self._translate_q is not None
-        segment.translate_queued = True
         try:
-            self._translate_q.put_nowait(segment)
+            self._put_translation(segment)
         except asyncio.QueueFull:
-            if self._stale(segment):
-                self._wake(segment.key, segment)
-                return
-            segment.translate_status = "queue_full"
-            segment.error = "英譯佇列已滿，中文仍保留"
-            segment.status = "translate_failed"
-            segment.version += 1
-            self.results[segment.key] = segment
-            self._emit(segment)
+            self._fail_translation(segment, "queue_full", "英譯佇列已滿，中文仍保留")
             self._wake(segment.key, segment)
 
     def _decode_sync(self, work: Path, audio: bytes, decoder):
@@ -734,17 +783,10 @@ class Pipeline:
             return
         fut = self._future(segment)
         self._waiters.setdefault(segment.key, []).append(fut)
-        assert self._translate_q is not None
         try:
-            self._translate_q.put_nowait(segment)
+            self._put_translation(segment)
         except asyncio.QueueFull:
-            if not self._stale(segment):
-                segment.translate_status = "queue_full"
-                segment.error = "英譯佇列已滿，中文仍保留"
-                segment.status = "translate_failed"
-                segment.version = segment.version + 1
-                self.results[segment.key] = segment
-                self._emit(segment)
+            self._fail_translation(segment, "queue_full", "英譯佇列已滿，中文仍保留")
             self._wake(segment.key, segment)
             return
         await fut
@@ -752,71 +794,79 @@ class Pipeline:
     async def _translate_loop(self) -> None:
         assert self._translate_q is not None
         while True:
-            segment = await self._translate_q.get()
+            epoch, enqueued_at, segment = await self._translate_q.get()
             try:
-                await self._apply_translation(segment)
+                await self._apply_translation(segment, epoch, enqueued_at)
             except Exception:
-                if not self._stale(segment) and segment.key in self._emitted_segs:
-                    segment.en = ""
-                    segment.translate_status = "error"
-                    segment.error = "英譯失敗，中文仍保留"
-                    segment.status = "translate_failed"
-                    segment.version = segment.version + 1
-                    self.results[segment.key] = segment
-                    self._emit(segment)
+                if self._epoch_current(segment, epoch) and segment.key in self._emitted_segs:
+                    self._fail_translation(segment, "error", "英譯失敗，中文仍保留")
             finally:
-                self._wake(segment.key, segment)
+                if self._epoch_current(segment, epoch):
+                    self._wake(segment.key, segment)
                 self._translate_q.task_done()
 
-    async def _apply_translation(self, segment: Segment) -> None:
-        if self._stale(segment) or segment.key not in self._emitted_segs:
+    async def _apply_translation(self, segment: Segment, epoch: int, enqueued_at: float) -> None:
+        if not self._epoch_current(segment, epoch) or segment.key not in self._emitted_segs:
             return
+        if time.monotonic() - enqueued_at > self.settings.translate_timeout_s:
+            self._fail_translation(segment, "skipped", "英譯排隊太久，中文仍保留")
+            return
+        zh = segment.zh
         glossary = self.glossary.get((segment.room_id, segment.session_id), [])
         context = self._context(segment)
+        kwargs = {}
+        params = inspect.signature(self.translator.translate).parameters
+        if "glossary" in params:
+            kwargs["glossary"] = glossary
+        if "context" in params:
+            kwargs["context"] = context
+        if "deadline" in params:
+            kwargs["deadline"] = time.monotonic() + self.settings.translate_timeout_s
+        loop = asyncio.get_running_loop()
         try:
-            kwargs = {}
-            params = inspect.signature(self.translator.translate).parameters
-            if "glossary" in params:
-                kwargs["glossary"] = glossary
-            if "context" in params:
-                kwargs["context"] = context
             translated: TranslateResult = await asyncio.wait_for(
-                asyncio.to_thread(self.translator.translate, segment.zh, **kwargs),
+                loop.run_in_executor(self._translate_pool, partial(self.translator.translate, zh, **kwargs)),
                 timeout=self.settings.translate_timeout_s,
             )
-            if self._stale(segment):
-                return
-            segment.en = translated.text or ""
-            segment.translate_status = translated.status
-            segment.error = translated.detail
-            segment.status = "ready" if translated.status in {"ok", "off", "no_key"} else "translate_failed"
         except asyncio.TimeoutError:
-            if self._stale(segment):
-                return
-            segment.en = ""
-            segment.translate_status = "timeout"
-            segment.error = "英譯逾時，不假設沒有計費。中文仍保留"
-            segment.status = "translate_failed"
-        except Exception:
-            if self._stale(segment):
-                return
-            segment.en = ""
-            segment.translate_status = "error"
-            segment.error = "英譯失敗，中文仍保留"
-            segment.status = "translate_failed"
-        if self._stale(segment):
+            if self._epoch_current(segment, epoch):
+                self._fail_translation(segment, "timeout", "英譯逾時，不假設沒有計費。中文仍保留")
             return
+        except Exception:
+            if self._epoch_current(segment, epoch):
+                self._fail_translation(segment, "error", "英譯失敗，中文仍保留")
+            return
+        if not self._epoch_current(segment, epoch):
+            return
+        segment.en = translated.text or ""
+        segment.translate_status = translated.status
+        segment.error = translated.detail
+        segment.status = "ready" if translated.status in {"ok", "off", "no_key"} else "translate_failed"
+        segment.translate_queued = False
         segment.version = segment.version + 1
         self.results[segment.key] = segment
         self._emit(segment)
 
+    def _remember_zh(self, segment: Segment) -> None:
+        if not segment.zh or self._stale(segment):
+            return
+        group = (segment.room_id, segment.session_id)
+        rows = self._recent_zh.setdefault(group, deque(maxlen=8))
+        for index, (seq, _text) in enumerate(rows):
+            if seq == segment.seq:
+                rows[index] = (segment.seq, segment.zh)
+                return
+        if rows and segment.seq < rows[0][0]:
+            return
+        for index, (seq, _text) in enumerate(rows):
+            if segment.seq < seq:
+                rows.insert(index, (segment.seq, segment.zh))
+                return
+        rows.append((segment.seq, segment.zh))
+
     def _context(self, segment: Segment) -> list[str]:
-        rows = []
-        for key, item in self.results.items():
-            if key[0] == segment.room_id and key[1] == segment.session_id and key[2] < segment.seq and item.zh:
-                rows.append((key[2], item.zh))
-        rows.sort()
-        return [text for _, text in rows[-4:]]
+        rows = self._recent_zh.get((segment.room_id, segment.session_id), ())
+        return [text for seq, text in rows if seq < segment.seq][-4:]
 
     async def _gap_loop(self) -> None:
         tick = min(0.05, max(self.settings.gap_wait_s, 0.01))
@@ -862,6 +912,7 @@ class Pipeline:
         if zh is not None:
             segment.zh_raw = segment.zh_raw or segment.zh
             segment.zh = annotate_question(zh.strip())
+            self._remember_zh(segment)
         segment.status = "zh_ready"
         await self._enqueue_translation(segment)
         return segment

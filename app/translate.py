@@ -83,7 +83,9 @@ class Translator:
             {"role": "user", "content": zh},
         ]
 
-    def translate(self, zh: str, glossary=None, context=None) -> TranslateResult:
+    def translate(self, zh: str, glossary=None, context=None, deadline: float | None = None) -> TranslateResult:
+        # deadline is time.monotonic() seconds. Stop retries when it passes so a
+        # timed-out caller does not leave this thread sleeping through the backoff.
         if not self.enabled or not zh:
             return TranslateResult("", "off")
         if not self.key:
@@ -92,8 +94,16 @@ class Translator:
             return TranslateResult("", "budget", "本場翻譯額度已用完，中文仍保留")
         last = TranslateResult("", "error", "英譯失敗，中文仍保留")
         for attempt in range(self.max_attempts):
+            if _deadline_hit(deadline):
+                return TranslateResult("", "timeout", "英譯逾時，不假設沒有計費。中文仍保留")
             self.calls += 1
-            last = self._once(zh, glossary, context)
+            timeout = 40.0
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return TranslateResult("", "timeout", "英譯逾時，不假設沒有計費。中文仍保留")
+                timeout = min(40.0, max(0.05, remaining))
+            last = self._once(zh, glossary, context, timeout)
             if last.status not in TRANSIENT_STATUS or attempt + 1 >= self.max_attempts:
                 return last
             delay = last.retry_after if last.retry_after is not None else min(0.2 * (2 ** attempt), self.max_backoff)
@@ -102,11 +112,17 @@ class Translator:
             if delay > self.max_backoff:
                 # Retry-After is longer than we will block the translation queue.
                 return last
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return TranslateResult("", "timeout", "英譯逾時，不假設沒有計費。中文仍保留")
+                if delay > remaining:
+                    delay = remaining
             self.attempts_slept.append(delay)
             (self.sleeper or time.sleep)(delay)
         return last
 
-    def _once(self, zh: str, glossary, context) -> TranslateResult:
+    def _once(self, zh: str, glossary, context, timeout: float = 40) -> TranslateResult:
         body = json.dumps({
             "model": self.model,
             "messages": self.build_messages(zh, glossary, context),
@@ -118,7 +134,7 @@ class Translator:
         )
         open_url = self.opener or urllib.request.urlopen
         try:
-            with open_url(req, timeout=40) as resp:
+            with open_url(req, timeout=timeout) as resp:
                 payload = resp.read().decode()
             data = json.loads(payload)
             content = data["choices"][0]["message"]["content"]
@@ -160,6 +176,10 @@ class Translator:
         if exc.code == 408 or (isinstance(exc.code, int) and 500 <= exc.code <= 599):
             return TranslateResult("", "http", f"英譯服務回應 {exc.code}，中文仍保留", retry_after=_retry_after(exc))
         return TranslateResult("", "bad_response", f"英譯服務回應 {exc.code}，中文仍保留")
+
+
+def _deadline_hit(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
 
 
 def _retry_after(exc: urllib.error.HTTPError) -> float | None:

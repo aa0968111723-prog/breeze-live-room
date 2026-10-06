@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { connectRoom, liveTail } from "../app/static/room_client.js";
+import { connectRoom, liveTail, mergeCaptionUpdate } from "../app/static/room_client.js";
 
 function tick() {
   return new Promise((resolve) => setTimeout(resolve, 0));
@@ -161,4 +161,14 @@ resumed[1].onmessage({ data: JSON.stringify({ type: "ping" }) });
 assert.equal(JSON.parse(resumed[1].sent[0]).type, "pong");
 resumeConn.stop();
 await resumeConn.done;
+
+const kept = { id: "class:s:1", version: 2, zh: "中", en: "old" };
+assert.equal(mergeCaptionUpdate(kept, { id: "class:s:1", version: 1, zh: "中", en: "" }), kept);
+assert.equal(mergeCaptionUpdate(kept, { id: "class:s:1", version: 2, zh: "中", en: "same" }), kept);
+assert.equal(mergeCaptionUpdate(kept, { id: "", version: 3, en: "nope" }), kept);
+assert.equal(mergeCaptionUpdate(null, { id: "", version: 1 }), null);
+const newer = mergeCaptionUpdate(kept, { id: "class:s:1", version: 3, zh: "中", en: "new" });
+assert.equal(newer.en, "new");
+assert.equal(newer.version, 3);
+assert.equal(mergeCaptionUpdate(null, { id: "class:s:2", zh: "下一句" }).zh, "下一句");
 console.log("room client ok");

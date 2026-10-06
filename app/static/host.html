@@ -59,6 +59,7 @@ label { display: block; margin-top: 8px; }
 </main>
 <script type="module">
 import { createCaptureController } from "/static/recorder_machine.js";
+import { connectRoom, liveTail, mergeCaptionUpdate } from "/static/room_client.js";
 const roomEl = document.querySelector("#room");
 const log = document.querySelector("#log");
 const status = document.querySelector("#status");
@@ -72,6 +73,9 @@ const lines = [];
 let token = "";
 let ready = false;
 let holdRoom = "";
+let captionConn = null;
+let listenedRoom = "";
+const captions = new Map();
 const phaseLabels = {
   idle: "待命",
   preparing: "準備麥克風",
@@ -83,6 +87,36 @@ const phaseLabels = {
 function line(text) {
   lines.unshift(text);
   log.textContent = lines.slice(0, 40).join("\n");
+}
+function showCaption(incoming, fromSocket) {
+  if (!incoming || incoming.id == null || incoming.id === "") return;
+  const prev = captions.get(incoming.id) || null;
+  const merged = mergeCaptionUpdate(prev, incoming);
+  if (!merged || merged === prev) return;
+  captions.set(incoming.id, merged);
+  const live = liveTail(captions);
+  if (live) {
+    captionEn.textContent = live.en || "（尚無英譯）";
+    captionZh.textContent = live.zh || live.error || "";
+  }
+  if (fromSocket && merged.en && !(prev && prev.en)) {
+    line(merged.en + "\n" + (merged.zh || merged.error || ""));
+  }
+}
+function listenCaptions(roomId, force) {
+  if (!token) return;
+  const room = (roomId || roomEl.value || "class").trim() || "class";
+  if (!force && captionConn && listenedRoom === room) return;
+  if (captionConn) captionConn.stop();
+  if (listenedRoom !== room) captions.clear();
+  listenedRoom = room;
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  captionConn = connectRoom({
+    room,
+    url: () => scheme + "://" + location.host + "/ws/listen?room_id=" + encodeURIComponent(room),
+    onState: () => {},
+    onEvent: (item) => showCaption(item, true),
+  });
 }
 function micError(err) {
   const name = err && err.name;
@@ -130,6 +164,7 @@ async function setup() {
     ? ("還缺：" + missing.join("、") + "。不會改走雲端辨識。")
     : (data.translate_label + "。模型模式：" + data.asr_mode + (data.model_reloads_each_segment ? "，每段會重新載入。" : "，常駐服務已就緒。") + (data.storage ? "逐字稿已啟用儲存，可匯出保存期限內的完整內容。" : "逐字稿未啟用儲存；重開服務會清空，只可匯出近期字幕。"));
   go.disabled = !ready || !token || !ctl.canEditRoom();
+  listenCaptions(roomEl.value);
 }
 async function refreshMetrics() {
   if (!token) return;
@@ -165,6 +200,7 @@ const ctl = createCaptureController({
       body.append("t0_ms", String(meta.t0_ms || 0));
       body.append("t1_ms", String(meta.t1_ms || 0));
       if (retryFlag) body.append("retry", "1");
+      body.append("wait_translation", "0");
       body.append("audio", blob, "segment.webm");
       return body;
     }
@@ -176,7 +212,11 @@ const ctl = createCaptureController({
           method: "POST",
           body: formFor(retryFlag),
           signal: abort.signal,
-          headers: { authorization: "Bearer " + token, ...(retryFlag ? { "x-breeze-retry": "1" } : {}) },
+          headers: {
+            authorization: "Bearer " + token,
+            "x-breeze-async-translation": "1",
+            ...(retryFlag ? { "x-breeze-retry": "1" } : {}),
+          },
         });
       } finally {
         clearTimeout(timeout);
@@ -194,9 +234,8 @@ const ctl = createCaptureController({
       line("失敗：" + (data.detail || data.error || "辨識失敗"));
       return data;
     }
-    captionEn.textContent = data.en || "（尚無英譯）";
-    captionZh.textContent = data.zh || data.error || "";
-    line((data.en || "（尚無英譯）") + "\n" + (data.zh || data.error || ""));
+    showCaption(data, false);
+    if (data.zh || data.error) line(data.zh || data.error);
     return data;
   },
   onPhase(next) {
@@ -228,6 +267,7 @@ go.onclick = async () => {
   go.disabled = true;
   try {
     await fetch("/api/rooms/open", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ room_id: room }) });
+    listenCaptions(room, true);
     await fetch("/api/glossary", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ room_id: room, session_id: "pending", text: document.querySelector("#glossary").value }) });
     await ctl.start();
     const activeRoom = ctl.session ? ctl.session.roomId : room;
@@ -328,7 +368,10 @@ roomEl.addEventListener("change", () => {
   }
   setup();
 });
-window.addEventListener("pagehide", () => { ctl.stop(); });
+window.addEventListener("pagehide", () => {
+  if (captionConn) captionConn.stop();
+  ctl.stop();
+});
 const tokenResp = await fetch("/api/host-token");
 if (!tokenResp.ok) {
   status.className = "warn";

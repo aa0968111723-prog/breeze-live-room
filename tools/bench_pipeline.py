@@ -771,7 +771,7 @@ def _print_report(report: dict) -> None:
         f"rtf={args['rtf']} tr={args['tr_ms']:.0f}ms jitter={args['tr_jitter']} "
         f"slow={slow} scale={args['scale']} seed={args['seed']}"
     )
-    print(f"async opt-in      wait_translation=0 + x-breeze-async-translation: 1 (ignored by original code)")
+    print("async opt-in      wait_translation=0 + x-breeze-async-translation: 1")
     print(f"audio             {report['audio_real_s']:.1f} real s    wall {report['wall_s']} s    capture wall {report['capture_wall_s']} s")
     print(f"recording paused  {_fmt(report['recording_paused_s'])} real s   ({_fmt(report['recording_paused_pct'], 2)}% of capture)")
     print(

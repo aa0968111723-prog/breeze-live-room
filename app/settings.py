@@ -101,6 +101,7 @@ class Settings:
     asr_timeout_s: float = 120.0
     translate_timeout_s: float = 40.0
     translate_queue: int = 4
+    translate_workers: int = 2
     heartbeat_s: float = 15.0
     idle_timeout_s: float = 45.0
     room_idle_s: float = 1800.0
@@ -131,6 +132,8 @@ class Settings:
             raise ValueError("BREEZE_ASR_WORKERS 至少為 1")
         if self.history_limit < 1 or self.translate_queue < 1 or self.listener_queue < 1:
             raise ValueError("歷史、翻譯佇列與聽眾佇列至少為 1")
+        if self.translate_workers < 1:
+            raise ValueError("BREEZE_TRANSLATE_WORKERS 至少為 1")
         if self.gap_wait_s < 0 or self.room_idle_s < 0:
             raise ValueError("等待時間不能是負數")
         if self.asr_mode not in {"cli", "resident"}:
@@ -182,6 +185,7 @@ class Settings:
             asr_timeout_s=_raw_float(env, "BREEZE_ASR_TIMEOUT", 120.0),
             translate_timeout_s=_raw_float(env, "BREEZE_TRANSLATE_TIMEOUT", 40.0),
             translate_queue=_raw_int(env, "BREEZE_TRANSLATE_QUEUE", 4),
+            translate_workers=_raw_int(env, "BREEZE_TRANSLATE_WORKERS", 2),
             heartbeat_s=_raw_float(env, "BREEZE_HEARTBEAT", 15.0),
             idle_timeout_s=_raw_float(env, "BREEZE_IDLE_TIMEOUT", 45.0),
             room_idle_s=_raw_float(env, "BREEZE_ROOM_IDLE", 1800.0),
