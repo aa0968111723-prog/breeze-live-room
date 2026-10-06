@@ -17,7 +17,7 @@ from app.aio import cancellation_pending, wait_bounded
 from app.asr import CliAsr, ResidentAsr
 from app.audio import AudioError, convert_to_wav, ffmpeg_bin, wav_duration_seconds
 from app.auth import audience_origin_allowed, new_host_token, require_host, require_local_host, same_secret
-from app.dispatch import ListenerSlot, RoomBus
+from app.dispatch import ListenerSlot, RoomBus, for_listener
 from app.pipeline import Pipeline, PipelineError, Segment
 from app.rooms import RoomBook, RoomIdError, validate_room_id, validate_session_id
 from app.settings import Settings, fill_process_environ
@@ -310,15 +310,19 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 kept.append(row)
         return kept
 
+    def _audience_captions(rows: list[dict]) -> list[dict]:
+        return [for_listener(item) for item in rows]
+
     def _fanout(snap: dict) -> None:
         room = book.get(str(snap.get("room_id") or ""))
         if room is None:
             return
         room["history"] = bus.history(str(snap.get("room_id") or ""))
         room["last_active"] = time.monotonic()
+        outgoing = for_listener(snap)
         dead = []
         for conn in list(room["listeners"]):
-            if not conn.slot.offer(snap):
+            if not conn.slot.offer(outgoing):
                 dead.append(conn)
         for conn in dead:
             room["listeners"].discard(conn)
@@ -963,8 +967,8 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         events = list(resumed["events"]) if cursor > 0 else []
         hello = {
             "type": "hello",
-            "history": _captions_since_open(room_id, history),
-            "events": _captions_since_open(room_id, events),
+            "history": _audience_captions(_captions_since_open(room_id, history)),
+            "events": _audience_captions(_captions_since_open(room_id, events)),
             "gap": bool(resumed["gap"]) if cursor > 0 else False,
             "latest_cursor": bus.latest_cursor(room_id),
             "oldest_cursor": resumed["oldest_cursor"],
@@ -980,7 +984,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             visible = _captions_since_open(room_id, source)
             ip = ws.client.host if ws.client is not None else ""
             if replay_gate.allow(ip):
-                hello["backfill"] = visible
+                hello["backfill"] = _audience_captions(visible)
         try:
             await ws.send_json(hello)
         except Exception:
