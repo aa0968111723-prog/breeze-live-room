@@ -356,4 +356,61 @@ async function testStopNeverHangsWhenUploadStalls() {
   assert.match(stall.lastError, /逾時/);
 }
 await testStopNeverHangsWhenUploadStalls();
+
+async function testTimedOutUploadDoesNotWedgeNextSession() {
+  let releaseOld = () => {};
+  const seen = [];
+  let sessionNum = 0;
+  const ctl = createCaptureController({
+    periodMs: 60000,
+    maxInflight: 1,
+    uploadTimeoutMs: 40,
+    openMic: async () => fakeStream(),
+    createRecorder: factory.createRecorder,
+    newId: () => "sess-" + (++sessionNum),
+    roomId: () => "class",
+    upload(meta) {
+      seen.push(meta.sessionId + ":" + meta.seq);
+      if (meta.sessionId === "sess-1") {
+        return new Promise((resolve) => { releaseOld = resolve; });
+      }
+      return Promise.resolve({ ok: true });
+    },
+  });
+  await ctl.start();
+  const stopping = ctl.stop();
+  const winner = await Promise.race([
+    stopping.then(() => "done"),
+    new Promise((resolve) => setTimeout(() => resolve("hung"), 500)),
+  ]);
+  assert.equal(winner, "done");
+  assert.equal(ctl.state, "idle");
+  assert.ok(ctl.inflight >= 1, "timed-out upload stays tracked until the next start");
+  const started = ctl.start();
+  const startWinner = await Promise.race([
+    started.then(() => "started"),
+    new Promise((resolve) => setTimeout(() => resolve("wedged"), 200)),
+  ]);
+  assert.equal(startWinner, "started");
+  assert.equal(ctl.state, "recording");
+  assert.equal(ctl.inflight, 0);
+  const stoppingNext = ctl.stop();
+  const nextWinner = await Promise.race([
+    stoppingNext.then(() => "done"),
+    new Promise((resolve) => setTimeout(() => resolve("hung"), 500)),
+  ]);
+  assert.equal(nextWinner, "done");
+  assert.ok(seen.includes("sess-2:1"), seen.join(","));
+  assert.equal(ctl.inflight, 0);
+  const uploadsBefore = ctl.uploads.length;
+  releaseOld({ ok: true });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(ctl.inflight, 0);
+  assert.equal(ctl.uploads.length, uploadsBefore);
+  await ctl.start();
+  await ctl.stop();
+  assert.ok(seen.includes("sess-3:1"), seen.join(","));
+  assert.equal(ctl.inflight, 0);
+}
+await testTimedOutUploadDoesNotWedgeNextSession();
 console.log("recorder machine ok");
