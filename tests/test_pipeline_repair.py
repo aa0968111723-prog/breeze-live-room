@@ -1,6 +1,9 @@
 import asyncio
+import json
+import re
 import threading
 import time
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -9,6 +12,8 @@ from httpx import ASGITransport, AsyncClient
 from app.asr import AsrResult
 from app.server import create_app
 from app.settings import Settings
+from app.store import CaptionStore
+from app.textutil import export_text
 from app.translate import TranslateResult, Translator
 
 ALLOWED_STATUS = {
@@ -64,13 +69,21 @@ async def token_of(app, client):
     return resp.json()["token"]
 
 
-async def push(client, token, room, session, seq, payload, *, wait_translation=None, async_header=False):
+async def push(client, token, room, session, seq, payload, *, wait_translation=None, async_header=False, t0_ms=None, t1_ms=None, retry=False):
     headers = auth(token)
     if async_header:
         headers["x-breeze-async-translation"] = "1"
+    if retry:
+        headers["x-breeze-retry"] = "1"
     data = {"room_id": room, "session_id": session, "seq": str(seq)}
     if wait_translation is not None:
         data["wait_translation"] = wait_translation
+    if retry:
+        data["retry"] = "1"
+    if t0_ms is not None:
+        data["t0_ms"] = str(t0_ms)
+    if t1_ms is not None:
+        data["t1_ms"] = str(t1_ms)
     return await client.post(
         "/api/push",
         params={"room_id": room, "session_id": session, "seq": str(seq)},
@@ -210,6 +223,7 @@ async def test_opt_in_push_returns_chinese_before_slow_english():
                 body = resp.json()
                 assert body["zh"] == text
                 assert body["en"] == ""
+                assert body["ok"] is True
                 assert body["status"] == "zh_ready"
                 assert body["status"] in ALLOWED_STATUS
             assert translator.release.is_set() is False
@@ -414,3 +428,553 @@ def test_host_page_opts_into_async_translation_and_listens_for_english():
     assert "connectRoom" in text
     assert "/ws/listen?room_id=" in text
     assert "mergeCaptionUpdate" in text
+    assert "throw new Error" in upload
+
+
+def test_host_upload_failure_throws_and_delete_control_is_present():
+    text = Path("app/static/host.html").read_text(encoding="utf-8")
+    upload = text.split("upload: async", 1)[1].split("onPhase", 1)[0]
+    assert "throw new Error" in upload
+    assert "刪除此段" in text
+    assert "onDelete" in text
+    assert "captions_cleared" in text
+    room = Path("app/static/room.html").read_text(encoding="utf-8")
+    assert "onDelete" in room
+    assert "createCaptionView" in room
+    client = Path("app/static/room_client.js").read_text(encoding="utf-8")
+    assert "caption_deleted" in client
+    assert "latest < cursor" in client
+
+
+_SRT_TIME = re.compile(
+    r"(\d{2}):(\d{2}):(\d{2}),(\d{3})\s+-->\s+(\d{2}):(\d{2}):(\d{2}),(\d{3})"
+)
+
+
+def srt_cues(payload: str) -> list[dict]:
+    text = payload.replace("\r\n", "\n").replace("\r", "\n").strip()
+    cues = []
+    for block in re.split(r"\n\s*\n", text):
+        lines = [line for line in block.split("\n") if line.strip()]
+        if len(lines) < 2:
+            continue
+        time_line = lines[1] if lines[0].strip().isdigit() else lines[0]
+        index = int(lines[0]) if lines[0].strip().isdigit() else None
+        match = _SRT_TIME.search(time_line)
+        if not match:
+            cues.append({"index": index, "ok": False, "text": "\n".join(lines)})
+            continue
+        parts = [int(item) for item in match.groups()]
+        start = ((parts[0] * 60 + parts[1]) * 60 + parts[2]) * 1000 + parts[3]
+        end = ((parts[4] * 60 + parts[5]) * 60 + parts[6]) * 1000 + parts[7]
+        body_from = 2 if lines[0].strip().isdigit() else 1
+        cues.append({
+            "index": index,
+            "ok": True,
+            "start": start,
+            "end": end,
+            "stamp": time_line.strip(),
+            "text": "\n".join(lines[body_from:]).strip(),
+        })
+    return cues
+
+
+def assert_monotonic_cues(cues: list[dict]) -> None:
+    assert cues, "no cues"
+    assert all(cue["ok"] for cue in cues)
+    assert [cue["index"] for cue in cues] == list(range(1, len(cues) + 1))
+    for cue in cues:
+        assert cue["end"] > cue["start"], cue
+    for prev, nxt in zip(cues, cues[1:]):
+        assert prev["start"] <= nxt["start"], (prev, nxt)
+        assert prev["end"] <= nxt["start"], (prev["end"], nxt["start"])
+
+
+class CountingAsr(EchoAsr):
+    def __init__(self):
+        self.calls = 0
+
+    def transcribe(self, wav: Path, prompt: str) -> AsrResult:
+        self.calls += 1
+        return super().transcribe(wav, prompt)
+
+
+class GateEnglish(Translator):
+    def __init__(self):
+        super().__init__(enabled=True, key="test-key")
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def translate(self, zh: str, glossary=None, context=None, deadline: float | None = None) -> TranslateResult:
+        del glossary, context, deadline
+        self.calls += 1
+        self.started.set()
+        self.release.wait(5)
+        return TranslateResult("EN " + zh, "ok")
+
+
+class Socket:
+    def __init__(self, app, path: str):
+        self.app = app
+        self.path = path
+        self.out: asyncio.Queue = asyncio.Queue()
+        self.inc: asyncio.Queue = asyncio.Queue()
+        self.task: asyncio.Task | None = None
+
+    async def __aenter__(self):
+        path, _, query = self.path.partition("?")
+        scope = {
+            "type": "websocket",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": query.encode(),
+            "headers": [(b"host", b"127.0.0.1:8780")],
+            "client": ("127.0.0.1", 5000),
+            "server": ("127.0.0.1", 8780),
+            "subprotocols": [],
+        }
+
+        async def receive():
+            return await self.inc.get()
+
+        async def send(message):
+            await self.out.put(message)
+
+        self.task = asyncio.create_task(self.app(scope, receive, send))
+        await self.inc.put({"type": "websocket.connect"})
+        first = await asyncio.wait_for(self.out.get(), 2)
+        assert first["type"] == "websocket.accept", first
+        return self
+
+    async def recv(self, timeout: float = 2):
+        msg = await asyncio.wait_for(self.out.get(), timeout)
+        if msg["type"] == "websocket.send":
+            return json.loads(msg["text"])
+        return {"type": msg["type"], "code": msg.get("code")}
+
+    async def close(self):
+        await self.inc.put({"type": "websocket.disconnect", "code": 1000})
+        if self.task is not None:
+            try:
+                await asyncio.wait_for(self.task, 1)
+            except Exception:
+                self.task.cancel()
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
+        return False
+
+
+async def export_of(client, token, room, kind):
+    resp = await client.get("/api/export", params={"room_id": room, "kind": kind}, headers=auth(token))
+    assert resp.status_code == 200, resp.text
+    return resp
+
+
+async def end_session(client, token, room, session):
+    resp = await client.post(
+        "/api/session/end",
+        json={"room_id": room, "session_id": session},
+        headers={**auth(token), "content-type": "application/json"},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_srt_cues_monotonic_and_non_overlapping():
+    srt = export_text(
+        [
+            {"zh": "一", "status": "ready", "session_id": "a", "session_ord": 1, "seq": 1, "t0_ms": 0, "t1_ms": 5000},
+            {"zh": "二", "status": "ready", "session_id": "a", "session_ord": 1, "seq": 2, "t0_ms": 3000, "t1_ms": 8000},
+            {"zh": "三", "status": "ready", "session_id": "b", "session_ord": 2, "seq": 1, "t0_ms": 0, "t1_ms": 2000},
+            {"zh": "負", "status": "ready", "session_id": "b", "session_ord": 2, "seq": 2, "t0_ms": -400, "t1_ms": -50},
+            {"zh": "倒", "status": "ready", "session_id": "b", "session_ord": 2, "seq": 3, "t0_ms": 1000, "t1_ms": 100},
+        ],
+        "srt",
+    )
+    cues = srt_cues(srt)
+    assert_monotonic_cues(cues)
+    assert cues[0]["text"].startswith("一")
+    assert cues[2]["start"] >= cues[1]["end"]
+    assert cues[2]["start"] != 0
+    vtt = export_text([{"zh": "一", "status": "ready", "session_id": "a", "seq": 1, "t0_ms": 0, "t1_ms": 1500}], "vtt")
+    assert "00:00:00.000 --> 00:00:01.500" in vtt
+
+
+@pytest.mark.anyio
+async def test_srt_second_session_does_not_restart_at_zero():
+    app = app_for(settings=settings_with(allow_testclient=True, translate=False))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            first = await push(client, token, "class", "s-old", 1, "上一場".encode(), t0_ms=0, t1_ms=6000, async_header=True, wait_translation="0")
+            assert first.status_code == 200, first.text
+            second = await push(client, token, "class", "s-new", 1, "下一場".encode(), t0_ms=0, t1_ms=4000, async_header=True, wait_translation="0")
+            assert second.status_code == 200, second.text
+            await end_session(client, token, "class", "s-old")
+            srt = await export_of(client, token, "class", "srt")
+            cues = srt_cues(srt.text)
+            assert_monotonic_cues(cues)
+            assert len(cues) == 2
+            assert cues[0]["start"] == 0
+            assert cues[1]["start"] >= cues[0]["end"]
+            assert cues[1]["start"] >= 6000
+            assert "下一場" in cues[1]["text"]
+            exported = await export_of(client, token, "class", "json")
+            rows = exported.json()
+            assert [row["session_id"] for row in rows] == ["s-old", "s-new"]
+            assert rows[1]["t0_ms"] >= rows[0]["t1_ms"]
+            assert {"zh", "en", "status", "seq", "session_id", "t0_ms", "t1_ms"} <= set(rows[0])
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_export_without_storage_keeps_full_session():
+    app = app_for(settings=settings_with(allow_testclient=True, translate=False, history_limit=2))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            for seq in range(1, 31):
+                resp = await push(
+                    client, token, "class", "s", seq, f"段{seq}".encode(),
+                    t0_ms=(seq - 1) * 6000, t1_ms=seq * 6000, async_header=True, wait_translation="0",
+                )
+                assert resp.status_code == 200, resp.text
+            assert len(app.state.bus.history("class")) <= 2
+            exported = await export_of(client, token, "class", "json")
+            rows = exported.json()
+            assert [row["seq"] for row in rows] == list(range(1, 31))
+            assert rows[0]["zh"] == "段1"
+            srt = await export_of(client, token, "class", "srt")
+            cues = srt_cues(srt.text)
+            assert len(cues) == 30
+            assert "段1" in srt.text and "段30" in srt.text
+    finally:
+        await stop(app)
+
+
+async def _push_half(app, client, token, room, session, count, text):
+    marked = None
+    for seq in range(1, count + 1):
+        resp = await push(
+            client, token, room, session, seq, text(session, seq).encode(),
+            t0_ms=(seq - 1) * 6000, t1_ms=seq * 6000, async_header=True, wait_translation="0",
+        )
+        assert resp.status_code == 200, resp.text[:300]
+        if seq == 50:
+            marked = app.state.bus.latest_cursor(room)
+    return marked
+
+
+@pytest.mark.anyio
+async def test_srt_100_minute_session_formats_hours(tmp_path):
+    """~1000 segments, two takes, storage off and on. Also backfill, retry, and memory."""
+    half = 500
+
+    async def run(store_path: str | None, track_memory: bool) -> None:
+        asr = CountingAsr()
+        settings = settings_with(
+            allow_testclient=True,
+            translate=False,
+            history_limit=200,
+            max_results=500,
+            data_path=store_path or "",
+            room_caption_cap=5000,
+        )
+        app = app_for(settings=settings, asr=asr)
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+                token = await token_of(app, client)
+                if not tracemalloc.is_tracing():
+                    tracemalloc.start()
+                before = tracemalloc.get_traced_memory()[0]
+                cursor_at_minute_5 = await _push_half(app, client, token, "class", "s1", half, lambda session, seq: f"{session}-{seq}")
+                await _push_half(app, client, token, "class", "s2", half, lambda session, seq: f"{session}-{seq}")
+                after, peak = tracemalloc.get_traced_memory()
+                if track_memory:
+                    delta = max(0, after - before)
+                    Path("/tmp/breeze_mem_1000.txt").write_text(
+                        f"delta={delta}\npeak={peak}\nindex={len(app.state.pipeline._index)}\n"
+                        f"results={len(app.state.pipeline.results)}\n"
+                        f"state={len(app.state.bus.caption_state('class'))}\n",
+                        encoding="utf-8",
+                    )
+                    assert delta < 80_000_000, delta
+                    tracemalloc.stop()
+                assert len(app.state.bus.history("class")) <= 200
+                state = app.state.bus.caption_state("class")
+                assert len(state) == half * 2
+                srt = await export_of(client, token, "class", "srt")
+                cues = srt_cues(srt.text)
+                assert len(cues) == half * 2
+                assert_monotonic_cues(cues)
+                assert any(cue["start"] >= 3_600_000 for cue in cues), cues[-1]
+                assert re.search(r"01:\d{2}:\d{2},\d{3}", srt.text)
+                assert "s1-1" in srt.text and "s2-1" in srt.text
+                assert sum(1 for cue in cues if cue["start"] == 0) == 1
+                exported = await export_of(client, token, "class", "json")
+                rows = exported.json()
+                assert len(rows) == half * 2
+                assert rows[0]["zh"] == "s1-1" and rows[0]["seq"] == 1
+                assert {"zh", "en", "status", "seq", "session_id", "t0_ms", "t1_ms"} <= set(rows[0])
+                assert rows[half]["session_id"] == "s2"
+                assert rows[half]["t0_ms"] >= 3_600_000 or rows[half]["t0_ms"] >= rows[half - 1]["t1_ms"]
+                assert rows[half]["t0_ms"] >= rows[half - 1]["t1_ms"]
+                if track_memory:
+                    async with Socket(app, f"/ws/listen?room_id=class&cursor={cursor_at_minute_5}") as sock:
+                        hello = await sock.recv()
+                    assert hello["gap"] is True
+                    assert "backfill" in hello
+                    backfill = hello["backfill"]
+                    assert len(backfill) == half * 2
+                    assert len({item["id"] for item in backfill}) == half * 2
+                    assert [(item["session_id"], item["seq"]) for item in backfill] == (
+                        [("s1", seq) for seq in range(1, half + 1)] + [("s2", seq) for seq in range(1, half + 1)]
+                    )
+                    calls = asr.calls
+                    again = await push(
+                        client, token, "class", "s1", 3, "s1-3".encode(),
+                        t0_ms=12000, t1_ms=18000, retry=True, async_header=True, wait_translation="0",
+                    )
+                    assert again.status_code == 200, again.text
+                    assert again.json()["zh"] == "s1-3"
+                    assert asr.calls == calls
+        finally:
+            await stop(app)
+
+    await run(None, True)
+    await run(str(tmp_path / "captions.sqlite3"), False)
+
+
+@pytest.mark.anyio
+async def test_room_idle_31_min_keeps_captions_exportable():
+    app = app_for(settings=settings_with(allow_testclient=True, translate=False, room_idle_s=1800))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            for seq in range(1, 5):
+                resp = await push(
+                    client, token, "class", "s", seq, f"休息{seq}".encode(),
+                    t0_ms=(seq - 1) * 6000, t1_ms=seq * 6000, async_header=True, wait_translation="0",
+                )
+                assert resp.status_code == 200, resp.text
+            room = app.state.room_book.rooms["class"]
+            room["session_active"] = False
+            room["listeners"].clear()
+            room["last_active"] = time.monotonic() - (31 * 60)
+            await app.state.sweep_once()
+            assert "class" not in app.state.room_book.rooms
+            srt = await export_of(client, token, "class", "srt")
+            cues = srt_cues(srt.text)
+            assert len(cues) == 4
+            assert "休息1" in srt.text and "休息4" in srt.text
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_room_delete_not_resurrected_by_late_translation():
+    gate = GateEnglish()
+    app = app_for(translator=gate, settings=settings_with(allow_testclient=True, data_path=""))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            pushed = await push(client, token, "class", "s", 1, "般若".encode(), async_header=True, wait_translation="0")
+            assert pushed.status_code == 200, pushed.text
+            deadline = time.monotonic() + 2
+            while not gate.started.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            assert gate.started.is_set()
+            deleted = await client.delete("/api/captions", params={"room_id": "class"}, headers=auth(token))
+            assert deleted.status_code == 200, deleted.text
+            gate.release.set()
+            await asyncio.sleep(0.3)
+            state = app.state.bus.caption_state("class")
+            assert all("般若" not in (item.get("zh") or "") and "EN" not in (item.get("en") or "") for item in state)
+            exported = await export_of(client, token, "class", "txt")
+            assert "般若" not in exported.text
+            nxt = await push(client, token, "class", "s", 2, "下一句".encode(), async_header=True, wait_translation="0", t0_ms=6000, t1_ms=12000)
+            assert nxt.status_code == 200, nxt.text
+            assert nxt.json()["zh"] == "下一句"
+            again = await push(client, token, "class", "s", 1, "般若".encode(), retry=True)
+            assert again.status_code == 409
+            exported = await export_of(client, token, "class", "txt")
+            assert "般若" not in exported.text
+            assert "下一句" in exported.text
+    finally:
+        gate.release.set()
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_room_delete_not_resurrected_by_retranslate():
+    app = app_for(settings=settings_with(allow_testclient=True, translate=False))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            pushed = await push(client, token, "class", "s", 1, "般若".encode(), t0_ms=0, t1_ms=1000)
+            assert pushed.status_code == 200, pushed.text
+            deleted = await client.delete("/api/captions", params={"room_id": "class"}, headers=auth(token))
+            assert deleted.status_code == 200, deleted.text
+            again = await client.post(
+                "/api/segment/retranslate",
+                json={"room_id": "class", "session_id": "s", "seq": 1, "zh": "般若"},
+                headers={**auth(token), "content-type": "application/json"},
+            )
+            assert again.status_code == 404
+            exported = await export_of(client, token, "class", "txt")
+            assert "般若" not in exported.text
+            assert app.state.bus.caption_state("class") == []
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_single_caption_delete_removes_from_store_bus_export_and_notifies_listener(tmp_path):
+    app = app_for(settings=settings_with(allow_testclient=True, translate=False, data_path=str(tmp_path / "captions.sqlite3")))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await client.post("/api/rooms/open", json={"room_id": "class"}, headers={**auth(token), "content-type": "application/json"})
+            first = await push(client, token, "class", "s", 1, "留下".encode(), t0_ms=0, t1_ms=1000)
+            second = await push(client, token, "class", "s", 2, "刪掉".encode(), t0_ms=1000, t1_ms=2000)
+            assert first.status_code == 200 and second.status_code == 200
+            async with Socket(app, "/ws/listen?room_id=class&cursor=0") as sock:
+                hello = await sock.recv()
+                assert hello["type"] == "hello"
+                deleted = await client.delete(
+                    "/api/captions",
+                    params={"room_id": "class", "id": "class:s:2"},
+                    headers=auth(token),
+                )
+                assert deleted.status_code == 200, deleted.text
+                assert deleted.json()["id"] == "class:s:2"
+                notice = await sock.recv()
+            assert notice["type"] == "caption_deleted"
+            assert notice["id"] == "class:s:2"
+            assert notice["room_id"] == "class"
+            assert all(item.get("id") != "class:s:2" for item in app.state.bus.history("class"))
+            assert all(item.get("id") != "class:s:2" for item in app.state.bus.caption_state("class"))
+            app.state.store.flush()
+            assert all(row["id"] != "class:s:2" for row in app.state.store.room_rows("class"))
+            exported = await export_of(client, token, "class", "txt")
+            assert "刪掉" not in exported.text
+            assert "留下" in exported.text
+            retry = await push(client, token, "class", "s", 2, "刪掉".encode(), retry=True, t0_ms=1000, t1_ms=2000)
+            assert retry.status_code == 409
+            exported = await export_of(client, token, "class", "txt")
+            assert "刪掉" not in exported.text
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_delete_is_room_isolated(tmp_path):
+    app = app_for(settings=settings_with(allow_testclient=True, translate=False, data_path=str(tmp_path / "captions.sqlite3")))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await push(client, token, "room-a", "s", 1, "甲一".encode(), t0_ms=0, t1_ms=1000)
+            await push(client, token, "room-a", "s", 2, "甲二".encode(), t0_ms=1000, t1_ms=2000)
+            await push(client, token, "room-b", "s", 1, "乙一".encode(), t0_ms=0, t1_ms=1000)
+            deleted = await client.delete(
+                "/api/captions",
+                params={"room_id": "room-a", "session_id": "s", "seq": 1},
+                headers=auth(token),
+            )
+            assert deleted.status_code == 200, deleted.text
+            assert deleted.json()["id"] == "room-a:s:1"
+            kept_a = await export_of(client, token, "room-a", "txt")
+            kept_b = await export_of(client, token, "room-b", "txt")
+            assert "甲一" not in kept_a.text and "甲二" in kept_a.text
+            assert "乙一" in kept_b.text
+            wiped = await client.delete("/api/captions", params={"room_id": "room-a"}, headers=auth(token))
+            assert wiped.status_code == 200
+            assert "甲" not in (await export_of(client, token, "room-a", "txt")).text
+            assert "乙一" in (await export_of(client, token, "room-b", "txt")).text
+            assert any(item.get("zh") == "乙一" for item in app.state.bus.caption_state("room-b"))
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_delete_requires_host_token():
+    app = app_for(settings=settings_with(allow_testclient=True, translate=False))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await push(client, token, "class", "s", 1, "留下".encode(), t0_ms=0, t1_ms=1000)
+            await push(client, token, "class", "s", 2, "也留".encode(), t0_ms=1000, t1_ms=2000)
+            anonymous = await client.delete("/api/captions", params={"room_id": "class", "id": "class:s:1"})
+            assert anonymous.status_code == 401
+            bad = await client.delete(
+                "/api/captions",
+                params={"room_id": "class", "id": "class:s:1"},
+                headers={"authorization": "Bearer nope", "origin": "http://127.0.0.1"},
+            )
+            assert bad.status_code == 401
+            authed = await client.delete(
+                "/api/captions",
+                params={"room_id": "class", "id": "class:s:2"},
+                headers=auth(token),
+            )
+            assert authed.status_code == 200, authed.text
+            assert authed.json()["id"] == "class:s:2"
+            exported = await export_of(client, token, "class", "txt")
+            assert "留下" in exported.text
+            assert "也留" not in exported.text
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_reconnect_after_delete_old_cursor_not_blank():
+    app = app_for(settings=settings_with(allow_testclient=True, translate=False))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await push(client, token, "class", "s", 1, "舊字幕".encode(), t0_ms=0, t1_ms=1000)
+            held = app.state.bus.latest_cursor("class")
+            assert held >= 1
+            deleted = await client.delete("/api/captions", params={"room_id": "class"}, headers=auth(token))
+            assert deleted.status_code == 200, deleted.text
+            async with Socket(app, f"/ws/listen?room_id=class&cursor={held}") as sock:
+                hello = await sock.recv()
+            assert hello["type"] == "hello"
+            assert hello["latest_cursor"] >= held
+            assert any(item.get("type") == "captions_cleared" for item in hello["events"])
+            assert hello.get("epoch", 1) >= 1
+            assert "舊字幕" not in json.dumps(hello.get("history") or [])
+            nxt = await push(client, token, "class", "s", 2, "新字幕".encode(), t0_ms=6000, t1_ms=9000, async_header=True, wait_translation="0")
+            assert nxt.status_code == 200, nxt.text
+            assert "新字幕" in (await export_of(client, token, "class", "txt")).text
+            assert "舊字幕" not in (await export_of(client, token, "class", "txt")).text
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_listener_error_does_not_stall_later_segments():
+    app = app_for(settings=settings_with(allow_testclient=True, translate=False))
+    try:
+        original = app.state.pipeline.on_event
+
+        def boom(event):
+            if int(event.get("seq") or 0) == 1 and int(event.get("version") or 1) == 1:
+                raise RuntimeError("listener failed")
+            return original(event)
+
+        app.state.pipeline.on_event = boom
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            first = await push(client, token, "class", "s", 1, "第一".encode(), async_header=True, wait_translation="0")
+            second = await push(client, token, "class", "s", 2, "第二".encode(), async_header=True, wait_translation="0")
+            assert first.status_code == 200, first.text
+            assert second.status_code == 200, second.text
+            rows = app.state.bus.caption_state("class")
+            assert any(item.get("zh") == "第二" for item in rows)
+    finally:
+        await stop(app)

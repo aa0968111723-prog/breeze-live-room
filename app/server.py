@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -108,14 +109,22 @@ def _field(form, request: Request, name: str) -> str:
     return str(value or "")
 
 
+_MAX_SEGMENT_MS = 48 * 60 * 60 * 1000
+
+
 def _optional_ms(form, request: Request, name: str) -> int | None:
     raw = _field(form, request, name)
     if raw == "":
         return None
     try:
-        return int(raw)
+        value = int(raw)
     except ValueError:
         return None
+    if value < 0:
+        return 0
+    if value > _MAX_SEGMENT_MS:
+        return _MAX_SEGMENT_MS
+    return value
 
 
 def _public_result(done: Segment) -> JSONResponse:
@@ -147,7 +156,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
     whisper = Path(settings.whisper_path) if settings.whisper_path else DEFAULT_WHISPER
     resident_error = ""
     book = RoomBook(settings.max_rooms, settings.room_idle_s)
-    bus = RoomBus(settings.history_limit)
+    bus = RoomBus(settings.history_limit, caption_cap=getattr(settings, "room_caption_cap", 5000))
     store = CaptionStore(settings.data_path or None)
     if asr is None:
         if settings.asr_mode == "resident":
@@ -177,23 +186,56 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         host = (share_override["host"] or "").strip()
         return host or None
 
-    def on_event(event: dict):
-        snap = bus.publish(event)
-        if snap is None:
-            return None
+    def _fanout(snap: dict) -> None:
         room = book.get(str(snap.get("room_id") or ""))
-        if room is not None:
-            room["history"] = bus.history(snap["room_id"])
-            room["last_active"] = time.monotonic()
-            dead = []
-            for conn in list(room["listeners"]):
-                if not conn.slot.offer(snap):
-                    dead.append(conn)
-            for conn in dead:
-                room["listeners"].discard(conn)
-        if store.enabled:
-            store.save(snap)
-        return snap
+        if room is None:
+            return
+        room["history"] = bus.history(str(snap.get("room_id") or ""))
+        room["last_active"] = time.monotonic()
+        dead = []
+        for conn in list(room["listeners"]):
+            if not conn.slot.offer(snap):
+                dead.append(conn)
+        for conn in dead:
+            room["listeners"].discard(conn)
+
+    def on_event(event: dict):
+        try:
+            snap = bus.publish(event)
+            if snap is None:
+                return None
+            _fanout(snap)
+            if store.enabled and snap.get("id") and snap.get("type") not in {"captions_cleared", "caption_deleted"}:
+                store.submit_save(snap)
+            return snap
+        except Exception:
+            logging.getLogger("breeze.server").exception("caption publish failed")
+            return None
+
+    def _release_room(room_id: str) -> None:
+        """Idle or close drops runtime, not captions that are still inside the ttl."""
+        keep = bus.has_captions(room_id)
+        if not keep and store.enabled:
+            try:
+                keep = store.has_room(room_id)
+            except Exception:
+                logging.getLogger("breeze.server").exception("caption store lookup failed")
+                keep = True
+        if keep:
+            bus.retire(room_id)
+        else:
+            bus.drop(room_id)
+        pipeline.drop_room(room_id)
+
+    def _expire_captions() -> None:
+        now = time.time()
+        for room_id in list(bus._state_at):
+            if book.get(room_id) is not None:
+                continue
+            if bus.caption_age(room_id, now) < settings.caption_ttl_s:
+                continue
+            bus.drop(room_id)
+            pipeline.drop_room(room_id)
 
     pipeline = Pipeline(asr, translator, PROMPT, TMP, settings, on_event=on_event)
 
@@ -209,14 +251,20 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             raise AudioError(413, f"音訊長於 {settings.max_audio_seconds} 秒，已拒絕")
         return wav
 
+    async def sweep_once() -> None:
+        try:
+            for room_id in book.sweep():
+                _release_room(room_id)
+            _expire_captions()
+            if store.enabled:
+                await asyncio.to_thread(store.purge_expired, settings.caption_ttl_s)
+        except Exception:
+            logging.getLogger("breeze.server").exception("sweep failed")
+
     async def sweep_loop() -> None:
         while True:
             await asyncio.sleep(1)
-            for room_id in book.sweep():
-                bus.drop(room_id)
-                pipeline.drop_room(room_id)
-            if store.enabled:
-                store.purge_expired(settings.caption_ttl_s)
+            await sweep_once()
 
     async def shutdown() -> None:
         for task in tasks:
@@ -227,6 +275,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         await pipeline.aclose()
         if hasattr(asr, "close"):
             asr.close()
+        store.close()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -250,6 +299,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
     app.state.store = store
     app.state.share_override = share_override
     app.state.shutdown = shutdown
+    app.state.sweep_once = sweep_once
     app.state.resident_error = resident_error
 
     def share_for(room_id: str) -> str | None:
@@ -356,8 +406,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             room["listeners"].clear()
         removed = book.sweep()
         for gone in removed:
-            bus.drop(gone)
-            pipeline.drop_room(gone)
+            _release_room(gone)
         return {"ok": True}
 
     @app.post("/api/session/active")
@@ -450,6 +499,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             "rss_bytes": rss_bytes(),
             "tokens_used": translator.tokens_used,
             "price": translator.price_note(),
+            "store_errors": store.errors,
         }
 
     @app.get("/api/export")
@@ -459,7 +509,10 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         if kind not in {"txt", "json", "srt", "vtt"}:
             raise HTTPException(status_code=400, detail="不支援的匯出格式")
         try:
-            events = await asyncio.to_thread(store.room_rows, room_id) if store.enabled else bus.history(room_id)
+            if store.enabled:
+                events = await asyncio.to_thread(store.room_rows, room_id)
+            else:
+                events = bus.caption_state(room_id)
             payload = export_text(events, kind)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -467,15 +520,28 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         return Response(payload, media_type=media, headers={"Cache-Control": "no-store"})
 
     @app.delete("/api/captions")
-    async def delete_captions(request: Request, room_id: str) -> dict:
+    async def delete_captions(request: Request, room_id: str, id: str = "", session_id: str = "", seq: int = 0) -> dict:
         require_host(request, token, settings)
         room_id = validate_room_id(room_id)
-        removed = store.delete_room(room_id)
-        bus.drop(room_id)
+        if id or session_id or seq:
+            segment_id, parsed_session, parsed_seq = _caption_target(room_id, id, session_id, seq)
+            pipeline.delete_segment(room_id, parsed_session, parsed_seq)
+            # Queue the delete before yielding so a save already in flight runs first
+            # and a caption accepted after this point is not removed with it.
+            pending = store.enqueue_delete_id(room_id, segment_id)
+            event = bus.delete_caption(room_id, segment_id, parsed_session, parsed_seq)
+            _fanout(event)
+            removed = await asyncio.wrap_future(pending)
+            return {"ok": True, "deleted": int(removed or 0), "id": segment_id}
+        pipeline.invalidate_room(room_id)
+        pending = store.enqueue_delete_room(room_id)
+        event = bus.clear_room(room_id)
+        _fanout(event)
         room = book.get(room_id)
         if room is not None:
             room["history"] = []
-        return {"ok": True, "deleted": removed}
+        removed = await asyncio.wrap_future(pending)
+        return {"ok": True, "deleted": int(removed or 0)}
 
     @app.post("/api/push")
     async def push(request: Request) -> dict:
@@ -523,12 +589,16 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 reserved_key = key
             book.open(room_id)
             retry = _field(form, request, "retry") == "1" or request.headers.get("x-breeze-retry") == "1"
+            t0_ms = _optional_ms(form, request, "t0_ms")
+            t1_ms = _optional_ms(form, request, "t1_ms")
+            if t0_ms is not None and t1_ms is not None and t1_ms < t0_ms:
+                t1_ms = t0_ms
             segment = Segment(
                 room_id=room_id,
                 session_id=session_id,
                 seq=seq,
-                t0_ms=_optional_ms(form, request, "t0_ms"),
-                t1_ms=_optional_ms(form, request, "t1_ms"),
+                t0_ms=t0_ms,
+                t1_ms=t1_ms,
             )
             held = reserved
             reserved = False
@@ -599,7 +669,10 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             "latest_cursor": bus.latest_cursor(room_id),
             "oldest_cursor": resumed["oldest_cursor"],
             "room_id": room_id,
+            "epoch": bus.epoch(room_id),
         }
+        if cursor > 0 and resumed.get("gap"):
+            hello["backfill"] = list(resumed.get("backfill") or [])
         try:
             await ws.send_json(hello)
         except Exception:
@@ -628,6 +701,29 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
 
     _TRACKED.append(app)
     return app
+
+
+def _caption_target(room_id: str, caption_id: str, session_id: str, seq: int) -> tuple[str, str, int]:
+    if caption_id:
+        prefix = room_id + ":"
+        if not str(caption_id).startswith(prefix):
+            raise HTTPException(status_code=400, detail="段落不屬於這個房間")
+        session, sep, seq_text = str(caption_id)[len(prefix):].rpartition(":")
+        if not sep:
+            raise HTTPException(status_code=400, detail="段落代號不正確")
+        try:
+            parsed = int(seq_text)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="段落序號不正確") from exc
+        if parsed < 1:
+            raise HTTPException(status_code=400, detail="段落序號不正確")
+        return str(caption_id), validate_session_id(session), parsed
+    if session_id and seq:
+        if seq < 1:
+            raise HTTPException(status_code=400, detail="段落序號不正確")
+        session = validate_session_id(session_id)
+        return f"{room_id}:{session}:{seq}", session, seq
+    raise HTTPException(status_code=400, detail="刪除單段需要 id 或 session_id 與 seq")
 
 
 async def _json(request: Request) -> dict:

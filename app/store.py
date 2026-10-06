@@ -1,64 +1,111 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+log = logging.getLogger("breeze.store")
 
 
 class CaptionStore:
-    """Optional single-machine caption store. Audio files are not kept."""
+    """Optional single-machine caption store. Audio files are not kept.
+
+    Writes share one connection on one thread, in call order, so a delete cannot
+    be overtaken by a save that was queued first. Readers wait for that queue.
+    """
 
     def __init__(self, path: str | Path | None):
         text = "" if path is None else str(path).strip()
         self.path = Path(text) if text else None
         self.enabled = self.path is not None
-        if self.path:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            conn = self._conn()
-            try:
-                with conn:
-                    conn.execute(
-                        """
-                        create table if not exists captions (
-                            id text primary key,
-                            room_id text not null,
-                            session_id text not null,
-                            seq integer not null,
-                            version integer not null,
-                            zh text,
-                            zh_raw text,
-                            en text,
-                            status text,
-                            t0_ms integer,
-                            t1_ms integer,
-                            updated_at real not null
-                        )
-                        """
-                    )
-                    conn.execute("create index if not exists captions_room_session_seq on captions (room_id, session_id, seq)")
-            finally:
-                conn.close()
+        self.errors = 0
+        self._conn: sqlite3.Connection | None = None
+        self._pool: ThreadPoolExecutor | None = None
+        self._writer: threading.Thread | None = None
+        self._closed = False
+        if not self.path:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="breeze-store")
+        self._submit(self._open).result()
 
-    def _conn(self) -> sqlite3.Connection:
+    def _on_writer(self) -> bool:
+        return self._writer is not None and threading.current_thread() is self._writer
+
+    def _submit(self, fn, *args):
+        if self._pool is None:
+            raise RuntimeError("caption store is not open")
+        return self._pool.submit(fn, *args)
+
+    def _open(self) -> None:
+        self._writer = threading.current_thread()
         assert self.path is not None
-        return sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(
+            """
+            create table if not exists captions (
+                id text primary key,
+                room_id text not null,
+                session_id text not null,
+                seq integer not null,
+                version integer not null,
+                zh text,
+                zh_raw text,
+                en text,
+                status text,
+                t0_ms integer,
+                t1_ms integer,
+                updated_at real not null
+            )
+            """
+        )
+        columns = {row[1] for row in conn.execute("pragma table_info(captions)")}
+        if "session_ord" not in columns:
+            conn.execute("alter table captions add column session_ord integer")
+        conn.execute("create index if not exists captions_room_session_seq on captions (room_id, session_id, seq)")
+        conn.execute("create index if not exists captions_updated_at on captions (updated_at)")
+        conn.commit()
+        self._conn = conn
 
-    def _run(self, fn):
-        conn = self._conn()
+    def _guard(self, fn, *args):
         try:
-            with conn:
-                return fn(conn)
-        finally:
-            conn.close()
+            return fn(*args)
+        except Exception:
+            self.errors += 1
+            log.exception("caption store write failed")
+            return None
+
+    def submit_save(self, event: dict) -> None:
+        if not self.enabled or not event.get("id") or self._closed:
+            return
+        self._submit(self._guard, self.save, dict(event))
 
     def save(self, event: dict) -> None:
         if not self.enabled or not event.get("id"):
             return
-        def write(conn: sqlite3.Connection) -> None:
+        if self._on_writer():
+            self._write_save(event)
+            return
+        self._submit(self.save, dict(event)).result()
+
+    def _write_save(self, event: dict) -> None:
+        conn = self._conn
+        if conn is None:
+            return
+        with conn:
             conn.execute(
                 """
-                insert into captions (id, room_id, session_id, seq, version, zh, zh_raw, en, status, t0_ms, t1_ms, updated_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                insert into captions (
+                    id, room_id, session_id, seq, version, zh, zh_raw, en, status,
+                    t0_ms, t1_ms, updated_at, session_ord
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(id) do update set
                     version=excluded.version,
                     zh=excluded.zh,
@@ -67,47 +114,133 @@ class CaptionStore:
                     status=excluded.status,
                     t0_ms=excluded.t0_ms,
                     t1_ms=excluded.t1_ms,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    session_ord=coalesce(excluded.session_ord, captions.session_ord)
                 where excluded.version >= captions.version
                 """,
                 (
                     event.get("id"), event.get("room_id"), event.get("session_id"), int(event.get("seq") or 0),
                     int(event.get("version") or 1), event.get("zh") or "", event.get("zh_raw") or "",
                     event.get("en") or "", event.get("status") or "", event.get("t0_ms"), event.get("t1_ms"),
-                    time.time(),
+                    time.time(), event.get("session_ord"),
                 ),
             )
-        self._run(write)
+
+    def enqueue_delete_room(self, room_id: str):
+        """Queue the delete behind saves already submitted. Do not wait yet."""
+        from concurrent.futures import Future
+
+        if not self.enabled or self._pool is None:
+            done: Future = Future()
+            done.set_result(0)
+            return done
+        return self._pool.submit(self._guard_delete, self._delete_room_now, room_id)
+
+    def enqueue_delete_id(self, room_id: str, seg_id: str):
+        from concurrent.futures import Future
+
+        if not self.enabled or self._pool is None:
+            done: Future = Future()
+            done.set_result(0)
+            return done
+        return self._pool.submit(self._guard_delete, self._delete_id_now, room_id, seg_id)
+
+    def _guard_delete(self, fn, *args) -> int:
+        try:
+            deleted = fn(*args)
+            return int(deleted or 0)
+        except Exception:
+            self.errors += 1
+            log.exception("caption store delete failed")
+            return 0
 
     def delete_room(self, room_id: str) -> int:
         if not self.enabled:
             return 0
-        def remove(conn: sqlite3.Connection) -> int:
+        if self._on_writer():
+            return self._delete_room_now(room_id)
+        deleted = self._submit(self.delete_room, room_id).result()
+        return int(deleted or 0)
+
+    def _delete_room_now(self, room_id: str) -> int:
+        conn = self._conn
+        if conn is None:
+            return 0
+        with conn:
             cur = conn.execute("delete from captions where room_id = ?", (room_id,))
-            return cur.rowcount
-        return self._run(remove)
+            return int(cur.rowcount or 0)
+
+    def delete_id(self, room_id: str, seg_id: str) -> int:
+        if not self.enabled:
+            return 0
+        if self._on_writer():
+            return self._delete_id_now(room_id, seg_id)
+        deleted = self._submit(self.delete_id, room_id, seg_id).result()
+        return int(deleted or 0)
+
+    def _delete_id_now(self, room_id: str, seg_id: str) -> int:
+        conn = self._conn
+        if conn is None:
+            return 0
+        with conn:
+            cur = conn.execute("delete from captions where room_id = ? and id = ?", (room_id, seg_id))
+            return int(cur.rowcount or 0)
 
     def purge_expired(self, ttl_s: float) -> int:
         if not self.enabled:
             return 0
+        if self._on_writer():
+            return self._purge_now(ttl_s)
+        removed = self._submit(self.purge_expired, ttl_s).result()
+        return int(removed or 0)
+
+    def _purge_now(self, ttl_s: float) -> int:
+        conn = self._conn
+        if conn is None:
+            return 0
         cutoff = time.time() - ttl_s
-        def purge(conn: sqlite3.Connection) -> int:
+        with conn:
             cur = conn.execute("delete from captions where updated_at < ?", (cutoff,))
-            return cur.rowcount
-        return self._run(purge)
+            return int(cur.rowcount or 0)
+
+    def has_room(self, room_id: str) -> bool:
+        if not self.enabled:
+            return False
+        if self._on_writer():
+            return self._has_room_now(room_id)
+        return bool(self._submit(self.has_room, room_id).result())
+
+    def _has_room_now(self, room_id: str) -> bool:
+        conn = self._conn
+        if conn is None:
+            return False
+        row = conn.execute("select 1 from captions where room_id = ? limit 1", (room_id,)).fetchone()
+        return row is not None
 
     def room_rows(self, room_id: str) -> list[dict]:
         if not self.enabled:
             return []
-        def read(conn: sqlite3.Connection) -> list[dict]:
-            conn.row_factory = sqlite3.Row
+        if self._on_writer():
+            return self._room_rows_now(room_id)
+        rows = self._submit(self.room_rows, room_id).result()
+        return rows or []
+
+    def _room_rows_now(self, room_id: str) -> list[dict]:
+        conn = self._conn
+        if conn is None:
+            return []
+        conn.row_factory = sqlite3.Row
+        try:
             rows = conn.execute(
                 """
                 with sessions as (
-                    select session_id, min(rowid) as session_ord
+                    select session_id,
+                           coalesce(min(nullif(session_ord, 0)), min(rowid)) as session_ord
                     from captions where room_id = ? group by session_id
                 )
-                select captions.*, sessions.session_ord
+                select captions.id, captions.room_id, captions.session_id, captions.seq,
+                       captions.version, captions.zh, captions.zh_raw, captions.en, captions.status,
+                       captions.t0_ms, captions.t1_ms, captions.updated_at, sessions.session_ord
                 from captions join sessions on captions.session_id = sessions.session_id
                 where captions.room_id = ?
                 order by sessions.session_ord, captions.seq
@@ -115,4 +248,25 @@ class CaptionStore:
                 (room_id, room_id),
             ).fetchall()
             return [dict(row) for row in rows]
-        return self._run(read)
+        finally:
+            conn.row_factory = None
+
+    def flush(self) -> None:
+        if not self.enabled or self._pool is None or self._closed:
+            return
+        if self._on_writer():
+            return
+        self._submit(lambda: None).result()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        pool = self._pool
+        self._pool = None
+        if pool is not None:
+            pool.shutdown(wait=True)
+        conn = self._conn
+        self._conn = None
+        if conn is not None:
+            conn.close()

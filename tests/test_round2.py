@@ -464,6 +464,13 @@ async def test_failed_session_does_not_block_a_new_session_and_end_fills_the_hol
                 if 2 in app.state.pipeline._held.get(("class", "old"), {}):
                     break
                 await asyncio.sleep(0)
+            # Decode runs on a worker. A yield-0 spin can finish before that thread
+            # is scheduled, especially after a long suite. The assertion is unchanged:
+            # seq 2 must still be parked, not emitted, while seq 1 is missing.
+            for _ in range(40):
+                if 2 in app.state.pipeline._held.get(("class", "old"), {}):
+                    break
+                await asyncio.sleep(0.025)
             assert 2 in app.state.pipeline._held.get(("class", "old"), {})
             fresh = await push(client, token, "class", "new", 1, "新會話".encode())
             assert fresh.status_code == 200

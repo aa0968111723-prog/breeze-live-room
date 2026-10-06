@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import logging
 import shutil
 import time
 import uuid
@@ -111,6 +112,8 @@ class Pipeline:
         self._flight: dict[tuple[str, str, int], asyncio.Future] = {}
         self._cancel: set[tuple[str, str, int]] = set()
         self._room_gen: dict[str, int] = {}
+        self._index: dict[tuple[str, str, int], dict] = {}
+        self._sealed: dict[str, set[str]] = {}
         self.inflight = 0
         self.rejected = 0
         self.missing_count = 0
@@ -281,6 +284,9 @@ class Pipeline:
             self._tr_epoch.pop(key, None)
         for group in [group for group in self._recent_zh if group[0] == room_id]:
             self._recent_zh.pop(group, None)
+        for key in [key for key in self._index if key[0] == room_id]:
+            self._index.pop(key, None)
+        self._sealed.pop(room_id, None)
 
     def _ord(self, room_id: str, session_id: str) -> int:
         key = (room_id, session_id)
@@ -321,8 +327,138 @@ class Pipeline:
         self._emit_waiters.setdefault(segment.key, []).append(fut)
         await fut
 
+    def _voided(self, segment: Segment) -> bool:
+        return segment.id in self._sealed.get(segment.room_id, ())
+
+    def _abandon(self, segment: Segment) -> Segment:
+        segment.zh = ""
+        segment.en = ""
+        segment.zh_raw = ""
+        segment.translate_queued = False
+        segment.status = "cancelled"
+        segment.translate_status = ""
+        segment.error = "已清除"
+        return segment
+
+    def _remember_index(self, segment: Segment) -> None:
+        if self._stale(segment) or self._voided(segment):
+            return
+        self._index[segment.key] = {
+            "hash": self._hashes.get(segment.key),
+            "version": segment.version,
+            "status": segment.status,
+            "zh": segment.zh,
+            "zh_raw": segment.zh_raw,
+            "en": segment.en,
+            "t0_ms": segment.t0_ms,
+            "t1_ms": segment.t1_ms,
+            "session_ord": segment.session_ord,
+            "error": segment.error,
+            "translate_status": segment.translate_status,
+            "room_gen": segment.room_gen,
+        }
+        self._trim_index(segment.room_id)
+
+    def _trim_index(self, room_id: str) -> None:
+        cap = max(1, int(getattr(self.settings, "room_caption_cap", 5000)))
+        keys = [key for key in self._index if key[0] == room_id]
+        if len(keys) <= cap:
+            return
+        keys.sort(key=lambda key: (int(self._index[key].get("session_ord") or 0), key[1], key[2]))
+        for key in keys[: len(keys) - cap]:
+            self._index.pop(key, None)
+            self._hashes.pop(key, None)
+
+    def _rehydrate(self, key: tuple[str, str, int]) -> Segment | None:
+        row = self._index.get(key)
+        if not row:
+            return None
+        segment = Segment(
+            room_id=key[0],
+            session_id=key[1],
+            seq=key[2],
+            zh=row.get("zh") or "",
+            zh_raw=row.get("zh_raw") or "",
+            en=row.get("en") or "",
+            status=row.get("status") or "ready",
+            translate_status=row.get("translate_status") or "",
+            error=row.get("error") or "",
+            version=int(row.get("version") or 1),
+            session_ord=int(row.get("session_ord") or 0),
+            t0_ms=row.get("t0_ms"),
+            t1_ms=row.get("t1_ms"),
+            room_gen=int(row.get("room_gen") or 0) or self._room_gen.get(key[0], 1),
+        )
+        if row.get("hash"):
+            self._hashes.setdefault(key, row["hash"])
+        self.results[key] = segment
+        return segment
+
+    def invalidate_room(self, room_id: str) -> None:
+        """Drop this room's captions. The live session keeps its seq counter and can continue."""
+        self._room_gen[room_id] = self._room_gen.get(room_id, 1) + 1
+        sealed = self._sealed.setdefault(room_id, set())
+        for (rid, sid), max_seq in list(self._max_seq.items()):
+            if rid != room_id:
+                continue
+            group = (rid, sid)
+            self._held.pop(group, None)
+            self._next[group] = max(self._next.get(group, 1), int(max_seq) + 1)
+            for seq in range(1, int(max_seq) + 1):
+                sealed.add(f"{rid}:{sid}:{seq}")
+                self._gap_since.pop((rid, sid, seq), None)
+        for key in list(self._flight):
+            if key[0] == room_id:
+                sealed.add(f"{key[0]}:{key[1]}:{key[2]}")
+        for key in list(self.results):
+            if key[0] == room_id:
+                sealed.add(f"{key[0]}:{key[1]}:{key[2]}")
+        for key in list(self._index):
+            if key[0] == room_id:
+                sealed.add(f"{key[0]}:{key[1]}:{key[2]}")
+                self._index.pop(key, None)
+        for key in [key for key in self._hashes if key[0] == room_id]:
+            if f"{key[0]}:{key[1]}:{key[2]}" in sealed:
+                self._hashes.pop(key, None)
+        for key in [key for key in self.results if key[0] == room_id]:
+            segment = self.results.pop(key)
+            self._emitted_segs.discard(key)
+            self._abandon(segment)
+            self._wake(key, segment)
+        for key in [key for key in self._waiters if key[0] == room_id]:
+            blank = Segment(
+                room_id=key[0], session_id=key[1], seq=key[2], status="cancelled", error="已清除",
+                room_gen=self._room_gen.get(room_id, 0),
+            )
+            self._wake(key, blank)
+        for group in [group for group in self._held if group[0] == room_id]:
+            self._held.pop(group, None)
+        for key in [key for key in self._tr_epoch if key[0] == room_id]:
+            self._tr_epoch[key] = self._tr_epoch.get(key, 0) + 1
+
+    def delete_segment(self, room_id: str, session_id: str, seq: int) -> None:
+        key = (room_id, session_id, seq)
+        self._sealed.setdefault(room_id, set()).add(f"{room_id}:{session_id}:{seq}")
+        self._tr_epoch[key] = self._tr_epoch.get(key, 0) + 1
+        self._index.pop(key, None)
+        self._hashes.pop(key, None)
+        self._emitted_segs.discard(key)
+        held = self._held.get((room_id, session_id))
+        if held is not None:
+            held.pop(seq, None)
+        segment = self.results.pop(key, None)
+        if segment is None:
+            segment = Segment(room_id=room_id, session_id=session_id, seq=seq, status="cancelled", error="已刪除")
+        else:
+            self._abandon(segment)
+        self._wake(key, segment)
+        if self._next.get((room_id, session_id), 1) == seq:
+            self._next[(room_id, session_id)] = seq + 1
+            self._gap_since.pop((room_id, session_id, seq), None)
+            self._drain((room_id, session_id))
+
     def _emit(self, segment: Segment) -> None:
-        if self._stale(segment):
+        if self._stale(segment) or self._voided(segment):
             # Do not mark emitted: that would unblock zh_ready into a translation wait
             # for a caption that will never be queued.
             return
@@ -356,17 +492,38 @@ class Pipeline:
         if len(self.events) > self.settings.history_limit * 2:
             del self.events[: len(self.events) - self.settings.history_limit * 2]
         self._mark_emitted(segment)
+        self._remember_index(segment)
         if segment.status == "zh_ready" and not segment.translate_queued:
             self._queue_translate(segment)
         if self.on_event:
-            delivered = self.on_event(dict(event))
+            try:
+                delivered = self.on_event(dict(event))
+            except Exception:
+                logging.getLogger("breeze.pipeline").exception("caption listener failed")
+                delivered = None
             if isinstance(delivered, dict) and delivered.get("cursor"):
                 segment.cursor = int(delivered["cursor"])
                 event["cursor"] = segment.cursor
+                indexed = self._index.get(segment.key)
+                if indexed is not None and int(indexed.get("version") or 0) == segment.version:
+                    indexed["cursor"] = segment.cursor
+
+    def _skip_void(self, segment: Segment) -> None:
+        """A deleted or stale seq must not pin the ordered release of later ones."""
+        group = (segment.room_id, segment.session_id)
+        held = self._held.get(group)
+        if held is not None:
+            held.pop(segment.seq, None)
+        if self._next.get(group, 1) != segment.seq:
+            return
+        self._next[group] = segment.seq + 1
+        self._gap_since.pop((*group, segment.seq), None)
+        self._drain(group)
 
     def _release(self, segment: Segment) -> None:
         self._note(segment)
-        if self._stale(segment):
+        if self._stale(segment) or self._voided(segment):
+            self._skip_void(segment)
             self._wake(segment.key, segment)
             return
         group = (segment.room_id, segment.session_id)
@@ -390,10 +547,13 @@ class Pipeline:
         nxt = self._next.get(group, 1)
         while nxt in held:
             item = held.pop(nxt)
-            self._emit(item)
             nxt += 1
             self._next[group] = nxt
             self._gap_since.pop((*group, nxt), None)
+            try:
+                self._emit(item)
+            except Exception:
+                logging.getLogger("breeze.pipeline").exception("caption emit failed")
 
     def _force_held_cap(self, group: tuple[str, str]) -> None:
         held = self._held.get(group, {})
@@ -409,6 +569,15 @@ class Pipeline:
 
     def mark_missing(self, room_id: str, session_id: str, seq: int, reason: str) -> Segment:
         key = (room_id, session_id, seq)
+        if f"{room_id}:{session_id}:{seq}" in self._sealed.get(room_id, ()):
+            if self._next.get((room_id, session_id), 1) == seq:
+                self._next[(room_id, session_id)] = seq + 1
+                self._gap_since.pop((room_id, session_id, seq), None)
+                self._drain((room_id, session_id))
+            existing = self.results.get(key)
+            return existing if existing is not None else Segment(
+                room_id=room_id, session_id=session_id, seq=seq, status="cancelled", error="已刪除",
+            )
         existing = self.results.get(key)
         if key in self._active:
             return existing if existing is not None else Segment(
@@ -478,6 +647,10 @@ class Pipeline:
     async def submit(self, segment: Segment, audio: bytes, decoder, *, slot_held: bool, retry: bool = False, owner: bool = False, wait_translation: bool = True) -> Segment:
         del owner  # Admission is synchronous; the flight future replaces the old owner spin.
         self.ensure_workers()
+        if segment.id in self._sealed.get(segment.room_id, ()):
+            if slot_held:
+                self.release_slot()
+            raise PipelineError(409, "這段已刪除")
         if (segment.room_id, segment.session_id) in self._closed:
             if slot_held:
                 self.release_slot()
@@ -495,6 +668,8 @@ class Pipeline:
                 self.release_slot()
             return await inflight
         existing = self.results.get(segment.key)
+        if existing is None and segment.key in self._index:
+            existing = self._rehydrate(segment.key)
         stored = self._hashes.get(segment.key)
         if existing and stored == digest:
             reprocess = retry and existing.status in FAILURES and segment.key not in self._active
@@ -697,7 +872,9 @@ class Pipeline:
             elif segment.status != "zh_ready":
                 self._wake(segment.key, segment)
             self._trim_results()
-        if segment.status != "zh_ready" or self._stale(segment):
+            if self._stale(segment) or self._voided(segment):
+                self._abandon(segment)
+        if segment.status != "zh_ready" or self._stale(segment) or self._voided(segment):
             return segment
         if not holder.get("wait_translation", True):
             try:
@@ -710,16 +887,18 @@ class Pipeline:
                 if self._stale(segment):
                     return segment
                 raise
-            if self._stale(segment):
-                return segment
+            if self._stale(segment) or self._voided(segment):
+                return self._abandon(segment)
             return self.results.get(segment.key, segment)
         fut = self._future(segment)
         self._waiters.setdefault(segment.key, []).append(fut)
         try:
             if segment.key not in self._emitted_segs:
                 await self._wait_emitted(segment)
-            if self._stale(segment) or not segment.translate_queued:
+            if self._stale(segment) or self._voided(segment) or not segment.translate_queued:
                 self._discard_waiter(segment.key, fut)
+                if self._stale(segment) or self._voided(segment):
+                    return self._abandon(segment)
                 return segment
             if not fut.done():
                 await fut
@@ -727,15 +906,19 @@ class Pipeline:
             task = asyncio.current_task()
             if task is not None and task.cancelling():
                 raise
-            if self._stale(segment):
-                return segment
+            if self._stale(segment) or self._voided(segment):
+                return self._abandon(segment)
             raise
-        if self._stale(segment):
-            return segment
+        if self._stale(segment) or self._voided(segment):
+            return self._abandon(segment)
         return self.results.get(segment.key, segment)
 
     def _epoch_current(self, segment: Segment, epoch: int) -> bool:
-        return not self._stale(segment) and self._tr_epoch.get(segment.key) == epoch
+        return (
+            not self._stale(segment)
+            and not self._voided(segment)
+            and self._tr_epoch.get(segment.key) == epoch
+        )
 
     def _put_translation(self, segment: Segment) -> None:
         assert self._translate_q is not None
@@ -844,6 +1027,11 @@ class Pipeline:
         segment.status = "ready" if translated.status in {"ok", "off", "no_key"} else "translate_failed"
         segment.translate_queued = False
         segment.version = segment.version + 1
+        if not self._epoch_current(segment, epoch):
+            # Deleted or superseded while this result was applied. Do not publish it.
+            segment.en = ""
+            segment.translate_queued = False
+            return
         self.results[segment.key] = segment
         self._emit(segment)
 
@@ -901,12 +1089,16 @@ class Pipeline:
         victims.sort()
         extra = len(self.results) - self.settings.max_results
         for _, key in victims[:extra]:
+            # Keep the compact index and the audio hash so a later retry is still deduped.
             self.results.pop(key, None)
-            self._hashes.pop(key, None)
 
     async def retranslate(self, room_id: str, session_id: str, seq: int, zh: str | None = None) -> Segment:
         self.ensure_workers()
+        if f"{room_id}:{session_id}:{seq}" in self._sealed.get(room_id, ()):
+            raise PipelineError(404, "找不到這段字幕")
         segment = self.results.get((room_id, session_id, seq))
+        if segment is None:
+            segment = self._rehydrate((room_id, session_id, seq))
         if segment is None or not (segment.zh or zh):
             raise PipelineError(404, "找不到這段字幕")
         if zh is not None:

@@ -78,6 +78,12 @@ SRT_TIME = re.compile(
 )
 
 
+def _session_counts(segments: int, sessions: int) -> list[int]:
+    sessions = max(1, min(int(sessions), max(1, int(segments))))
+    base, extra = divmod(int(segments), sessions)
+    return [base + (1 if index < extra else 0) for index in range(sessions)]
+
+
 def _flag_given(name: str) -> bool:
     for arg in sys.argv[1:]:
         if arg == name or arg.startswith(name + "="):
@@ -305,42 +311,55 @@ class Recorder:
     the benchmark knobs mean by "a chunk every period".
     """
 
-    def __init__(self, segments: int, period_s: float, scale: float, max_inflight: int = 2):
+    def __init__(self, segments: int, period_s: float, scale: float, max_inflight: int = 2, sessions: int = 1):
         self.segments = segments
         self.period_s = period_s
         self.scale = scale
         self.max_inflight = max_inflight
+        self.sessions = max(1, int(sessions))
         self.paused_wall = 0.0
         self.chunks: list[dict] = []
 
-    async def run(self, upload) -> None:
+    async def run(self, upload, on_session_end=None) -> None:
+        """Split the run into K sessions. Each session restarts seq and t0 at 0, like the browser."""
         inflight: set[asyncio.Task] = set()
-        session_start = time.monotonic()
+        counts = _session_counts(self.segments, self.sessions)
+        global_seq = 0
 
-        def rel_ms(mark: float) -> int:
-            return int(round((mark - session_start) / self.scale * 1000.0))
+        for index, count in enumerate(counts):
+            session_id = f"s{index + 1}"
+            session_start = time.monotonic()
 
-        for seq in range(1, self.segments + 1):
-            if len(inflight) >= self.max_inflight:
-                paused_at = time.monotonic()
-                while len(inflight) >= self.max_inflight:
-                    await asyncio.wait(set(inflight), return_when=asyncio.FIRST_COMPLETED)
-                self.paused_wall += time.monotonic() - paused_at
-            t0 = time.monotonic()
-            await asyncio.sleep(self.period_s * self.scale)
-            t1 = time.monotonic()
-            chunk = {
-                "seq": seq,
-                "t0_ms": rel_ms(t0),
-                "t1_ms": rel_ms(t1),
-                "end_mono": t1,
-            }
-            self.chunks.append(chunk)
-            task = asyncio.create_task(upload(chunk))
-            inflight.add(task)
-            task.add_done_callback(inflight.discard)
-        if inflight:
-            await asyncio.gather(*inflight, return_exceptions=True)
+            def rel_ms(mark: float, origin: float = session_start) -> int:
+                return int(round((mark - origin) / self.scale * 1000.0))
+
+            for seq in range(1, count + 1):
+                if len(inflight) >= self.max_inflight:
+                    paused_at = time.monotonic()
+                    while len(inflight) >= self.max_inflight:
+                        await asyncio.wait(set(inflight), return_when=asyncio.FIRST_COMPLETED)
+                    self.paused_wall += time.monotonic() - paused_at
+                t0 = time.monotonic()
+                await asyncio.sleep(self.period_s * self.scale)
+                t1 = time.monotonic()
+                global_seq += 1
+                chunk = {
+                    "seq": seq,
+                    "global_seq": global_seq,
+                    "session_id": session_id,
+                    "t0_ms": rel_ms(t0),
+                    "t1_ms": rel_ms(t1),
+                    "end_mono": t1,
+                }
+                self.chunks.append(chunk)
+                task = asyncio.create_task(upload(chunk))
+                inflight.add(task)
+                task.add_done_callback(inflight.discard)
+            if inflight:
+                await asyncio.gather(*inflight, return_exceptions=True)
+                inflight.clear()
+            if on_session_end is not None:
+                await on_session_end(session_id)
 
 
 async def _run(args) -> dict:
@@ -368,7 +387,7 @@ async def _run(args) -> dict:
         history_limit=200,
         max_results=500,
     )
-    data_path = (args.data_path or "").strip()
+    data_path = "" if args.no_store else (args.data_path or "").strip()
     if data_path:
         path = Path(data_path)
         if path.exists():
@@ -388,10 +407,12 @@ async def _run(args) -> dict:
 
     bus = app.state.bus
     original_publish = bus.publish
+    by_segment: dict[tuple[str, int], int] = {}
 
     def publish(event: dict):
         now = time.monotonic()
-        seq = int(event.get("seq") or 0)
+        local_seq = int(event.get("seq") or 0)
+        seq = by_segment.get((str(event.get("session_id") or ""), local_seq), local_seq)
         if seq:
             zh = event.get("zh") or ""
             en = event.get("en") or ""
@@ -450,13 +471,13 @@ async def _run(args) -> dict:
                 "/api/push",
                 data={
                     "room_id": "bench",
-                    "session_id": "s1",
+                    "session_id": chunk["session_id"],
                     "seq": str(chunk["seq"]),
                     "t0_ms": str(chunk["t0_ms"]),
                     "t1_ms": str(chunk["t1_ms"]),
                     "wait_translation": "0",
                 },
-                files={"audio": ("segment.webm", f"SEQ{chunk['seq']}".encode("ascii"), "audio/webm")},
+                files={"audio": ("segment.webm", f"SEQ{chunk['global_seq']}".encode("ascii"), "audio/webm")},
                 headers={
                     "authorization": f"Bearer {token}",
                     "x-breeze-async-translation": "1",
@@ -467,7 +488,7 @@ async def _run(args) -> dict:
                 body = response.json()
             except Exception:
                 body = {"raw": response.text[:200]}
-            pushes[chunk["seq"]] = {
+            pushes[chunk["global_seq"]] = {
                 "http": response.status_code,
                 "status": body.get("status"),
                 "zh": body.get("zh") or "",
@@ -477,7 +498,7 @@ async def _run(args) -> dict:
                 "wait_wall_s": time.monotonic() - started,
             }
         except Exception as exc:
-            pushes[chunk["seq"]] = {
+            pushes[chunk["global_seq"]] = {
                 "http": 0,
                 "status": "client_error",
                 "zh": "",
@@ -490,6 +511,8 @@ async def _run(args) -> dict:
 
     wall_start = time.monotonic()
     import httpx
+    bus_history = 0
+    store_rows = 0
 
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
@@ -503,13 +526,21 @@ async def _run(args) -> dict:
             if opened.status_code != 200:
                 raise SystemExit(f"open room failed: {opened.status_code} {opened.text[:200]}")
             sample_task = asyncio.create_task(sampler(wall_start))
-            recorder = Recorder(args.segments, args.period_s, scale)
+            recorder = Recorder(args.segments, args.period_s, scale, sessions=args.sessions)
             capture_started = time.monotonic()
 
             async def do_upload(chunk: dict) -> None:
+                by_segment[(chunk["session_id"], chunk["seq"])] = chunk["global_seq"]
                 await upload(client, token, chunk)
 
-            await recorder.run(do_upload)
+            async def end_session(session_id: str) -> None:
+                await client.post(
+                    "/api/session/end",
+                    json={"room_id": "bench", "session_id": session_id},
+                    headers={"authorization": f"Bearer {token}", "content-type": "application/json"},
+                )
+
+            await recorder.run(do_upload, on_session_end=end_session)
             capture_wall = time.monotonic() - capture_started
             last_end = max((chunk["end_mono"] for chunk in recorder.chunks), default=time.monotonic())
 
@@ -518,7 +549,7 @@ async def _run(args) -> dict:
             def unresolved() -> list[int]:
                 waiting = []
                 for chunk in recorder.chunks:
-                    seq = chunk["seq"]
+                    seq = chunk["global_seq"]
                     pushed = pushes.get(seq) or {}
                     if pushed.get("http") not in (200, None) and not pushed.get("zh") and seq not in zh_at:
                         continue
@@ -552,6 +583,10 @@ async def _run(args) -> dict:
                 )
                 export_status = exported.status_code
                 srt_payload = exported.text if exported.status_code == 200 else ""
+            # Shutdown closes the writer. Count rows first; main's store also accepts this call.
+            bus_history = len(app.state.bus.history("bench"))
+            if getattr(app.state, "store", None) is not None and app.state.store.enabled:
+                store_rows = len(app.state.store.room_rows("bench"))
 
     wall_s = time.monotonic() - wall_start
     real = lambda wall: wall / scale
@@ -561,7 +596,7 @@ async def _run(args) -> dict:
     by_seq_zh = {}
     by_seq_en = {}
     for chunk in recorder.chunks:
-        seq = chunk["seq"]
+        seq = chunk["global_seq"]
         if seq in zh_at:
             value = real(zh_at[seq] - chunk["end_mono"])
             zh_latency.append(value)
@@ -644,11 +679,6 @@ async def _run(args) -> dict:
         key = str(row.get("http"))
         http_counts[key] = http_counts.get(key, 0) + 1
 
-    bus_history = len(app.state.bus.history("bench"))
-    store_rows = 0
-    if getattr(app.state, "store", None) is not None and app.state.store.enabled:
-        store_rows = len(app.state.store.room_rows("bench"))
-
     srt = None
     if srt_payload or args.scenario == "soak" or args.check_srt:
         srt = _check_srt(srt_payload, len(segments_with_text), require_hour=args.scenario == "soak" or args.segments * args.period_s >= 3600)
@@ -656,7 +686,7 @@ async def _run(args) -> dict:
         srt["bus_history_len"] = bus_history
         srt["store_rows"] = store_rows
         srt["history_limit"] = app.state.settings.history_limit
-        srt["export_uses"] = "sqlite" if data_path else "bus_history"
+        srt["export_uses"] = "sqlite" if data_path else "memory"
 
     report = {
         "scenario": args.scenario or None,
@@ -672,6 +702,8 @@ async def _run(args) -> dict:
             "scale": scale,
             "seed": args.seed,
             "data_path": data_path or None,
+            "sessions": args.sessions,
+            "no_store": bool(args.no_store),
             "async_opt_in": True,
         },
         "timeouts_wall_s": {
@@ -737,7 +769,7 @@ async def _run(args) -> dict:
     # unresolved() closed over state; recompute plainly for the report.
     still = []
     for chunk in recorder.chunks:
-        seq = chunk["seq"]
+        seq = chunk["global_seq"]
         if seq in en_at:
             continue
         status = translate_status.get(seq) or (pushes.get(seq) or {}).get("translate_status") or ""
@@ -850,6 +882,8 @@ def main() -> None:
     parser.add_argument("--json", dest="json_path", default="")
     parser.add_argument("--scenario", choices=sorted(PRESETS), default="")
     parser.add_argument("--data-path", default="", dest="data_path")
+    parser.add_argument("--no-store", action="store_true", dest="no_store", help="Disable SQLite even if --data-path is set")
+    parser.add_argument("--sessions", type=int, default=1, help="Split the run into K sessions in one room; each restarts t0 at 0")
     parser.add_argument("--check-srt", action="store_true", dest="check_srt")
     args = parser.parse_args()
     if args.scenario:

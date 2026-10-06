@@ -34,3 +34,18 @@ def test_drop_forgets_version_high_water():
     assert bus.history("class")[0]["zh"] == "新開"
     again["zh"] = "被改"
     assert bus.history("class")[0]["zh"] == "新開"
+
+
+def test_cursor_not_reset_after_drop():
+    bus = RoomBus()
+    first = bus.publish({"id": "a:s:1", "room_id": "class", "session_id": "s", "session_ord": 1, "seq": 1, "version": 1, "zh": "舊"})
+    assert first is not None
+    held = int(first["cursor"])
+    bus.drop("class")
+    again = bus.publish({"id": "a:s:2", "room_id": "class", "session_id": "s", "session_ord": 1, "seq": 2, "version": 1, "zh": "續"})
+    assert again is not None
+    assert int(again["cursor"]) > held
+    assert bus.latest_cursor("class") >= int(again["cursor"])
+    resumed = bus.since("class", held)
+    assert resumed["gap"] is False
+    assert any(item.get("zh") == "續" for item in resumed["events"])

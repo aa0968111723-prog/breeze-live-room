@@ -1,49 +1,79 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Awaitable, Callable
+
+_PASS = (
+    "type", "id", "room_id", "session_id", "session_ord", "seq", "version",
+    "zh", "en", "status", "translate_status", "error", "t0_ms", "t1_ms", "zh_raw",
+    "epoch",
+)
+_CONTROL = {"caption_deleted", "captions_cleared"}
 
 
 class RoomBus:
-    """Per-room event log. A publish never lands in another room's history."""
+    """Per-room event log. A publish never lands in another room's history.
 
-    def __init__(self, limit: int = 200):
+    The live window (history / cursor resume) stays at `limit`. A separate caption
+    state keeps one row per segment for export and for backfill after a long gap.
+    The per-room cursor counter is not restarted by drop or clear.
+    """
+
+    def __init__(self, limit: int = 200, caption_cap: int = 5000):
         self.limit = limit
+        self.caption_cap = max(1, int(caption_cap))
         self.by_room: dict[str, list[dict]] = {}
         self._log: dict[str, list[dict]] = {}
-        self._seen: dict[str, set[tuple[str, int]]] = {}
         self._ver: dict[str, dict[str, int]] = {}
+        self._cursor: dict[str, int] = {}
+        self._epoch: dict[str, int] = {}
+        self._state: dict[str, dict[str, dict]] = {}
+        self._state_order: dict[str, list[str]] = {}
+        self._state_at: dict[str, float] = {}
+        self._tomb: dict[str, set[str]] = {}
+
+    def epoch(self, room_id: str) -> int:
+        return int(self._epoch.get(room_id, 1))
+
+    def _alloc_cursor(self, room: str) -> int:
+        nxt = int(self._cursor.get(room, 0)) + 1
+        self._cursor[room] = nxt
+        return nxt
 
     def publish(self, event: dict) -> dict | None:
         room = str(event.get("room_id") or "")
-        snap = {key: event.get(key) for key in (
-            "type", "id", "room_id", "session_id", "session_ord", "seq", "version",
-            "zh", "en", "status", "translate_status", "error", "t0_ms", "t1_ms", "zh_raw",
-        )}
+        snap = {key: event.get(key) for key in _PASS}
         snap["type"] = snap.get("type") or "caption"
         snap["room_id"] = room
+        self._epoch.setdefault(room, 1)
+        if snap.get("epoch") is None:
+            snap["epoch"] = self._epoch[room]
         seg_id = str(snap.get("id") or "")
         if seg_id:
             snap["id"] = seg_id
         version = int(snap.get("version") or 1)
         snap["version"] = version
-        if seg_id:
-            seen = self._seen.setdefault(room, set())
-            marker = (seg_id, version)
-            if marker in seen:
-                return None
+        kind = str(snap["type"])
+        if kind not in _CONTROL and seg_id and seg_id in self._tomb.get(room, ()):
+            return None
+        if kind not in _CONTROL and seg_id:
             best = self._ver.get(room, {}).get(seg_id)
             if best is not None and version <= best:
-                seen.add(marker)
                 return None
-            seen.add(marker)
             self._ver.setdefault(room, {})[seg_id] = version
-        log = self._log.setdefault(room, [])
-        snap["cursor"] = (log[-1]["cursor"] + 1) if log else 1
+        snap["cursor"] = self._alloc_cursor(room)
         stored = dict(snap)
+        log = self._log.setdefault(room, [])
         log.append(stored)
         if len(log) > self.limit:
             del log[: len(log) - self.limit]
+        if kind == "captions_cleared":
+            return dict(stored)
+        if kind == "caption_deleted":
+            self._remove_id(room, seg_id)
+            return dict(stored)
+        self._remember_state(room, stored)
         rows = self.by_room.setdefault(room, [])
         replaced = False
         for index, item in enumerate(rows):
@@ -60,31 +90,144 @@ class RoomBus:
         self.by_room[room] = rows
         return dict(stored)
 
+    def _remember_state(self, room: str, stored: dict) -> None:
+        seg_id = str(stored.get("id") or "")
+        if not seg_id:
+            return
+        bucket = self._state.setdefault(room, {})
+        order = self._state_order.setdefault(room, [])
+        previous = bucket.get(seg_id)
+        if previous is not None and int(stored.get("version") or 1) < int(previous.get("version") or 1):
+            return
+        if seg_id not in bucket:
+            order.append(seg_id)
+        bucket[seg_id] = dict(stored)
+        self._state_at[room] = time.time()
+        extra = len(order) - self.caption_cap
+        if extra > 0:
+            versions = self._ver.get(room)
+            for old in order[:extra]:
+                bucket.pop(old, None)
+                if versions is not None:
+                    versions.pop(old, None)
+            del order[:extra]
+
+    def _remove_id(self, room: str, seg_id: str) -> None:
+        if not seg_id:
+            return
+        bucket = self._state.get(room)
+        if bucket is not None:
+            bucket.pop(seg_id, None)
+        order = self._state_order.get(room)
+        if order is not None:
+            self._state_order[room] = [item for item in order if item != seg_id]
+        rows = self.by_room.get(room)
+        if rows is not None:
+            self.by_room[room] = [item for item in rows if str(item.get("id") or "") != seg_id]
+        log = self._log.get(room)
+        if log is not None:
+            self._log[room] = [
+                item for item in log
+                if str(item.get("id") or "") != seg_id or item.get("type") == "caption_deleted"
+            ]
+
     def history(self, room_id: str) -> list[dict]:
         return [dict(item) for item in self.by_room.get(room_id, [])]
 
+    def caption_state(self, room_id: str) -> list[dict]:
+        rows = [dict(item) for item in self._state.get(room_id, {}).values()]
+        rows.sort(key=lambda item: (int(item.get("session_ord") or 0), int(item.get("seq") or 0), int(item.get("cursor") or 0)))
+        return rows
+
+    def has_captions(self, room_id: str) -> bool:
+        return bool(self._state.get(room_id))
+
+    def caption_age(self, room_id: str, now: float | None = None) -> float:
+        stamp = self._state_at.get(room_id)
+        if stamp is None:
+            return 0.0
+        current = time.time() if now is None else now
+        return current - stamp
+
     def since(self, room_id: str, cursor: int) -> dict:
         log = self._log.get(room_id, [])
+        latest = int(self._cursor.get(room_id, 0))
         if not log:
-            return {"events": [], "gap": False, "oldest_cursor": 0, "latest_cursor": 0}
+            gap = cursor > 0 and latest > cursor
+            return {
+                "events": [],
+                "gap": gap,
+                "oldest_cursor": 0,
+                "latest_cursor": latest,
+                "backfill": self.caption_state(room_id) if gap else [],
+            }
         oldest = int(log[0]["cursor"])
-        latest = int(log[-1]["cursor"])
+        latest = max(latest, int(log[-1]["cursor"]))
         gap = cursor > 0 and oldest > cursor + 1
         events = [dict(item) for item in log if int(item["cursor"]) > cursor]
-        return {"events": events, "gap": gap, "oldest_cursor": oldest, "latest_cursor": latest}
+        return {
+            "events": events,
+            "gap": gap,
+            "oldest_cursor": oldest,
+            "latest_cursor": latest,
+            "backfill": self.caption_state(room_id) if gap else [],
+        }
 
     def latest_cursor(self, room_id: str) -> int:
-        log = self._log.get(room_id, [])
-        if not log:
-            return 0
-        return int(log[-1]["cursor"])
+        return int(self._cursor.get(room_id, 0))
+
+    def clear_room(self, room_id: str) -> dict:
+        """Forget captions but keep the cursor. Listeners learn from captions_cleared."""
+        tomb = self._tomb.setdefault(room_id, set())
+        for seg_id in list(self._state.get(room_id, {})):
+            tomb.add(seg_id)
+        for item in self.by_room.get(room_id, []):
+            if item.get("id"):
+                tomb.add(str(item["id"]))
+        self._state.pop(room_id, None)
+        self._state_order.pop(room_id, None)
+        self._state_at.pop(room_id, None)
+        self._ver.pop(room_id, None)
+        self.by_room.pop(room_id, None)
+        self._log[room_id] = []
+        self._epoch[room_id] = self._epoch.get(room_id, 1) + 1
+        published = self.publish({
+            "type": "captions_cleared",
+            "room_id": room_id,
+            "epoch": self._epoch[room_id],
+        })
+        return published or {"type": "captions_cleared", "room_id": room_id, "epoch": self.epoch(room_id)}
+
+    def delete_caption(self, room_id: str, seg_id: str, session_id: str = "", seq: int = 0) -> dict:
+        seg_id = str(seg_id or "")
+        self._tomb.setdefault(room_id, set()).add(seg_id)
+        versions = self._ver.get(room_id)
+        if versions is not None:
+            versions.pop(seg_id, None)
+        self._remove_id(room_id, seg_id)
+        published = self.publish({
+            "type": "caption_deleted",
+            "room_id": room_id,
+            "id": seg_id,
+            "session_id": session_id,
+            "seq": seq,
+        })
+        return published or {"type": "caption_deleted", "room_id": room_id, "id": seg_id}
+
+    def retire(self, room_id: str) -> None:
+        """Drop the live window. Export state and the cursor counter stay."""
+        self.by_room.pop(room_id, None)
+        self._log.pop(room_id, None)
 
     def drop(self, room_id: str) -> None:
         self.by_room.pop(room_id, None)
         self._log.pop(room_id, None)
-        self._seen.pop(room_id, None)
         self._ver.pop(room_id, None)
-        self._ver.pop(room_id, None)
+        self._state.pop(room_id, None)
+        self._state_order.pop(room_id, None)
+        self._state_at.pop(room_id, None)
+        self._tomb.pop(room_id, None)
+        self._epoch[room_id] = self._epoch.get(room_id, 1) + 1
 
 
 class ListenerSlot:

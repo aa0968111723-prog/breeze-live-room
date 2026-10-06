@@ -108,6 +108,7 @@ class Settings:
     listener_queue: int = 32
     silence_rms: float = 0.0
     caption_ttl_s: float = 86400.0
+    room_caption_cap: int = 5000
     token_budget: int = 0
     allowed_hosts: tuple[str, ...] = ()
     allowed_schemes: tuple[str, ...] = ("http",)
@@ -132,6 +133,8 @@ class Settings:
             raise ValueError("BREEZE_ASR_WORKERS 至少為 1")
         if self.history_limit < 1 or self.translate_queue < 1 or self.listener_queue < 1:
             raise ValueError("歷史、翻譯佇列與聽眾佇列至少為 1")
+        if self.room_caption_cap < 1:
+            raise ValueError("BREEZE_ROOM_CAPTION_CAP 至少為 1")
         if self.translate_workers < 1:
             raise ValueError("BREEZE_TRANSLATE_WORKERS 至少為 1")
         if self.gap_wait_s < 0 or self.room_idle_s < 0:
@@ -192,6 +195,7 @@ class Settings:
             listener_queue=_raw_int(env, "BREEZE_LISTENER_QUEUE", 32),
             silence_rms=_raw_float(env, "BREEZE_SILENCE_RMS", 0.0),
             caption_ttl_s=_raw_float(env, "BREEZE_CAPTION_TTL", 86400.0),
+            room_caption_cap=_raw_int(env, "BREEZE_ROOM_CAPTION_CAP", 5000),
             token_budget=_raw_int(env, "BREEZE_TOKEN_BUDGET", 0),
             allowed_hosts=_csv(env, "BREEZE_ALLOWED_HOSTS"),
             allowed_schemes=schemes,
