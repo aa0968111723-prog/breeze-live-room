@@ -101,6 +101,61 @@ async def test_translate_failure_keeps_chinese():
 
 
 @pytest.mark.anyio
+async def test_retry_after_cancel_is_processed():
+    import threading
+
+    class GateAsr:
+        def __init__(self):
+            self.calls = 0
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def transcribe(self, wav: Path, prompt: str) -> AsrResult:
+            del prompt
+            self.entered.set()
+            assert self.release.wait(2), "cancel test did not release ASR"
+            self.calls += 1
+            return AsrResult(ok=True, text=wav.read_bytes().decode() or "中文")
+
+    asr = GateAsr()
+    app = make_app(asr=asr)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+        try:
+            token = await token_of(app, client)
+            headers = {**auth(token), "content-type": "application/json"}
+
+            async def send(retry: bool):
+                extra = {"x-breeze-retry": "1"} if retry else {}
+                return await client.post(
+                    "/api/push",
+                    data={"room_id": "class", "session_id": "s", "seq": "1", **({"retry": "1"} if retry else {})},
+                    files={"audio": ("a.webm", b"1", "audio/webm")},
+                    headers={**auth(token), **extra},
+                )
+
+            first = asyncio.create_task(send(False))
+            assert await asyncio.to_thread(asr.entered.wait, 2)
+            cancelled = await client.post(
+                "/api/segment/cancel",
+                json={"room_id": "class", "session_id": "s", "seq": 1},
+                headers=headers,
+            )
+            assert cancelled.status_code == 200
+            asr.release.set()
+            done = await asyncio.wait_for(first, 2)
+            assert done.status_code == 409
+            assert done.json()["status"] == "cancelled"
+            again = await asyncio.wait_for(send(True), 2)
+            body = again.json()
+            assert again.status_code == 200, again.text
+            assert body["status"] != "cancelled"
+            assert body["zh"]
+            assert asr.calls == 2
+        finally:
+            asr.release.set()
+
+
+@pytest.mark.anyio
 async def test_retry_does_not_transcribe_twice():
     asr = FakeAsr()
     app = make_app(asr=asr)

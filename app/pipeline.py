@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import logging
 import shutil
+import threading
 import time
 import uuid
 from collections import deque
@@ -122,6 +123,11 @@ class Pipeline:
         self._translate_q: asyncio.Queue | None = None
         self._translate_pool: ThreadPoolExecutor | None = None
         self._tr_epoch: dict[tuple[str, str, int], int] = {}
+        self._version_floor: dict[tuple[str, str, int], int] = {}
+        self._seeded: set[str] = set()
+        self._flushing: set[tuple[str, str]] = set()
+        self.translate_skipped = 0
+        self._translate_busy = 0
         self._recent_zh: dict[tuple[str, str], deque] = {}
         self._tasks: list[asyncio.Task] = []
         self._workers = False
@@ -193,6 +199,7 @@ class Pipeline:
             "held": sum(len(rows) for rows in self._held.values()),
             "results": len(self.results),
             "translate_queued": 0 if self._translate_q is None else self._translate_q.qsize(),
+            "translate_skipped": self.translate_skipped,
         }
 
     def ensure_workers(self) -> None:
@@ -200,9 +207,9 @@ class Pipeline:
             return
         self._workers = True
         workers = max(1, int(self.settings.translate_workers))
-        # translate_queue stays the configured floor. The internal bound is larger
-        # so a short English stall queues instead of failing Chinese that is already out.
-        backlog = max(self.settings.translate_queue, workers * 8)
+        # The configured queue is the bound. When it is full the oldest waiting
+        # line is skipped so the newest speech still gets English.
+        backlog = max(1, int(self.settings.translate_queue))
         self._translate_q = asyncio.Queue(maxsize=backlog)
         # Own pool: translation must not occupy the default executor that decode and ASR share.
         self._translate_pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="breeze-translate")
@@ -211,6 +218,15 @@ class Pipeline:
         self._tasks.append(asyncio.create_task(self._gap_loop()))
 
     async def aclose(self) -> None:
+        # Let queued translations finish, but never wait past the shutdown budget.
+        # A translator that ignores cancel can still outlive this; the pool is
+        # then shut down without waiting on it.
+        deadline = time.monotonic() + max(0.0, float(getattr(self.settings, "shutdown_flush_s", 2.0)))
+        while time.monotonic() < deadline:
+            queued = self._translate_q is not None and not self._translate_q.empty()
+            if self._translate_busy <= 0 and not queued:
+                break
+            await asyncio.sleep(0.01)
         for task in self._tasks:
             task.cancel()
         if self._tasks:
@@ -282,6 +298,7 @@ class Pipeline:
             self._gap_since.pop(stamp, None)
         for key in [key for key in self._tr_epoch if key[0] == room_id]:
             self._tr_epoch.pop(key, None)
+        self._flushing = {group for group in self._flushing if group[0] != room_id}
         for group in [group for group in self._recent_zh if group[0] == room_id]:
             self._recent_zh.pop(group, None)
         for key in [key for key in self._index if key[0] == room_id]:
@@ -605,21 +622,73 @@ class Pipeline:
         self._wake(key, segment)
         return segment
 
-    def end_session(self, room_id: str, session_id: str) -> None:
+    def _session_busy(self, group: tuple[str, str]) -> bool:
+        room_id, session_id = group
+        for key in self._active:
+            if key[0] == room_id and key[1] == session_id:
+                return True
+        for key, flight in self._flight.items():
+            if key[0] == room_id and key[1] == session_id and not flight.done():
+                return True
+        for key in self._reserved:
+            if key[0] == room_id and key[1] == session_id:
+                return True
+        for key, segment in self.results.items():
+            if key[0] == room_id and key[1] == session_id and segment.translate_queued:
+                return True
+        if self._translate_q is not None:
+            for item in list(self._translate_q._queue):
+                segment = item[2]
+                if segment.room_id == room_id and segment.session_id == session_id:
+                    return True
+        return False
+
+    def _fill_session_holes(self, room_id: str, session_id: str) -> None:
+        """Mark seqs that never arrived. Leave in-flight and already-saved seqs alone."""
         group = (room_id, session_id)
-        self._closed.add(group)
         max_seq = self._max_seq.get(group, 0)
-        seq = self._next.get(group, 1)
+        seq = 1
         while seq <= max_seq:
             key = (room_id, session_id, seq)
-            if key in self._active:
+            if key in self._active or key in self._reserved:
+                seq += 1
+                continue
+            flight = self._flight.get(key)
+            if flight is not None and not flight.done():
                 seq += 1
                 continue
             current = self.results.get(key)
+            if current is None and key in self._index:
+                current = self._rehydrate(key)
             if current is None or current.status == "queued":
                 self.mark_missing(room_id, session_id, seq, "會話結束，這段沒有收到")
             seq += 1
         self._drain(group)
+
+    async def end_session(self, room_id: str, session_id: str, *, flush_s: float | None = None) -> None:
+        """Finish in-flight audio and queued English, then close the session.
+
+        New chunks are still accepted until this returns, so the last upload
+        that races the stop button is not answered 409. The wait is bounded.
+        """
+        group = (room_id, session_id)
+        if group in self._closed and group not in self._flushing:
+            return
+        timeout = self.settings.stop_flush_s if flush_s is None else max(0.0, float(flush_s))
+        deadline = time.monotonic() + timeout
+        # Short window so a chunk posted immediately after /api/session/end still enters.
+        grace_until = time.monotonic() + min(0.2, timeout)
+        self._flushing.add(group)
+        try:
+            while time.monotonic() < grace_until:
+                await asyncio.sleep(0.02)
+            self._fill_session_holes(room_id, session_id)
+            while time.monotonic() < deadline and self._session_busy(group):
+                await asyncio.sleep(0.02)
+        finally:
+            self._flushing.discard(group)
+            self._closed.add(group)
+            self._fill_session_holes(room_id, session_id)
 
     def fail_received(self, segment: Segment, detail: str, status: str = "error") -> Segment:
         segment.status = status
@@ -651,7 +720,8 @@ class Pipeline:
             if slot_held:
                 self.release_slot()
             raise PipelineError(409, "這段已刪除")
-        if (segment.room_id, segment.session_id) in self._closed:
+        group = (segment.room_id, segment.session_id)
+        if group in self._closed and group not in self._flushing:
             if slot_held:
                 self.release_slot()
             raise PipelineError(409, "這個會話已結束")
@@ -679,11 +749,25 @@ class Pipeline:
                 return await self._wait_result(existing)
             segment.version = max(existing.version + 1, 1)
         elif existing and stored != digest:
+            # Restored rows have no audio hash. Returning the saved caption
+            # keeps a restart from rejecting the same seq or rewriting it.
+            if stored is None and not (retry and existing.status in FAILURES and segment.key not in self._active):
+                if slot_held:
+                    self.release_slot()
+                floor = self._version_floor.get(segment.key, 0)
+                if floor and existing.version < floor:
+                    existing.version = floor
+                return await self._wait_result(existing)
             if not (retry and existing.status in FAILURES and segment.key not in self._active):
                 if slot_held:
                     self.release_slot()
                 raise PipelineError(409, "同一段的內容不同，已拒絕替換")
-            segment.version = max(existing.version + 1, 1)
+            segment.version = max(existing.version + 1, self._version_floor.get(segment.key, 0) + 1, 1)
+        if retry and (existing is None or (existing.status in FAILURES and segment.key not in self._active)):
+            self._cancel.discard(segment.key)
+        floor = self._version_floor.get(segment.key, 0)
+        if floor and segment.version <= floor and (existing is None or segment.version != existing.version):
+            segment.version = max(segment.version, floor + 1)
         if not slot_held:
             if not self.try_admit_count():
                 raise PipelineError(429, "辨識佇列已滿，請稍後再送")
@@ -920,17 +1004,86 @@ class Pipeline:
             and self._tr_epoch.get(segment.key) == epoch
         )
 
+    def _drop_queued(self, key: tuple[str, str, int]) -> None:
+        """Remove a waiting attempt for this segment. Do not count it as skipped."""
+        queue = self._translate_q
+        if queue is None:
+            return
+        pending = queue._queue
+        kept: deque = deque()
+        removed = 0
+        while pending:
+            item = pending.popleft()
+            if item[2].key == key:
+                removed += 1
+            else:
+                kept.append(item)
+        pending.extend(kept)
+        for _ in range(removed):
+            queue.task_done()
+
     def _put_translation(self, segment: Segment) -> None:
         assert self._translate_q is not None
+        self._drop_queued(segment.key)
         epoch = self._tr_epoch.get(segment.key, 0) + 1
         self._tr_epoch[segment.key] = epoch
+        item = (epoch, time.monotonic(), segment)
         # Epoch travels with the queue item. The segment object is shared, so a
         # later retranslate must not change which attempt a worker already holds.
-        self._translate_q.put_nowait((epoch, time.monotonic(), segment))
         segment.translate_queued = True
+        self._offer_translation(item)
+
+    def _offer_translation(self, item: tuple, deferred: bool = False) -> None:
+        """Queue one attempt. A full queue drops the oldest waiting line, not the new one.
+
+        Idle workers are woken with call_soon, so a burst can see a full queue before
+        they take a slot. Drop only on the deferred attempt, after that turn.
+        """
+        assert self._translate_q is not None
+        epoch, _enqueued_at, segment = item
+        if self._tr_epoch.get(segment.key) != epoch:
+            return
+        try:
+            self._translate_q.put_nowait(item)
+            return
+        except asyncio.QueueFull:
+            pass
+        loop = asyncio.get_running_loop()
+        if not deferred:
+            loop.call_soon(partial(self._offer_translation, item, True))
+            return
+        try:
+            old_epoch, _old_at, old = self._translate_q.get_nowait()
+        except asyncio.QueueEmpty:
+            self.translate_skipped += 1
+            loop.call_soon(self._skip_backlog, segment, epoch)
+            return
+        self._translate_q.task_done()
+        self.translate_skipped += 1
+        loop.call_soon(self._skip_backlog, old, old_epoch)
+        try:
+            self._translate_q.put_nowait(item)
+        except asyncio.QueueFull:
+            self.translate_skipped += 1
+            loop.call_soon(self._skip_backlog, segment, epoch)
+
+    def _skip_backlog(self, segment: Segment, epoch: int) -> None:
+        """Oldest queued line lost its slot. Publish that once, after the outer emit."""
+        if self._tr_epoch.get(segment.key) != epoch:
+            return
+        if self._stale(segment) or self._voided(segment) or segment.key not in self._emitted_segs:
+            segment.translate_queued = False
+            self._wake(segment.key, segment)
+            return
+        if segment.status != "zh_ready":
+            self._wake(segment.key, segment)
+            return
+        self._fail_translation(segment, "skipped_backlog", "英譯積壓，略過較舊的段落，中文仍保留")
+        self._wake(segment.key, segment)
 
     def _fail_translation(self, segment: Segment, translate_status: str, error: str) -> None:
         if self._stale(segment) or segment.key not in self._emitted_segs:
+            segment.translate_queued = False
             return
         segment.translate_queued = False
         segment.en = ""
@@ -942,14 +1095,10 @@ class Pipeline:
         self._emit(segment)
 
     def _queue_translate(self, segment: Segment) -> None:
-        if self._stale(segment):
+        if self._stale(segment) or self._voided(segment):
             return
         self.ensure_workers()
-        try:
-            self._put_translation(segment)
-        except asyncio.QueueFull:
-            self._fail_translation(segment, "queue_full", "英譯佇列已滿，中文仍保留")
-            self._wake(segment.key, segment)
+        self._put_translation(segment)
 
     def _decode_sync(self, work: Path, audio: bytes, decoder):
         work.mkdir(parents=True, exist_ok=True)
@@ -958,43 +1107,64 @@ class Pipeline:
         return decoder(src, work)
 
     async def _enqueue_translation(self, segment: Segment) -> None:
-        if self._stale(segment):
+        if self._stale(segment) or self._voided(segment):
             return
         if segment.key not in self._emitted_segs:
             await self._wait_emitted(segment)
-        if self._stale(segment) or segment.key not in self._emitted_segs:
+        if self._stale(segment) or self._voided(segment) or segment.key not in self._emitted_segs:
             return
         fut = self._future(segment)
         self._waiters.setdefault(segment.key, []).append(fut)
+        self._put_translation(segment)
         try:
-            self._put_translation(segment)
-        except asyncio.QueueFull:
-            self._fail_translation(segment, "queue_full", "英譯佇列已滿，中文仍保留")
-            self._wake(segment.key, segment)
-            return
-        await fut
+            await asyncio.wait_for(fut, timeout=max(0.1, float(self.settings.translate_timeout_s) + 1.0))
+        except asyncio.TimeoutError:
+            self._discard_waiter(segment.key, fut)
+            if segment.translate_queued and segment.status == "zh_ready":
+                segment.translate_queued = False
+                self._fail_translation(segment, "timeout", "英譯逾時，不假設沒有計費。中文仍保留")
+                self._wake(segment.key, segment)
 
     async def _translate_loop(self) -> None:
         assert self._translate_q is not None
         while True:
-            epoch, enqueued_at, segment = await self._translate_q.get()
             try:
-                await self._apply_translation(segment, epoch, enqueued_at)
-            except Exception:
-                if self._epoch_current(segment, epoch) and segment.key in self._emitted_segs:
-                    self._fail_translation(segment, "error", "英譯失敗，中文仍保留")
+                epoch, enqueued_at, segment = await self._translate_q.get()
+            except asyncio.CancelledError:
+                raise
+            self._translate_busy += 1
+            try:
+                try:
+                    await self._apply_translation(segment, epoch, enqueued_at)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logging.getLogger("breeze.pipeline").exception("translation worker failed")
+                    try:
+                        if self._epoch_current(segment, epoch) and segment.key in self._emitted_segs:
+                            self._fail_translation(segment, "error", "英譯失敗，中文仍保留")
+                    except Exception:
+                        logging.getLogger("breeze.pipeline").exception("translation failure could not be published")
+                try:
+                    if self._epoch_current(segment, epoch):
+                        self._wake(segment.key, segment)
+                except Exception:
+                    logging.getLogger("breeze.pipeline").exception("translation waiter wake failed")
             finally:
-                if self._epoch_current(segment, epoch):
-                    self._wake(segment.key, segment)
+                self._translate_busy = max(0, self._translate_busy - 1)
                 self._translate_q.task_done()
 
     async def _apply_translation(self, segment: Segment, epoch: int, enqueued_at: float) -> None:
-        if not self._epoch_current(segment, epoch) or segment.key not in self._emitted_segs:
+        if not self._epoch_current(segment, epoch):
+            # A newer attempt owns translate_queued. Do not clear it.
+            return
+        if segment.key not in self._emitted_segs:
+            segment.translate_queued = False
             return
         if time.monotonic() - enqueued_at > self.settings.translate_timeout_s:
             self._fail_translation(segment, "skipped", "英譯排隊太久，中文仍保留")
             return
-        zh = segment.zh
+        zh_snapshot = segment.zh
         glossary = self.glossary.get((segment.room_id, segment.session_id), [])
         context = self._context(segment)
         kwargs = {}
@@ -1005,21 +1175,37 @@ class Pipeline:
             kwargs["context"] = context
         if "deadline" in params:
             kwargs["deadline"] = time.monotonic() + self.settings.translate_timeout_s
-        loop = asyncio.get_running_loop()
+        cancel = None
+        if "cancel" in params:
+            cancel = threading.Event()
+            kwargs["cancel"] = cancel
+        assert self._translate_pool is not None
+        cfut = self._translate_pool.submit(partial(self.translator.translate, zh_snapshot, **kwargs))
         try:
-            translated: TranslateResult = await asyncio.wait_for(
-                loop.run_in_executor(self._translate_pool, partial(self.translator.translate, zh, **kwargs)),
-                timeout=self.settings.translate_timeout_s,
-            )
+            translated: TranslateResult = await asyncio.wait_for(asyncio.wrap_future(cfut), timeout=self.settings.translate_timeout_s)
         except asyncio.TimeoutError:
+            if cancel is not None:
+                cancel.set()
+            cfut.cancel()
             if self._epoch_current(segment, epoch):
                 self._fail_translation(segment, "timeout", "英譯逾時，不假設沒有計費。中文仍保留")
             return
+        except asyncio.CancelledError:
+            if cancel is not None:
+                cancel.set()
+            cfut.cancel()
+            raise
         except Exception:
+            if cancel is not None:
+                cancel.set()
             if self._epoch_current(segment, epoch):
                 self._fail_translation(segment, "error", "英譯失敗，中文仍保留")
             return
         if not self._epoch_current(segment, epoch):
+            # A newer attempt owns translate_queued. Do not clear it.
+            return
+        if segment.zh != zh_snapshot:
+            segment.translate_queued = False
             return
         segment.en = translated.text or ""
         segment.translate_status = translated.status
@@ -1028,7 +1214,9 @@ class Pipeline:
         segment.translate_queued = False
         segment.version = segment.version + 1
         if not self._epoch_current(segment, epoch):
-            # Deleted or superseded while this result was applied. Do not publish it.
+            segment.en = ""
+            return
+        if segment.zh != zh_snapshot:
             segment.en = ""
             segment.translate_queued = False
             return
@@ -1092,6 +1280,62 @@ class Pipeline:
             # Keep the compact index and the audio hash so a later retry is still deduped.
             self.results.pop(key, None)
 
+    def seed_from_store(self, room_id: str, rows: list[dict]) -> None:
+        """Restore per-session progress from saved captions. Safe to call once per room."""
+        if room_id in self._seeded:
+            return
+        self._seeded.add(room_id)
+        sessions: dict[str, dict] = {}
+        for row in rows or []:
+            session_id = str(row.get("session_id") or "")
+            try:
+                seq = int(row.get("seq") or 0)
+                version = max(1, int(row.get("version") or 1))
+                session_ord = int(row.get("session_ord") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not session_id or seq < 1:
+                continue
+            key = (room_id, session_id, seq)
+            self._version_floor[key] = max(self._version_floor.get(key, 0), version)
+            segment = Segment(
+                room_id=room_id,
+                session_id=session_id,
+                seq=seq,
+                zh=row.get("zh") or "",
+                zh_raw=row.get("zh_raw") or "",
+                en=row.get("en") or "",
+                status=row.get("status") or "ready",
+                translate_status=row.get("translate_status") or "",
+                error=row.get("error") or "",
+                version=version,
+                session_ord=session_ord,
+                t0_ms=row.get("t0_ms"),
+                t1_ms=row.get("t1_ms"),
+            )
+            self._stamp_gen(segment)
+            self.results[key] = segment
+            self._emitted_segs.add(key)
+            self._remember_index(segment)
+            bucket = sessions.setdefault(session_id, {"ord": 0, "max_seq": 0, "seqs": set()})
+            bucket["ord"] = max(int(bucket["ord"]), session_ord)
+            bucket["max_seq"] = max(int(bucket["max_seq"]), seq)
+            bucket["seqs"].add(seq)
+        max_ord = 0
+        for session_id, info in sessions.items():
+            group = (room_id, session_id)
+            if info["ord"]:
+                self._session_ord[group] = int(info["ord"])
+                max_ord = max(max_ord, int(info["ord"]))
+            self._max_seq[group] = int(info["max_seq"])
+            # Past the saved seqs, so a continuing session does not invent 1..N gaps.
+            self._next[group] = int(info["max_seq"]) + 1
+            for seq in range(1, int(info["max_seq"]) + 1):
+                if seq not in info["seqs"]:
+                    self.mark_missing(room_id, session_id, seq, "缺段：這段沒有留在逐字稿裡")
+        if max_ord:
+            self._room_sessions[room_id] = max(self._room_sessions.get(room_id, 0), max_ord)
+
     async def retranslate(self, room_id: str, session_id: str, seq: int, zh: str | None = None) -> Segment:
         self.ensure_workers()
         if f"{room_id}:{session_id}:{seq}" in self._sealed.get(room_id, ()):
@@ -1101,10 +1345,13 @@ class Pipeline:
             segment = self._rehydrate((room_id, session_id, seq))
         if segment is None or not (segment.zh or zh):
             raise PipelineError(404, "找不到這段字幕")
+        if segment.status in {"cancelled", "missing"}:
+            raise PipelineError(409, "這段已取消或缺少，不能重譯")
         if zh is not None:
             segment.zh_raw = segment.zh_raw or segment.zh
             segment.zh = annotate_question(zh.strip())
             self._remember_zh(segment)
+        # A second retranslate replaces the queued attempt instead of stacking one.
         segment.status = "zh_ready"
         await self._enqueue_translation(segment)
-        return segment
+        return self.results.get((room_id, session_id, seq), segment)

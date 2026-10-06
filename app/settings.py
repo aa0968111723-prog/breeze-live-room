@@ -109,6 +109,8 @@ class Settings:
     silence_rms: float = 0.0
     caption_ttl_s: float = 86400.0
     room_caption_cap: int = 5000
+    stop_flush_s: float = 8.0
+    shutdown_flush_s: float = 2.0
     token_budget: int = 0
     allowed_hosts: tuple[str, ...] = ()
     allowed_schemes: tuple[str, ...] = ("http",)
@@ -137,7 +139,7 @@ class Settings:
             raise ValueError("BREEZE_ROOM_CAPTION_CAP 至少為 1")
         if self.translate_workers < 1:
             raise ValueError("BREEZE_TRANSLATE_WORKERS 至少為 1")
-        if self.gap_wait_s < 0 or self.room_idle_s < 0:
+        if self.gap_wait_s < 0 or self.room_idle_s < 0 or self.stop_flush_s < 0 or self.shutdown_flush_s < 0:
             raise ValueError("等待時間不能是負數")
         if self.asr_mode not in {"cli", "resident"}:
             raise ValueError("BREEZE_ASR 只接受 cli 或 resident")
@@ -196,6 +198,8 @@ class Settings:
             silence_rms=_raw_float(env, "BREEZE_SILENCE_RMS", 0.0),
             caption_ttl_s=_raw_float(env, "BREEZE_CAPTION_TTL", 86400.0),
             room_caption_cap=_raw_int(env, "BREEZE_ROOM_CAPTION_CAP", 5000),
+            stop_flush_s=_raw_float(env, "BREEZE_STOP_FLUSH", 8.0),
+            shutdown_flush_s=_raw_float(env, "BREEZE_SHUTDOWN_FLUSH", 2.0),
             token_budget=_raw_int(env, "BREEZE_TOKEN_BUDGET", 0),
             allowed_hosts=_csv(env, "BREEZE_ALLOWED_HOSTS"),
             allowed_schemes=schemes,

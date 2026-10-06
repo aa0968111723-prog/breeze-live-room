@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -47,13 +48,24 @@ class Translator:
         import os
         if not self.model:
             self.model = os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-4.1-mini")
+        self._token_lock = threading.Lock()
+
+    def _budget_exhausted(self) -> bool:
+        with self._token_lock:
+            return bool(self.token_budget and self.tokens_used >= self.token_budget)
+
+    def _add_tokens(self, count: int) -> None:
+        if count <= 0:
+            return
+        with self._token_lock:
+            self.tokens_used += count
 
     def status_label(self) -> str:
         if not self.enabled:
             return "已關閉"
         if not self.key:
             return "未設定金鑰，只出中文"
-        if self.token_budget and self.tokens_used >= self.token_budget:
+        if self._budget_exhausted():
             return "本場翻譯額度已用完，只出中文"
         return "已設定金鑰，尚未驗證可用"
 
@@ -83,18 +95,19 @@ class Translator:
             {"role": "user", "content": zh},
         ]
 
-    def translate(self, zh: str, glossary=None, context=None, deadline: float | None = None) -> TranslateResult:
+    def translate(self, zh: str, glossary=None, context=None, deadline: float | None = None, cancel: threading.Event | None = None) -> TranslateResult:
         # deadline is time.monotonic() seconds. Stop retries when it passes so a
         # timed-out caller does not leave this thread sleeping through the backoff.
+        # cancel is optional. Callers that do not accept it are unchanged.
         if not self.enabled or not zh:
             return TranslateResult("", "off")
         if not self.key:
             return TranslateResult("", "no_key")
-        if self.token_budget and self.tokens_used >= self.token_budget:
+        if self._budget_exhausted():
             return TranslateResult("", "budget", "本場翻譯額度已用完，中文仍保留")
         last = TranslateResult("", "error", "英譯失敗，中文仍保留")
         for attempt in range(self.max_attempts):
-            if _deadline_hit(deadline):
+            if _cancelled(cancel) or _deadline_hit(deadline):
                 return TranslateResult("", "timeout", "英譯逾時，不假設沒有計費。中文仍保留")
             self.calls += 1
             timeout = 40.0
@@ -119,7 +132,11 @@ class Translator:
                 if delay > remaining:
                     delay = remaining
             self.attempts_slept.append(delay)
-            (self.sleeper or time.sleep)(delay)
+            if cancel is not None:
+                if cancel.wait(delay):
+                    return TranslateResult("", "timeout", "英譯逾時，不假設沒有計費。中文仍保留")
+            else:
+                (self.sleeper or time.sleep)(delay)
         return last
 
     def _once(self, zh: str, glossary, context, timeout: float = 40) -> TranslateResult:
@@ -145,9 +162,9 @@ class Translator:
             prompt_tokens = usage.get("prompt_tokens")
             completion_tokens = usage.get("completion_tokens")
             if isinstance(prompt_tokens, int):
-                self.tokens_used += prompt_tokens
+                self._add_tokens(prompt_tokens)
             if isinstance(completion_tokens, int):
-                self.tokens_used += completion_tokens
+                self._add_tokens(completion_tokens)
             return TranslateResult(text, "ok", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
         except urllib.error.HTTPError as exc:
             return self._http_error(exc)
@@ -176,6 +193,10 @@ class Translator:
         if exc.code == 408 or (isinstance(exc.code, int) and 500 <= exc.code <= 599):
             return TranslateResult("", "http", f"英譯服務回應 {exc.code}，中文仍保留", retry_after=_retry_after(exc))
         return TranslateResult("", "bad_response", f"英譯服務回應 {exc.code}，中文仍保留")
+
+
+def _cancelled(cancel: threading.Event | None) -> bool:
+    return cancel is not None and cancel.is_set()
 
 
 def _deadline_hit(deadline: float | None) -> bool:
