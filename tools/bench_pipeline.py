@@ -92,11 +92,26 @@ def _flag_given(name: str) -> bool:
 
 
 def _rss_bytes() -> int:
+    """Resident set size in bytes.
+
+    Linux reads /proc/self/statm. Other Unix platforms fall back to resource.getrusage.
+    Windows has neither; return 0 so a soak run still finishes and the report stays printable.
+    """
     try:
         with open("/proc/self/statm", encoding="ascii") as handle:
             resident = int(handle.read().split()[1])
-        return resident * os.sysconf("SC_PAGE_SIZE")
-    except (OSError, ValueError, IndexError):
+        page = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+        return resident * int(page)
+    except (OSError, ValueError, IndexError, AttributeError):
+        pass
+    try:
+        import resource
+        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux reports KiB; macOS reports bytes.
+        if sys.platform == "darwin":
+            return int(usage)
+        return int(usage) * 1024
+    except (ImportError, AttributeError, OSError, ValueError):
         return 0
 
 

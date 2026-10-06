@@ -700,12 +700,15 @@ async def test_srt_100_minute_session_formats_hours(tmp_path):
                 if track_memory:
                     after, peak = tracemalloc.get_traced_memory()
                     delta = max(0, after - before)
-                    Path("/tmp/breeze_mem_1000.txt").write_text(
+                    report = (
                         f"delta={delta}\npeak={peak}\nindex={len(app.state.pipeline._index)}\n"
                         f"results={len(app.state.pipeline.results)}\n"
-                        f"state={len(app.state.bus.caption_state('class'))}\n",
-                        encoding="utf-8",
+                        f"state={len(app.state.bus.caption_state('class'))}\n"
                     )
+                    # tmp_path, not /tmp: Windows has no /tmp and Path("/tmp/...") becomes \tmp\...
+                    destination = tmp_path / "breeze_mem_1000.txt"
+                    destination.write_text(report, encoding="utf-8")
+                    print(report, end="")
                     assert delta < 80_000_000, delta
                 assert len(app.state.bus.history("class")) <= 200
                 state = app.state.bus.caption_state("class")
