@@ -18,7 +18,7 @@ def report():
 
 def test_100min_session_never_waits(report):
     """B-a1. ASR 1.5s and a 6s period stay inside maxInflight=2, so the host never waits."""
-    assert report.waiting_v_total == 0
+    assert report.waiting_v_total == 0, report.waiting
     assert report.metrics, "expected a metrics snapshot at least every 100 segments"
     for snap in report.metrics:
         assert snap["pending"] <= 2

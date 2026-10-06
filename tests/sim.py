@@ -248,10 +248,11 @@ class Listener:
 
     async def _pump(self) -> None:
         while True:
+            # A plain get, not wait_for(get(), timeout): on Python 3.11 wait_for can
+            # swallow a cancel that lands as the inner get completes, and close()
+            # would then wait forever on a pump that keeps looping.
             try:
-                msg = await asyncio.wait_for(self.sock.out.get(), 0.5)
-            except asyncio.TimeoutError:
-                continue
+                msg = await self.sock.out.get()
             except asyncio.CancelledError:
                 return
             now = time.monotonic()
@@ -429,11 +430,17 @@ class VirtualHost:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def run(self, count: int, text_of=None, pace: bool = True, on_each=None, drain: bool = True) -> None:
+    async def run(
+        self, count: int, text_of=None, pace: bool = True, on_each=None, drain: bool = True, before_slice=None,
+    ) -> None:
         """Record ``count`` slices. drain=False returns once the last slice is handed to
-        upload, like pressing stop right after speaking; stop() then settles uploads."""
+        upload, like pressing stop right after speaking; stop() then settles uploads.
+        before_slice(seq) runs synchronously before the slot check, outside any
+        measured wait."""
         text_of = text_of or (lambda i: f"第{i}句")
         for seq in range(1, count + 1):
+            if before_slice is not None:
+                before_slice(seq)
             await self._wait_slot()
             if pace:
                 await asyncio.sleep(self.period_v * self.scale)
@@ -575,13 +582,20 @@ async def _run_100min_async() -> SimReport:
     if not tracing:
         tracemalloc.start()
     # Host, server and both listeners share one process here, and every real
-    # millisecond is 1/SCALE virtual milliseconds. A full GC pass over pytest,
-    # httpx and the app's import-time objects can block the loop for tens of ms
-    # on a CI runner, which the recorder model would book as a multi-second
-    # pause that a browser plus a separate server never see. Freeze what exists
-    # before the class starts so collections only scan objects made during it.
+    # millisecond is 1/SCALE virtual milliseconds. A full GC pass is a 30-90 ms
+    # stop-the-world pause on a runner (measured on 3.11), which the recorder model
+    # would book as a multi-second recorder pause that a browser plus a separate
+    # server never see. Freeze what exists before the class, turn automatic GC off
+    # for the paced run, and collect at slice boundaries before the slot check,
+    # where a pause is not inside any measured wait.
+    gc_was_enabled = gc.isenabled()
     gc.collect()
     gc.freeze()
+    gc.disable()
+
+    def collect_between_slices(seq: int) -> None:
+        if seq % 50 == 0:
+            gc.collect()
     snapshots: list[dict] = []
     listeners: list[Listener] = []
     host: VirtualHost | None = None
@@ -601,7 +615,9 @@ async def _run_100min_async() -> SimReport:
                     return
                 pending_snaps.append(asyncio.create_task(_snapshot(app, client, token, seq, snapshots)))
 
-            await host.run(SEGMENTS, pace=True, on_each=on_each)
+            await host.run(SEGMENTS, pace=True, on_each=on_each, before_slice=collect_between_slices)
+            if gc_was_enabled:
+                gc.enable()
             if pending_snaps:
                 await asyncio.gather(*pending_snaps)
             await _snapshot(app, client, token, SEGMENTS, snapshots)
@@ -648,6 +664,8 @@ async def _run_100min_async() -> SimReport:
         await stop(app)
         if not tracing and tracemalloc.is_tracing():
             tracemalloc.stop()
+        if gc_was_enabled:
+            gc.enable()
         gc.unfreeze()
     return report
 

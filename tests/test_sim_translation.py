@@ -74,6 +74,11 @@ async def test_slow_translation_does_not_pause_recorder():
             await host.run(30)
             assert host.waiting_v_total == 0
             assert host.retries == []
+            # The last push can return before the listener pump has read its zh_ready.
+            assert await listener.wait_for(
+                lambda: len({m.get("seq") for m in listener.messages if m.get("status") == "zh_ready"}) >= 30,
+                vlimit(15),
+            )
             zh_at = {}
             for msg in listener.messages:
                 if msg.get("status") == "zh_ready" and msg.get("seq") is not None:
