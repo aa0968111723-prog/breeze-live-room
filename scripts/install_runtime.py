@@ -64,6 +64,7 @@ def download_verified(asset: dict, target: Path, opener=None) -> Path:
                 else:
                     raise RuntimeError(f"下載伺服器回應 {status}")
                 total = offset
+                last_progress = offset
                 with part.open(mode) as stream:
                     while True:
                         block = response.read(1024 * 1024)
@@ -73,6 +74,9 @@ def download_verified(asset: dict, target: Path, opener=None) -> Path:
                         if total > asset["size"]:
                             raise RuntimeError("下載內容超過預期大小")
                         stream.write(block)
+                        if total - last_progress >= 50 * 1024 * 1024:
+                            print(f"下載 {target.name}：{total * 100 // asset['size']}%", flush=True)
+                            last_progress = total
             break
         except urllib.error.HTTPError as exc:
             if exc.code == 416 and offset and attempt == 0:
@@ -166,9 +170,10 @@ def main() -> int:
     doctor = subprocess.run([sys.executable, "-m", "app.doctor", "--verify-model"], cwd=ROOT)
     if doctor.returncode:
         return doctor.returncode
-    shortcut = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ".\\install-shortcut.ps1"], cwd=ROOT)
-    if shortcut.returncode:
-        print("桌面捷徑未建立，仍可雙擊 start.bat。")
+    if os.getenv('BREEZE_SKIP_SHORTCUT') != '1':
+        shortcut = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ".\\install-shortcut.ps1"], cwd=ROOT)
+        if shortcut.returncode:
+            print("桌面捷徑未建立，仍可雙擊 start.bat。")
     print("安裝及啟動前檢查完成。請雙擊 start.bat，再進行麥克風試錄。")
     return 0
 
