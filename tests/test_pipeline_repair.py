@@ -1216,3 +1216,17 @@ async def test_stop_flush_admits_chunk_inside_window_and_last_seq_returns_early(
             assert after.status_code == 409
     finally:
         await stop(app)
+
+
+def test_device_acceptance_storage_off_export_covers_a_class():
+    """A 100-minute export fits in the room caption cap. Storage is for restart, not for that export."""
+    text = Path("docs/DEVICE-ACCEPTANCE.md").read_text(encoding="utf-8")
+    assert "沒開儲存時 100 分鐘匯出會缺掉大部分" not in text
+    assert "BREEZE_ROOM_CAPTION_CAP" in text
+    assert "預設 5000" in text
+    assert "不能因為沒開儲存就把 C-1 的匯出判成缺段" in text
+    assert "沒開儲存時 C-6、E-4 直接 FAIL" in text
+    assert "沒開儲存時只會剩近期字幕，直接 FAIL" in text
+    statuses = [line.strip() for line in text.splitlines() if line.strip().startswith("- 狀態：")]
+    assert statuses
+    assert statuses == ["- 狀態：尚未驗證"] * len(statuses)
