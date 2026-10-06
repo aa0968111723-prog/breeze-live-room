@@ -69,15 +69,9 @@ async def test_restart_old_cursor_gets_new_events(tmp_path):
                     assert await listener.wait_for(lambda: any(m.get("type") == "hello" for m in listener.messages), 5)
                     hello = next(m for m in listener.messages if m.get("type") == "hello")
                     assert hello["latest_cursor"] < saved
-                    rows = list(hello.get("backfill") or []) + list(hello.get("events") or []) + list(hello.get("history") or [])
-                    seqs = {}
-                    for item in rows:
-                        if item.get("seq") is None or not item.get("id"):
-                            continue
-                        seqs.setdefault(item["id"], item)
-                    new_ids = {f"class:s2:{n}" for n in range(1, 6)}
-                    assert new_ids <= set(seqs)
-                    assert len(seqs) == len({item["id"] for item in rows if item.get("id")})
+                    backfill_ids = [item["id"] for item in (hello.get("backfill") or []) if item.get("id")]
+                    expected = [f"class:s:{n}" for n in range(1, 51)] + [f"class:s2:{n}" for n in range(1, 6)]
+                    assert backfill_ids == expected
     finally:
         await stop(app2)
 
