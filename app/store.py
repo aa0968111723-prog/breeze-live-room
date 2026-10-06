@@ -22,6 +22,8 @@ class CaptionStore:
         self.path = Path(text) if text else None
         self.enabled = self.path is not None
         self.errors = 0
+        self.recovered = False
+        self.quarantine_path: Path | None = None
         self._conn: sqlite3.Connection | None = None
         self._pool: ThreadPoolExecutor | None = None
         self._writer: threading.Thread | None = None
@@ -40,13 +42,52 @@ class CaptionStore:
             raise RuntimeError("caption store is not open")
         return self._pool.submit(fn, *args)
 
-    def _open(self) -> None:
-        self._writer = threading.current_thread()
-        assert self.path is not None
-        conn = sqlite3.connect(self.path, check_same_thread=False)
+    def _connect(self, path: Path) -> sqlite3.Connection:
+        conn = sqlite3.connect(path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    def _quarantine(self, path: Path) -> None:
+        stamp = time.strftime("%Y%m%d%H%M%S")
+        dest = path.with_name(f"{path.name}.corrupt-{stamp}")
+        extra = 0
+        while dest.exists():
+            extra += 1
+            dest = path.with_name(f"{path.name}.corrupt-{stamp}-{extra}")
+        path.rename(dest)
+        for suffix in ("-wal", "-shm"):
+            side = Path(str(path) + suffix)
+            if side.exists():
+                side.rename(dest.with_name(dest.name + suffix))
+        self.quarantine_path = dest
+        log.warning("caption store was unreadable; moved it to %s and started a new file", dest)
+
+    def _open(self) -> None:
+        self._writer = threading.current_thread()
+        assert self.path is not None
+        conn = None
+        try:
+            conn = self._connect(self.path)
+            check = conn.execute("pragma quick_check").fetchone()
+            if check is None or str(check[0]).lower() != "ok":
+                raise sqlite3.DatabaseError(f"quick_check {check}")
+        except sqlite3.Error:
+            log.warning("caption store at %s failed to open", self.path, exc_info=True)
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+            if self.path.exists():
+                self._quarantine(self.path)
+            self.recovered = True
+            conn = self._connect(self.path)
+        self._prepare(conn)
+        self._conn = conn
+
+    def _prepare(self, conn: sqlite3.Connection) -> None:
         conn.execute(
             """
             create table if not exists captions (
@@ -216,6 +257,21 @@ class CaptionStore:
             return False
         row = conn.execute("select 1 from captions where room_id = ? limit 1", (room_id,)).fetchone()
         return row is not None
+
+    def room_ids(self) -> list[str]:
+        if not self.enabled:
+            return []
+        if self._on_writer():
+            return self._room_ids_now()
+        rows = self._submit(self.room_ids).result()
+        return rows or []
+
+    def _room_ids_now(self) -> list[str]:
+        conn = self._conn
+        if conn is None:
+            return []
+        found = conn.execute("select distinct room_id from captions").fetchall()
+        return [str(row[0]) for row in found if row and row[0]]
 
     def room_rows(self, room_id: str) -> list[dict]:
         if not self.enabled:

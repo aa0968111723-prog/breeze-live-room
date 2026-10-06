@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 import time
 from typing import Awaitable, Callable
 
@@ -20,7 +21,7 @@ class RoomBus:
     The per-room cursor counter is not restarted by drop or clear.
     """
 
-    def __init__(self, limit: int = 200, caption_cap: int = 5000):
+    def __init__(self, limit: int = 200, caption_cap: int = 5000, epoch: int | None = None):
         self.limit = limit
         self.caption_cap = max(1, int(caption_cap))
         self.by_room: dict[str, list[dict]] = {}
@@ -28,13 +29,16 @@ class RoomBus:
         self._ver: dict[str, dict[str, int]] = {}
         self._cursor: dict[str, int] = {}
         self._epoch: dict[str, int] = {}
+        # One value per process. A restarted server does not reuse it, so clients
+        # can tell that cursors and versions belong to a new process.
+        self._boot = int(epoch) if epoch is not None else secrets.randbelow(2_000_000_000) + 1
         self._state: dict[str, dict[str, dict]] = {}
         self._state_order: dict[str, list[str]] = {}
         self._state_at: dict[str, float] = {}
         self._tomb: dict[str, set[str]] = {}
 
     def epoch(self, room_id: str) -> int:
-        return int(self._epoch.get(room_id, 1))
+        return int(self._epoch.get(room_id, self._boot))
 
     def _alloc_cursor(self, room: str) -> int:
         nxt = int(self._cursor.get(room, 0)) + 1
@@ -46,7 +50,7 @@ class RoomBus:
         snap = {key: event.get(key) for key in _PASS}
         snap["type"] = snap.get("type") or "caption"
         snap["room_id"] = room
-        self._epoch.setdefault(room, 1)
+        self._epoch.setdefault(room, self._boot)
         if snap.get("epoch") is None:
             snap["epoch"] = self._epoch[room]
         seg_id = str(snap.get("id") or "")
@@ -153,7 +157,8 @@ class RoomBus:
         log = self._log.get(room_id, [])
         latest = int(self._cursor.get(room_id, 0))
         if not log:
-            gap = cursor > 0 and latest > cursor
+            # An old client cursor that this process never issued is a gap, not silence.
+            gap = cursor > 0 and cursor != latest
             return {
                 "events": [],
                 "gap": gap,
@@ -163,7 +168,9 @@ class RoomBus:
             }
         oldest = int(log[0]["cursor"])
         latest = max(latest, int(log[-1]["cursor"]))
-        gap = cursor > 0 and oldest > cursor + 1
+        ahead = cursor > latest
+        hole = oldest > cursor + 1
+        gap = cursor > 0 and (hole or ahead)
         events = [dict(item) for item in log if int(item["cursor"]) > cursor]
         return {
             "events": events,
@@ -172,6 +179,18 @@ class RoomBus:
             "latest_cursor": latest,
             "backfill": self.caption_state(room_id) if gap else [],
         }
+
+    def hydrate(self, room_id: str, rows: list[dict]) -> None:
+        """Replay saved captions into this room. Same id and version is ignored."""
+        self._epoch.setdefault(room_id, self._boot)
+        for row in rows or []:
+            if not row.get("id"):
+                continue
+            event = {key: row.get(key) for key in _PASS}
+            event["type"] = "caption"
+            event["room_id"] = room_id
+            event["epoch"] = self.epoch(room_id)
+            self.publish(event)
 
     def latest_cursor(self, room_id: str) -> int:
         return int(self._cursor.get(room_id, 0))
@@ -190,7 +209,7 @@ class RoomBus:
         self._ver.pop(room_id, None)
         self.by_room.pop(room_id, None)
         self._log[room_id] = []
-        self._epoch[room_id] = self._epoch.get(room_id, 1) + 1
+        self._epoch[room_id] = self.epoch(room_id) + 1
         published = self.publish({
             "type": "captions_cleared",
             "room_id": room_id,
@@ -227,7 +246,7 @@ class RoomBus:
         self._state_order.pop(room_id, None)
         self._state_at.pop(room_id, None)
         self._tomb.pop(room_id, None)
-        self._epoch[room_id] = self._epoch.get(room_id, 1) + 1
+        self._epoch[room_id] = self.epoch(room_id) + 1
 
 
 class ListenerSlot:

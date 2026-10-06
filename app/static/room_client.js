@@ -77,19 +77,27 @@ export function createCaptionView(limit = 80) {
   };
 }
 
-export function connectRoom({ room, url, onState, onEvent, onGap, onDelete, onClear, onBackfill, onReset, openSocket, sleep }) {
+export function connectRoom({ room, url, onState, onEvent, onGap, onDelete, onClear, onBackfill, onReset, openSocket, sleep, now, staleMs }) {
   const versions = new Map();
   let cursor = 0;
   let seenEpoch = null;
   let connectedCursor = 0;
+  let wantReplay = false;
   let attempt = 0;
   let stopped = false;
   let socket = null;
   let timer = null;
   let cancelWait = null;
+  let lastMessageAt = 0;
   let resolveDone = null;
   const done = new Promise((resolve) => { resolveDone = resolve; });
   const opener = openSocket || ((address) => new WebSocket(address));
+  const clock = typeof now === "function" ? now : () => Date.now();
+  const staleAfter = Number(staleMs) > 0 ? Number(staleMs) : 35000;
+
+  function markMessage() {
+    lastMessageAt = clock();
+  }
 
   function remember(item) {
     if (!item || item.id == null || item.id === "") return false;
@@ -106,7 +114,12 @@ export function connectRoom({ room, url, onState, onEvent, onGap, onDelete, onCl
     const base = url();
     const join = base.includes("?") ? "&" : "?";
     connectedCursor = cursor;
-    return base + join + "cursor=" + encodeURIComponent(String(cursor));
+    let query = "cursor=" + encodeURIComponent(String(cursor));
+    if (wantReplay) {
+      query += "&replay=1";
+      wantReplay = false;
+    }
+    return base + join + query;
   }
 
   function isCaption(data) {
@@ -176,7 +189,10 @@ export function connectRoom({ room, url, onState, onEvent, onGap, onDelete, onCl
           resolve();
         };
         cancelWait = finish;
-        ws.onopen = () => { attempt = 0; onState("已連上 " + room); };
+        ws.onopen = () => {
+          markMessage();
+          onState("已連上 " + room);
+        };
         ws.onmessage = (ev) => {
           let data;
           try {
@@ -185,11 +201,18 @@ export function connectRoom({ room, url, onState, onEvent, onGap, onDelete, onCl
             return;
           }
           if (!data || typeof data !== "object") return;
+          markMessage();
           if (data.type === "ping") {
             try { ws.send(JSON.stringify({ type: "pong" })); } catch { /* closed */ }
             return;
           }
+          if (data.type === "room_unavailable") {
+            onState(data.reason === "full" ? "房間已滿，稍後再連" : "房間已結束");
+            try { ws.close(); } catch { /* reconnect uses the attempt counter */ }
+            return;
+          }
           if (data.type === "hello") {
+            attempt = 0;
             const latest = Number(data.latest_cursor);
             const epoch = data.epoch == null ? null : Number(data.epoch);
             const cursorBehind = Number.isFinite(latest) && latest < cursor;
@@ -197,13 +220,17 @@ export function connectRoom({ room, url, onState, onEvent, onGap, onDelete, onCl
             if (cursorBehind || epochChanged) {
               versions.clear();
               cursor = 0;
-              if (epoch != null) seenEpoch = epoch;
+              if (epoch != null && Number.isFinite(epoch)) seenEpoch = epoch;
               if (onReset) onReset(data);
+              // The hello we are about to drop may be the only copy of the backlog.
+              // The next connection asks for the full caption state.
+              wantReplay = true;
               if (connectedCursor > 0) {
                 try { ws.close(); } catch { /* reconnect below */ }
                 return;
               }
-            } else if (epoch != null) {
+              wantReplay = false;
+            } else if (epoch != null && Number.isFinite(epoch)) {
               seenEpoch = epoch;
             }
             cursor = noteCursor(cursor, data.latest_cursor);
@@ -238,7 +265,11 @@ export function connectRoom({ room, url, onState, onEvent, onGap, onDelete, onCl
     nudge() {
       if (stopped) return;
       attempt = 0;
-      // Backoff uses the timer. The live socket wait must stay up; stop() closes it.
+      if (socket && lastMessageAt && clock() - lastMessageAt > staleAfter) {
+        const ws = socket;
+        try { ws.close(); } catch { /* onclose reconnects */ }
+      }
+      // Backoff uses the timer. A live socket that is still receiving stays up.
       if (timer && cancelWait) cancelWait();
     },
     stop() {

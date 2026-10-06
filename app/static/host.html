@@ -142,6 +142,41 @@ function listenCaptions(roomId, force) {
     onReset: () => { view.reset(); paintCaption(false, null, false); },
   });
 }
+let authJob = null;
+async function recoverAuth() {
+  if (authJob) return authJob;
+  authJob = (async () => {
+    const resp = await fetch("/api/host-token", { cache: "no-store" });
+    if (!resp.ok) throw new Error("無法重新取得主持權限");
+    const data = await resp.json();
+    if (!data || typeof data.token !== "string" || !data.token) throw new Error("無法重新取得主持權限");
+    token = data.token;
+    const room = (ctl.session && ctl.session.roomId) || (roomEl.value || "class").trim() || "class";
+    const sessionId = (ctl.session && ctl.session.id) || "pending";
+    const headers = { authorization: "Bearer " + token, "content-type": "application/json" };
+    await fetch("/api/rooms/open", { method: "POST", headers, body: JSON.stringify({ room_id: room }) });
+    await fetch("/api/glossary", { method: "POST", headers, body: JSON.stringify({ room_id: room, session_id: sessionId, text: document.querySelector("#glossary").value }) });
+    listenCaptions(room, true);
+  })();
+  try {
+    await authJob;
+  } finally {
+    authJob = null;
+  }
+}
+async function hostFetch(url, options) {
+  const build = () => {
+    const opts = { ...(options || {}) };
+    const headers = { ...(opts.headers || {}) };
+    if (token) headers.authorization = "Bearer " + token;
+    opts.headers = headers;
+    return opts;
+  };
+  let resp = await fetch(url, build());
+  if (resp.status !== 401) return resp;
+  await recoverAuth();
+  return fetch(url, build());
+}
 function micError(err) {
   const name = err && err.name;
   if (name === "NotAllowedError") return "瀏覽器拒絕了麥克風。請允許後再按開始。";
@@ -247,11 +282,19 @@ const ctl = createCaptureController({
       }
     }
     let resp = await post(false);
+    if (resp.status === 401) {
+      await recoverAuth();
+      resp = await post(false);
+    }
     let data = await resp.json();
     if (resp.status === 429) {
       line("佇列已滿，稍後重送這一段：" + meta.seq);
       await new Promise((resolve) => setTimeout(resolve, 800));
       resp = await post(true);
+      if (resp.status === 401) {
+        await recoverAuth();
+        resp = await post(true);
+      }
       data = await resp.json();
     }
     if (!resp.ok || !data.ok) {
@@ -291,14 +334,14 @@ go.onclick = async () => {
   roomEl.disabled = true;
   go.disabled = true;
   try {
-    await fetch("/api/rooms/open", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ room_id: room }) });
+    await hostFetch("/api/rooms/open", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: room }) });
     listenCaptions(room, true);
-    await fetch("/api/glossary", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ room_id: room, session_id: "pending", text: document.querySelector("#glossary").value }) });
+    await hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: room, session_id: "pending", text: document.querySelector("#glossary").value }) });
     await ctl.start();
     const activeRoom = ctl.session ? ctl.session.roomId : room;
-    await fetch("/api/session/active", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ room_id: activeRoom, active: true }) });
+    await hostFetch("/api/session/active", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: activeRoom, active: true }) });
     if (ctl.session) {
-      await fetch("/api/glossary", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ room_id: ctl.session.roomId, session_id: ctl.session.id, text: document.querySelector("#glossary").value }) });
+      await hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: ctl.session.roomId, session_id: ctl.session.id, text: document.querySelector("#glossary").value }) });
     }
     line("開始聽了。每一段都是完整錄音。");
   } catch (err) {
@@ -314,7 +357,7 @@ stopBtn.onclick = async () => {
   const current = ctl.session;
   await ctl.stop();
   if (current) {
-    await fetch("/api/session/end", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ room_id: current.roomId, session_id: current.id }) });
+    await hostFetch("/api/session/end", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: current.roomId, session_id: current.id }) });
   }
   lockRoom();
   line(ctl.lastError ? ("已停止：" + ctl.lastError) : "已停止。收音已停，送出的尾段也處理完了。");
@@ -346,7 +389,7 @@ document.querySelector("#try").onclick = async () => {
 };
 document.querySelector("#save-terms").onclick = async () => {
   if (!token || !ctl.session) { line("開始聽之後才會把術語套到這一場。"); return; }
-  await fetch("/api/glossary", { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ room_id: ctl.session.roomId, session_id: ctl.session.id, text: document.querySelector("#glossary").value }) });
+  await hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: ctl.session.roomId, session_id: ctl.session.id, text: document.querySelector("#glossary").value }) });
   line("已儲存這一場的術語。");
 };
 document.querySelector("#skip").onclick = async () => {

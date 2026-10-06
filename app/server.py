@@ -238,6 +238,44 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             pipeline.drop_room(room_id)
 
     pipeline = Pipeline(asr, translator, PROMPT, TMP, settings, on_event=on_event)
+    hydrated: set[str] = set()
+    hydrate_jobs: dict[str, asyncio.Task] = {}
+
+    async def _hydrate_room(room_id: str) -> None:
+        if room_id in hydrated:
+            return
+        if not store.enabled:
+            hydrated.add(room_id)
+            return
+        try:
+            rows = await asyncio.to_thread(store.room_rows, room_id)
+        except Exception:
+            logging.getLogger("breeze.server").exception("caption hydrate failed")
+            hydrate_jobs.pop(room_id, None)
+            return
+        cutoff = time.time() - float(settings.caption_ttl_s)
+        fresh = []
+        for row in rows or []:
+            try:
+                updated = float(row.get("updated_at") or 0)
+            except (TypeError, ValueError):
+                updated = 0.0
+            if updated and updated < cutoff:
+                continue
+            fresh.append(row)
+        hydrated.add(room_id)
+        bus.hydrate(room_id, fresh)
+        pipeline.seed_from_store(room_id, fresh)
+
+    async def ensure_hydrated(room_id: str) -> None:
+        """Load this room from SQLite the first time it is opened, joined, or pushed."""
+        if room_id in hydrated:
+            return
+        job = hydrate_jobs.get(room_id)
+        if job is None:
+            job = asyncio.get_running_loop().create_task(_hydrate_room(room_id))
+            hydrate_jobs[room_id] = job
+        await job
 
     def decode(src: Path, work: Path) -> Path:
         if decoder:
@@ -281,6 +319,16 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
     async def lifespan(app: FastAPI):
         pipeline.ensure_workers()
         tasks.append(asyncio.create_task(sweep_loop()))
+        # After create_app returns the bus is still empty (tests depend on that).
+        # Replaying starts here, before the first request is served.
+        if store.enabled:
+            try:
+                room_ids = await asyncio.to_thread(store.room_ids)
+            except Exception:
+                logging.getLogger("breeze.server").exception("caption room list failed")
+                room_ids = []
+            for room_id in room_ids:
+                await ensure_hydrated(room_id)
         try:
             yield
         finally:
@@ -353,6 +401,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             "queue": pipeline.stats(),
             "listeners": sum(len(item["listeners"]) for item in book.rooms.values()),
             "storage": store.enabled,
+            "storage_recovered": bool(getattr(store, "recovered", False)),
         }
 
     @app.get("/api/health")
@@ -382,6 +431,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         body = await _json(request)
         room_id = validate_room_id(str(body.get("room_id") or "class"))
         book.open(room_id)
+        await ensure_hydrated(room_id)
         return {"ok": True, "room": room_id, "listen_url": share_for(room_id)}
 
     @app.post("/api/rooms/touch")
@@ -400,13 +450,24 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         body = await _json(request)
         room_id = validate_room_id(str(body.get("room_id") or ""))
         room = book.close(room_id)
+        closing = []
         if room:
-            for conn in list(room["listeners"]):
-                conn.slot.offer({"type": "room_unavailable", "room_id": room_id, "reason": "ended"})
+            closing = list(room["listeners"])
             room["listeners"].clear()
         removed = book.sweep()
         for gone in removed:
             _release_room(gone)
+        for conn in closing:
+            try:
+                await conn.ws.send_json({"type": "room_unavailable", "room_id": room_id, "reason": "ended"})
+            except Exception:
+                pass
+            conn.slot.alive = False
+        for conn in closing:
+            try:
+                await conn.ws.close(code=4404)
+            except Exception:
+                pass
         return {"ok": True}
 
     @app.post("/api/session/active")
@@ -425,7 +486,17 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         body = await _json(request)
         room_id = validate_room_id(str(body.get("room_id") or ""))
         session_id = validate_session_id(str(body.get("session_id") or ""))
-        pipeline.end_session(room_id, session_id)
+        await ensure_hydrated(room_id)
+        flush_s = None
+        if "flush_s" in body:
+            try:
+                flush_s = max(0.0, float(body.get("flush_s")))
+            except (TypeError, ValueError):
+                flush_s = None
+        if str(body.get("flush", "1")).strip().lower() in {"0", "false", "no"}:
+            flush_s = 0.0
+        await pipeline.end_session(room_id, session_id, flush_s=flush_s)
+        await asyncio.to_thread(store.flush)
         book.set_session_active(room_id, False)
         return {"ok": True}
 
@@ -500,6 +571,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             "tokens_used": translator.tokens_used,
             "price": translator.price_note(),
             "store_errors": store.errors,
+            "storage_recovered": bool(getattr(store, "recovered", False)),
         }
 
     @app.get("/api/export")
@@ -588,6 +660,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 pipeline.note_reserved(key)
                 reserved_key = key
             book.open(room_id)
+            await ensure_hydrated(room_id)
             retry = _field(form, request, "retry") == "1" or request.headers.get("x-breeze-retry") == "1"
             t0_ms = _optional_ms(form, request, "t0_ms")
             t1_ms = _optional_ms(form, request, "t1_ms")
@@ -642,7 +715,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 await form.close()
 
     @app.websocket("/ws/listen")
-    async def listen(ws: WebSocket, room_id: str = "class", cursor: int = 0) -> None:
+    async def listen(ws: WebSocket, room_id: str = "class", cursor: int = 0, replay: int = 0) -> None:
         try:
             room_id = validate_room_id(room_id)
         except RoomIdError:
@@ -660,6 +733,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             return
         conn = Conn(ws, settings.listener_queue)
         room["listeners"].add(conn)
+        await ensure_hydrated(room_id)
         resumed = bus.since(room_id, cursor)
         hello = {
             "type": "hello",
@@ -673,6 +747,8 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         }
         if cursor > 0 and resumed.get("gap"):
             hello["backfill"] = list(resumed.get("backfill") or [])
+        if int(replay or 0) == 1:
+            hello["backfill"] = bus.caption_state(room_id)
         try:
             await ws.send_json(hello)
         except Exception:
