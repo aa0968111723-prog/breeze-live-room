@@ -54,6 +54,11 @@ function Get-BreezeAsciiTemp {
 $breezeOriginalTemp = $env:TEMP
 $breezeOriginalTmp = $env:TMP
 try {
+    if ((Test-BreezeNonAsciiText $env:TEMP) -or (Test-BreezeNonAsciiText $env:TMP)) {
+        $breezeAsciiTemp = Get-BreezeAsciiTemp
+        $env:TEMP = $breezeAsciiTemp
+        $env:TMP = $breezeAsciiTemp
+    }
     Add-Type -TypeDefinition @'
 using System;
 using System.Text;
