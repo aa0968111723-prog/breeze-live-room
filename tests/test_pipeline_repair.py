@@ -1317,6 +1317,73 @@ async def test_stop_flush_admits_chunk_inside_window_and_last_seq_returns_early(
         await stop(app)
 
 
+@pytest.mark.anyio
+async def test_store_delete_failure_keeps_captions_and_reports_failure(tmp_path):
+    """A raised store delete must not claim success or drop captions that will replay."""
+    import sqlite3
+
+    path = tmp_path / "captions.sqlite3"
+    app = app_for(settings=settings_with(allow_testclient=True, translate=False, data_path=str(path)))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            headers = auth(token)
+            first = await push(client, token, "class", "s", 1, "留下".encode(), async_header=True, wait_translation="0")
+            second = await push(client, token, "class", "s", 2, "可刪".encode(), async_header=True, wait_translation="0")
+            assert first.status_code == 200 and second.status_code == 200
+            app.state.store.flush()
+            original_id = app.state.store._delete_id_now
+            original_room = app.state.store._delete_room_now
+
+            def boom(*_args, **_kwargs):
+                raise sqlite3.OperationalError("disk full")
+
+            app.state.store._delete_id_now = boom
+            app.state.store._delete_room_now = boom
+            denied = await client.delete(
+                "/api/captions",
+                params={"room_id": "class", "id": "class:s:1"},
+                headers=headers,
+            )
+            assert denied.status_code == 503, denied.text
+            body = denied.json()
+            assert body["ok"] is False
+            assert "畫面上的字幕還留著" in body["detail"]
+            assert any(row.get("zh") == "留下" for row in app.state.bus.caption_state("class"))
+            assert any(row.get("zh") == "留下" for row in app.state.store.room_rows("class"))
+            room_denied = await client.delete("/api/captions", params={"room_id": "class"}, headers=headers)
+            assert room_denied.status_code == 503, room_denied.text
+            assert room_denied.json()["ok"] is False
+            assert any(row.get("zh") == "留下" for row in app.state.bus.caption_state("class"))
+            assert any(row.get("zh") == "可刪" for row in app.state.bus.caption_state("class"))
+            app.state.store._delete_id_now = original_id
+            app.state.store._delete_room_now = original_room
+            removed = await client.delete(
+                "/api/captions",
+                params={"room_id": "class", "session_id": "s", "seq": 2},
+                headers=headers,
+            )
+            assert removed.status_code == 200, removed.text
+            assert removed.json()["ok"] is True
+            again = await push(client, token, "class", "s", 2, "不該復活".encode(), async_header=True, wait_translation="0")
+            assert again.status_code == 409
+            kept = await export_of(client, token, "class", "json")
+            assert any(row.get("zh") == "留下" for row in kept.json())
+            assert all(row.get("zh") != "可刪" for row in kept.json())
+    finally:
+        await stop(app)
+    restarted = app_for(settings=settings_with(allow_testclient=True, translate=False, data_path=str(path)))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=restarted), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(restarted, client)
+            exported = await export_of(client, token, "class", "json")
+            rows = exported.json()
+            assert any(row.get("zh") == "留下" for row in rows)
+            assert all(row.get("zh") != "可刪" for row in rows)
+    finally:
+        await stop(restarted)
+
+
 def test_device_acceptance_storage_off_export_covers_a_class():
     """A 100-minute export fits in the room caption cap. Storage is for restart, not for that export."""
     text = Path("docs/DEVICE-ACCEPTANCE.md").read_text(encoding="utf-8")

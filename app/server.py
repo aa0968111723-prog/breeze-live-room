@@ -624,22 +624,42 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                     raise HTTPException(status_code=503, detail="字幕儲存暫時無法讀取，沒有刪除") from exc
             if not known:
                 raise HTTPException(status_code=404, detail="找不到這段字幕")
-            pipeline.delete_segment(room_id, parsed_session, parsed_seq)
-            # Queue the delete before yielding so a save already in flight runs first
-            # and a caption accepted after this point is not removed with it.
+            # Seal before the store delete so a late emit cannot save the row again.
+            # Memory and the bus stay until the store accepts the delete. A raised
+            # store error must not report success or hide a row that will replay.
+            pipeline.brace_delete(room_id, parsed_session, parsed_seq)
             pending = store.enqueue_delete_id(room_id, segment_id)
+            try:
+                removed = await asyncio.wrap_future(pending)
+            except Exception:
+                pipeline.abort_delete(room_id, parsed_session, parsed_seq)
+                logging.getLogger("breeze.server").exception("caption store delete failed")
+                return JSONResponse(
+                    status_code=503,
+                    content={"ok": False, "detail": "字幕儲存暫時無法刪除，畫面上的字幕還留著"},
+                )
+            pipeline.delete_segment(room_id, parsed_session, parsed_seq)
             event = bus.delete_caption(room_id, segment_id, parsed_session, parsed_seq)
             _fanout(event)
-            removed = await asyncio.wrap_future(pending)
             return {"ok": True, "deleted": int(removed or 0), "id": segment_id}
-        pipeline.invalidate_room(room_id)
+        pipeline.mute_room(room_id)
         pending = store.enqueue_delete_room(room_id)
+        try:
+            removed = await asyncio.wrap_future(pending)
+        except Exception:
+            pipeline.unmute_room(room_id)
+            logging.getLogger("breeze.server").exception("caption store delete failed")
+            return JSONResponse(
+                status_code=503,
+                content={"ok": False, "detail": "字幕儲存暫時無法刪除，畫面上的字幕還留著"},
+            )
+        pipeline.unmute_room(room_id)
+        pipeline.invalidate_room(room_id)
         event = bus.clear_room(room_id)
         _fanout(event)
         room = book.get(room_id)
         if room is not None:
             room["history"] = []
-        removed = await asyncio.wrap_future(pending)
         return {"ok": True, "deleted": int(removed or 0)}
 
     @app.post("/api/push")

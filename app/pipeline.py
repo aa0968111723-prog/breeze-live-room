@@ -116,6 +116,8 @@ class Pipeline:
         self._room_gen: dict[str, int] = {}
         self._index: dict[tuple[str, str, int], dict] = {}
         self._sealed: dict[str, set[str]] = {}
+        self._braced: dict[str, set[str]] = {}
+        self._muted: set[str] = set()
         self.inflight = 0
         self.rejected = 0
         self.missing_count = 0
@@ -305,6 +307,8 @@ class Pipeline:
         for key in [key for key in self._index if key[0] == room_id]:
             self._index.pop(key, None)
         self._sealed.pop(room_id, None)
+        self._braced.pop(room_id, None)
+        self._muted.discard(room_id)
 
     def note_retained_order(self, room_id: str, rows: list[dict]) -> None:
         """Reseed session ordinals after a close that kept the room's captions.
@@ -489,9 +493,43 @@ class Pipeline:
         held = self._held.get((room_id, session_id))
         return bool(held and seq in held)
 
+    def mute_room(self, room_id: str) -> None:
+        """Hold publishes while a room delete is waiting on the store."""
+        self._muted.add(room_id)
+
+    def unmute_room(self, room_id: str) -> None:
+        self._muted.discard(room_id)
+
+    def brace_delete(self, room_id: str, session_id: str, seq: int) -> None:
+        """Stop a later emit from saving this id before the store delete settles.
+
+        The caption stays in memory. abort_delete undoes a seal this call added.
+        """
+        ident = f"{room_id}:{session_id}:{seq}"
+        key = (room_id, session_id, seq)
+        already = ident in self._sealed.get(room_id, ())
+        self._sealed.setdefault(room_id, set()).add(ident)
+        if not already:
+            self._braced.setdefault(room_id, set()).add(ident)
+        self._tr_epoch[key] = self._tr_epoch.get(key, 0) + 1
+
+    def abort_delete(self, room_id: str, session_id: str, seq: int) -> None:
+        ident = f"{room_id}:{session_id}:{seq}"
+        braced = self._braced.get(room_id)
+        if braced is None or ident not in braced:
+            return
+        braced.discard(ident)
+        sealed = self._sealed.get(room_id)
+        if sealed is not None:
+            sealed.discard(ident)
+
     def delete_segment(self, room_id: str, session_id: str, seq: int) -> None:
         key = (room_id, session_id, seq)
-        self._sealed.setdefault(room_id, set()).add(f"{room_id}:{session_id}:{seq}")
+        ident = f"{room_id}:{session_id}:{seq}"
+        braced = self._braced.get(room_id)
+        if braced is not None:
+            braced.discard(ident)
+        self._sealed.setdefault(room_id, set()).add(ident)
         self._tr_epoch[key] = self._tr_epoch.get(key, 0) + 1
         self._index.pop(key, None)
         self._hashes.pop(key, None)
@@ -511,7 +549,7 @@ class Pipeline:
             self._drain((room_id, session_id))
 
     def _emit(self, segment: Segment) -> None:
-        if self._stale(segment) or self._voided(segment):
+        if segment.room_id in self._muted or self._stale(segment) or self._voided(segment):
             # Do not mark emitted: that would unblock zh_ready into a translation wait
             # for a caption that will never be queued.
             return

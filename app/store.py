@@ -229,7 +229,7 @@ class CaptionStore:
         except Exception:
             self.errors += 1
             log.exception("caption store delete failed")
-            return 0
+            raise
 
     def delete_room(self, room_id: str) -> int:
         if not self.enabled:
