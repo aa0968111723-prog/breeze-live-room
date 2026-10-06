@@ -305,6 +305,27 @@ class Pipeline:
             self._index.pop(key, None)
         self._sealed.pop(room_id, None)
 
+    def note_retained_order(self, room_id: str, rows: list[dict]) -> None:
+        """Reseed session ordinals after a close that kept the room's captions.
+
+        drop_room forgets the counter. The room stays hydrated, so the next
+        session would start at 1 and sort beside the retained lines.
+        """
+        max_ord = 0
+        for row in rows or []:
+            session_id = str(row.get("session_id") or "")
+            try:
+                session_ord = int(row.get("session_ord") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not session_id or session_ord < 1:
+                continue
+            key = (room_id, session_id)
+            self._session_ord[key] = max(int(self._session_ord.get(key, 0)), session_ord)
+            max_ord = max(max_ord, session_ord)
+        if max_ord:
+            self._room_sessions[room_id] = max(int(self._room_sessions.get(room_id, 0)), max_ord)
+
     def _ord(self, room_id: str, session_id: str) -> int:
         key = (room_id, session_id)
         if key not in self._session_ord:

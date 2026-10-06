@@ -221,11 +221,21 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             except Exception:
                 logging.getLogger("breeze.server").exception("caption store lookup failed")
                 keep = True
+        retained: list[dict] = []
         if keep:
             bus.retire(room_id)
+            retained = bus.caption_state(room_id)
+            if not retained and store.enabled:
+                try:
+                    retained = store.room_rows(room_id)
+                except Exception:
+                    logging.getLogger("breeze.server").exception("caption order lookup failed")
+                    retained = []
         else:
             bus.drop(room_id)
         pipeline.drop_room(room_id)
+        if retained:
+            pipeline.note_retained_order(room_id, retained)
 
     def _expire_captions() -> None:
         now = time.time()

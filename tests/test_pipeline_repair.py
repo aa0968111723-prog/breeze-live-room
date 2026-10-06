@@ -1011,6 +1011,72 @@ async def test_emitted_segment_index_respects_caption_cap():
         await stop(app)
 
 
+@pytest.mark.anyio
+async def test_reopen_after_close_or_idle_keeps_session_order(tmp_path):
+    """Closing or idle-reclaiming a room must not hand the next session ordinal 1."""
+    app = app_for(settings=settings_with(
+        allow_testclient=True,
+        translate=False,
+        room_idle_s=30,
+        data_path=str(tmp_path / "order.sqlite3"),
+    ))
+
+    async def sessions(client, token, room, first, second):
+        headers = {**auth(token), "content-type": "application/json"}
+        opened = await client.post("/api/rooms/open", json={"room_id": room}, headers=headers)
+        assert opened.status_code == 200, opened.text
+        for session, text, t0 in ((first, "甲", 0), (second, "乙", 0)):
+            resp = await push(
+                client, token, room, session, 1, text.encode(),
+                t0_ms=t0, t1_ms=t0 + 1000, async_header=True, wait_translation="0",
+            )
+            assert resp.status_code == 200, resp.text
+        return headers
+
+    def assert_order(rows, room_label):
+        ordered = [(row["session_id"], row["zh"], int(row["session_ord"])) for row in rows]
+        assert [item[0] for item in ordered] == ["a", "b", "c"], (room_label, ordered)
+        assert ordered[2][2] > ordered[1][2] > ordered[0][2], (room_label, ordered)
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            headers = await sessions(client, token, "closed", "a", "b")
+            closed = await client.post("/api/rooms/close", json={"room_id": "closed"}, headers=headers)
+            assert closed.status_code == 200, closed.text
+            again = await push(
+                client, token, "closed", "c", 1, "丙".encode(),
+                t0_ms=0, t1_ms=1000, async_header=True, wait_translation="0",
+            )
+            assert again.status_code == 200, again.text
+            exported = await export_of(client, token, "closed", "json")
+            assert_order(exported.json(), "close-json")
+            srt = await export_of(client, token, "closed", "srt")
+            cues = srt_cues(srt.text)
+            assert_monotonic_cues(cues)
+            assert [cue["text"].split("\n", 1)[0] for cue in cues] == ["甲", "乙", "丙"]
+
+            await sessions(client, token, "idle", "a", "b")
+            room = app.state.room_book.rooms["idle"]
+            room["session_active"] = False
+            room["last_active"] = time.monotonic() - 60
+            await app.state.sweep_once()
+            assert app.state.room_book.get("idle") is None
+            nxt = await push(
+                client, token, "idle", "c", 1, "丙".encode(),
+                t0_ms=0, t1_ms=1000, async_header=True, wait_translation="0",
+            )
+            assert nxt.status_code == 200, nxt.text
+            idle_json = await export_of(client, token, "idle", "json")
+            assert_order(idle_json.json(), "idle-json")
+            idle_srt = await export_of(client, token, "idle", "srt")
+            idle_cues = srt_cues(idle_srt.text)
+            assert_monotonic_cues(idle_cues)
+            assert [cue["text"].split("\n", 1)[0] for cue in idle_cues] == ["甲", "乙", "丙"]
+    finally:
+        await stop(app)
+
+
 class _DelayAsr(EchoAsr):
     def __init__(self, delay: float):
         self.delay = delay
