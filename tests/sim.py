@@ -612,6 +612,17 @@ async def _run_100min_async() -> SimReport:
                 listener = Listener(app, room)
                 await listener.__aenter__()
                 listeners.append(listener)
+            # Warm the push path once in a separate room before the class: first form
+            # parse, decode and ASR threads, translate pool, store writer. That one-off
+            # cost is tens of real ms on a CI runner (3.11 showed a 2.35 virtual s wait
+            # at the very first slice only); a real server is warm long before the first
+            # 6 s slice, and the scaled clock would magnify it 1/SCALE times.
+            await open_room(client, token, "warmup")
+            warm = await post_segment(client, token, "warmup", "warmup", 1, "預熱".encode(), 0, 6000)
+            assert warm.status_code == 200, warm.text
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and len(getattr(translator, "finished", [])) < 1:
+                await asyncio.sleep(0.01)
             host = VirtualHost(client, token, room, session)
             pending_snaps: list[asyncio.Task] = []
 
@@ -626,7 +637,7 @@ async def _run_100min_async() -> SimReport:
             if pending_snaps:
                 await asyncio.gather(*pending_snaps)
             await _snapshot(app, client, token, SEGMENTS, snapshots)
-            await _wait_translations(app, translator, SEGMENTS)
+            await _wait_translations(app, translator, SEGMENTS + 1)
             # flush is this branch's async store. Main writes each row before publish returns.
             flush = getattr(app.state.store, "flush", None)
             if flush is not None:
@@ -653,7 +664,7 @@ async def _run_100min_async() -> SimReport:
                 responses=list(host.responses),
                 final_metrics=final,
                 results_at={int(item["seq"]): int(item["results"]) for item in snapshots},
-                emitted=len(pipe._emitted_segs),
+                emitted=sum(1 for key in pipe._emitted_segs if key[0] == room),  # the warm-up room is not the class
                 bus_log=len(app.state.bus._log.get(room, [])),
                 bus_by_room=len(app.state.bus.by_room.get(room, [])),
                 state_count=len(state),

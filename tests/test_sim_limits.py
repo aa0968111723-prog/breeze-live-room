@@ -81,7 +81,10 @@ def test_room_reclaim_after_30min_only_when_idle():
     """B-L3. RoomBook reclaims at idle_s only when there is no listener and no active session."""
     book = RoomBook(8, 1800)
     room = book.open("class")
-    opened = room["last_active"]
+    # A whole-number base keeps opened + 1800 - opened exactly 1800.0. With a raw
+    # monotonic value (large on a long-running Windows runner) the float subtraction
+    # can land at 1799.9999999 and the boundary check flips.
+    room["last_active"] = opened = 1000.0
     assert book.sweep(now=opened + 1799) == []
     assert "class" in book.rooms
     room["listeners"].add(object())
