@@ -685,16 +685,20 @@ async def test_srt_100_minute_session_formats_hours(tmp_path):
             room_caption_cap=5000,
         )
         app = app_for(settings=settings, asr=asr)
+        started_trace = False
         try:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
                 token = await token_of(app, client)
-                if not tracemalloc.is_tracing():
+                before = 0
+                if track_memory and not tracemalloc.is_tracing():
                     tracemalloc.start()
-                before = tracemalloc.get_traced_memory()[0]
+                    started_trace = True
+                if track_memory:
+                    before = tracemalloc.get_traced_memory()[0]
                 cursor_at_minute_5 = await _push_half(app, client, token, "class", "s1", half, lambda session, seq: f"{session}-{seq}")
                 await _push_half(app, client, token, "class", "s2", half, lambda session, seq: f"{session}-{seq}")
-                after, peak = tracemalloc.get_traced_memory()
                 if track_memory:
+                    after, peak = tracemalloc.get_traced_memory()
                     delta = max(0, after - before)
                     Path("/tmp/breeze_mem_1000.txt").write_text(
                         f"delta={delta}\npeak={peak}\nindex={len(app.state.pipeline._index)}\n"
@@ -703,7 +707,6 @@ async def test_srt_100_minute_session_formats_hours(tmp_path):
                         encoding="utf-8",
                     )
                     assert delta < 80_000_000, delta
-                    tracemalloc.stop()
                 assert len(app.state.bus.history("class")) <= 200
                 state = app.state.bus.caption_state("class")
                 assert len(state) == half * 2
@@ -743,6 +746,8 @@ async def test_srt_100_minute_session_formats_hours(tmp_path):
                     assert again.json()["zh"] == "s1-3"
                     assert asr.calls == calls
         finally:
+            if started_trace:
+                tracemalloc.stop()
             await stop(app)
 
     await run(None, True)
