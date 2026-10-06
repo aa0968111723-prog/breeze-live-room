@@ -76,11 +76,14 @@ def _early_key(request: Request) -> tuple[str, str, int] | None:
         return None
 
 
-async def _wait_until_join_ready(pipeline: Pipeline, key: tuple[str, str, int]) -> None:
+async def _wait_until_join_ready(pipeline: Pipeline, key: tuple[str, str, int], timeout: float) -> None:
     """Owner has reserved this segment but not registered a flight. Do not take another slot."""
+    deadline = time.monotonic() + max(0.0, float(timeout))
     while key in pipeline._reserved or key in pipeline._active:
         flight = pipeline._flight.get(key)
         if flight is not None and not flight.done():
+            return
+        if time.monotonic() >= deadline:
             return
         await asyncio.sleep(0.01)
 
@@ -665,7 +668,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         try:
             removed = await asyncio.wrap_future(pending)
         except Exception:
-            pipeline.unmute_room(room_id)
+            pipeline.unmute_room(room_id, abort=True)
             logging.getLogger("breeze.server").exception("caption store delete failed")
             return JSONResponse(
                 status_code=503,
@@ -754,7 +757,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                     held = False
                 raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
             if not held and (key in pipeline._reserved or key in pipeline._active):
-                await _wait_until_join_ready(pipeline, key)
+                await _wait_until_join_ready(pipeline, key, pipeline._result_wait_s())
             # Default still waits for English. Opt in to return at Chinese: form
             # wait_translation=0 and/or header x-breeze-async-translation: 1.
             opt_out = _field(form, request, "wait_translation").strip().lower() in {"0", "false"}
