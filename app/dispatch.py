@@ -5,6 +5,8 @@ import secrets
 import time
 from typing import Awaitable, Callable
 
+from app.aio import cancellation_pending, wait_bounded
+
 _PASS = (
     "type", "id", "room_id", "session_id", "session_ord", "seq", "version",
     "zh", "en", "status", "translate_status", "error", "t0_ms", "t1_ms", "zh_raw",
@@ -278,11 +280,26 @@ class ListenerSlot:
 
     async def _run(self) -> None:
         try:
-            while True:
+            while self.alive:
+                if cancellation_pending():
+                    raise asyncio.CancelledError()
                 msg = await self.q.get()
-                if msg is None:
+                if msg is None or not self.alive:
                     return
-                await asyncio.wait_for(self.sender(msg), timeout=self.send_timeout)
+                if cancellation_pending():
+                    raise asyncio.CancelledError()
+                try:
+                    await wait_bounded(self.sender(msg), self.send_timeout)
+                except asyncio.TimeoutError:
+                    self.alive = False
+                    return
+                if cancellation_pending():
+                    raise asyncio.CancelledError()
+                if not self.alive:
+                    return
+        except asyncio.CancelledError:
+            self.alive = False
+            raise
         except Exception:
             self.alive = False
         finally:
@@ -305,8 +322,18 @@ class ListenerSlot:
             self.q.put_nowait(None)
         except asyncio.QueueFull:
             pass
-        if self.task:
-            try:
-                await asyncio.wait_for(self.task, timeout=0.2)
-            except Exception:
-                self.task.cancel()
+        task = self.task
+        if task is None:
+            return
+        try:
+            await wait_bounded(task, 0.2)
+        except asyncio.CancelledError:
+            # Awaiting an already-cancelled sender raises CancelledError here
+            # even when close() itself was not cancelled.
+            if not task.done():
+                task.cancel()
+            if cancellation_pending():
+                raise
+        except Exception:
+            if not task.done():
+                task.cancel()

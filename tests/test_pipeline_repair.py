@@ -1329,3 +1329,92 @@ def test_device_acceptance_storage_off_export_covers_a_class():
     statuses = [line.strip() for line in text.splitlines() if line.strip().startswith("- 狀態：")]
     assert statuses
     assert statuses == ["- 狀態：尚未驗證"] * len(statuses)
+
+
+@pytest.mark.anyio
+async def test_cancel_finishes_listener_and_sender():
+    """Python 3.11 wait_for can swallow a cancel that lands as the inner await finishes."""
+    from app.dispatch import ListenerSlot
+
+    async def finishes(task: asyncio.Task, seconds: float = 0.5) -> bool:
+        if task.done():
+            return True
+        try:
+            async with asyncio.timeout(seconds):
+                await asyncio.shield(task)
+        except (TimeoutError, asyncio.CancelledError):
+            return task.done()
+        return task.done()
+
+    async def one_sender() -> None:
+        release = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def sender(_msg, release=release, entered=entered) -> None:
+            entered.set()
+            await release.wait()
+
+        slot = ListenerSlot(sender, send_timeout=30)
+        slot.start()
+        assert slot.task is not None
+        assert slot.offer({"n": 1})
+        await entered.wait()
+        release.set()
+        slot.task.cancel()
+        assert await finishes(slot.task), "sender kept running after cancel"
+
+    async def one_close() -> None:
+        release = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def sender(_msg, release=release, entered=entered) -> None:
+            entered.set()
+            await release.wait()
+
+        slot = ListenerSlot(sender, send_timeout=30)
+        slot.start()
+        assert slot.task is not None
+        assert slot.offer({"n": 1})
+        await entered.wait()
+        release.set()
+        try:
+            async with asyncio.timeout(1):
+                await slot.close()
+        except TimeoutError as exc:
+            raise AssertionError("sender close hung") from exc
+        assert slot.task.done()
+
+    try:
+        async with asyncio.timeout(20):
+            for _ in range(30):
+                await one_sender()
+            for _ in range(15):
+                await one_close()
+            app = app_for(settings=settings_with(allow_testclient=True, translate=False, idle_timeout_s=30))
+            try:
+                async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+                    token = await token_of(app, client)
+                    opened = await client.post(
+                        "/api/rooms/open",
+                        json={"room_id": "class"},
+                        headers={**auth(token), "content-type": "application/json"},
+                    )
+                    assert opened.status_code == 200, opened.text
+                    for _ in range(15):
+                        sock = Socket(app, "/ws/listen?room_id=class")
+                        await sock.__aenter__()
+                        hello = await sock.recv()
+                        assert hello["type"] == "hello"
+                        await sock.inc.put({"type": "websocket.receive", "text": '{"type":"pong"}'})
+                        assert sock.task is not None
+                        sock.task.cancel()
+                        assert await finishes(sock.task), "listener kept running after cancel"
+                        assert not app.state.room_book.rooms["class"]["listeners"]
+            finally:
+                try:
+                    async with asyncio.timeout(2):
+                        await stop(app)
+                except TimeoutError:
+                    pass
+    except TimeoutError as exc:
+        raise AssertionError("cancel test exceeded its real timeout") from exc

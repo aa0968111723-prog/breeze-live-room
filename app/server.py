@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from app.aio import cancellation_pending, wait_bounded
 from app.asr import CliAsr, ResidentAsr
 from app.audio import AudioError, convert_to_wav, ffmpeg_bin, wav_duration_seconds
 from app.auth import new_host_token, require_host, require_local_host
@@ -789,10 +790,16 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         ping_task = asyncio.create_task(_ping(conn, settings))
         try:
             while True:
+                if cancellation_pending():
+                    raise asyncio.CancelledError()
                 try:
-                    raw = await asyncio.wait_for(ws.receive_text(), timeout=settings.idle_timeout_s)
+                    raw = await wait_bounded(ws.receive_text(), settings.idle_timeout_s)
                 except asyncio.TimeoutError:
                     break
+                except asyncio.CancelledError:
+                    raise
+                if cancellation_pending():
+                    raise asyncio.CancelledError()
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:

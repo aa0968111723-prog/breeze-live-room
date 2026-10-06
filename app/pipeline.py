@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 
+from app.aio import cancellation_pending, wait_bounded
 from app.asr import AsrResult
 from app.audio import AudioError, wav_duration_seconds, wav_rms
 from app.settings import Settings
@@ -969,7 +970,7 @@ class Pipeline:
         try:
             segment.status = "decoding"
             try:
-                wav = await asyncio.wait_for(
+                wav = await wait_bounded(
                     asyncio.to_thread(self._decode_sync, work, audio, decoder),
                     timeout=self.settings.decode_timeout_s,
                 )
@@ -1004,7 +1005,7 @@ class Pipeline:
             segment.status = "transcribing"
             try:
                 async with self._asr_slots:
-                    asr: AsrResult = await asyncio.wait_for(
+                    asr: AsrResult = await wait_bounded(
                         asyncio.to_thread(self.asr.transcribe, wav, self.prompt),
                         timeout=self.settings.asr_timeout_s,
                     )
@@ -1221,7 +1222,7 @@ class Pipeline:
         self._waiters.setdefault(segment.key, []).append(fut)
         self._put_translation(segment)
         try:
-            await asyncio.wait_for(fut, timeout=max(0.1, float(self.settings.translate_timeout_s) + 1.0))
+            await wait_bounded(fut, timeout=max(0.1, float(self.settings.translate_timeout_s) + 1.0))
         except asyncio.TimeoutError:
             self._discard_waiter(segment.key, fut)
             if segment.translate_queued and segment.status == "zh_ready":
@@ -1232,6 +1233,8 @@ class Pipeline:
     async def _translate_loop(self) -> None:
         assert self._translate_q is not None
         while True:
+            if cancellation_pending():
+                raise asyncio.CancelledError()
             try:
                 epoch, enqueued_at, segment = await self._translate_q.get()
             except asyncio.CancelledError:
@@ -1286,7 +1289,7 @@ class Pipeline:
         assert self._translate_pool is not None
         cfut = self._translate_pool.submit(partial(self.translator.translate, zh_snapshot, **kwargs))
         try:
-            translated: TranslateResult = await asyncio.wait_for(asyncio.wrap_future(cfut), timeout=self.settings.translate_timeout_s)
+            translated: TranslateResult = await wait_bounded(asyncio.wrap_future(cfut), timeout=self.settings.translate_timeout_s)
         except asyncio.TimeoutError:
             if cancel is not None:
                 cancel.set()
