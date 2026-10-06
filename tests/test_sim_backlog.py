@@ -36,7 +36,7 @@ def report_scale():
 
 
 def test_100min_latency_no_drift(report):
-    """B-a2. Thresholds are the spec's 10/15/20/3 plus the larger of 20% or 2 virtual seconds."""
+    """B-a2. Thresholds are the spec's 10/15/20/3. Windows may add 20% and nothing else."""
     values = latencies(report)
     assert len(values) == SEGMENTS
     first = values[:100]

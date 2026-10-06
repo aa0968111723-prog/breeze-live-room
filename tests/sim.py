@@ -58,8 +58,18 @@ def virtual_s(real_s: float) -> float:
 
 
 def vlimit(limit: float) -> float:
-    """More generous of ±20% or +2 virtual seconds, not both stacked."""
-    return limit + max(limit * 0.2, 2.0)
+    """Spec threshold in virtual seconds.
+
+    Windows is the only platform that gets any slack, and only 20%. Its timer
+    tick is about 15.6 ms, which at the Windows sim scale is a large fraction
+    of a short limit. A zero-wait check and the SRT end bound do not go through
+    here: one Windows 3.11 run booked a 109 ms stall as 5.45 virtual seconds
+    of recorder pause (scale 0.02) and the same stretch on the last cue. That
+    is a simulator stall while a slot was still held, not a wider spec limit.
+    """
+    if sys.platform == "win32":
+        return limit * 1.2
+    return limit
 
 
 def percentile(values: list[float], p: float) -> float:
