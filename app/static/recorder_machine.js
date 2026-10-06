@@ -13,6 +13,7 @@ export function createCaptureController(deps) {
   const uploads = [];
   const inflight = new Set();
   const maxInflight = deps.maxInflight || 2;
+  let flightEpoch = 0;
   let timerBusy = false;
   let waitingAt = null;
   const gaps = [];
@@ -75,24 +76,65 @@ export function createCaptureController(deps) {
     });
   }
 
+  function abandonInflight() {
+    flightEpoch += 1;
+    inflight.clear();
+  }
+
   function trackUpload(meta, blob) {
     if (!blob || typeof blob.size !== "number" || blob.size <= 0) return Promise.resolve();
+    const epoch = flightEpoch;
     const job = Promise.resolve()
       .then(() => deps.upload(meta, blob))
       .then((result) => {
+        if (epoch !== flightEpoch) return;
         uploads.push({ meta, bytes: blob.size, result });
         if (uploads.length > 200) uploads.shift();
       }, (err) => {
+        if (epoch !== flightEpoch) return;
         if (session && meta.sessionId === session.id) lastError = err?.message || "字幕段上傳失敗";
         try { deps.onUploadError?.(meta, err); } catch { /* host paint */ }
       });
     inflight.add(job);
-    return job.finally(() => inflight.delete(job));
+    return job.finally(() => {
+      if (epoch === flightEpoch) inflight.delete(job);
+    });
+  }
+
+  const schedule = deps.schedule || ((fn, ms) => setTimeout(fn, ms));
+  const clearSchedule = deps.clearSchedule || ((id) => clearTimeout(id));
+  const uploadTimeoutMs = Number(deps.uploadTimeoutMs) > 0 ? Number(deps.uploadTimeoutMs) : 300000;
+
+  function waitFor(promise, ms) {
+    let timer = null;
+    let timedOut = false;
+    const timeout = new Promise((resolve) => {
+      timer = schedule(() => {
+        timedOut = true;
+        resolve("timeout");
+      }, ms);
+    });
+    return Promise.race([
+      Promise.resolve(promise).then(() => "done", () => "done"),
+      timeout,
+    ]).finally(() => {
+      if (timer != null) clearSchedule(timer);
+    }).then((result) => result === "timeout" || timedOut);
   }
 
   async function settleUploads() {
+    const deadline = Date.now() + uploadTimeoutMs;
     while (inflight.size) {
-      await Promise.allSettled([...inflight]);
+      const left = deadline - Date.now();
+      if (left <= 0) {
+        lastError = lastError || "上傳逾時，已停止等待";
+        break;
+      }
+      const timedOut = await waitFor(Promise.allSettled([...inflight]), left);
+      if (timedOut) {
+        lastError = lastError || "上傳逾時，已停止等待";
+        break;
+      }
     }
   }
 
@@ -104,9 +146,11 @@ export function createCaptureController(deps) {
     if (!current) return Promise.resolve();
     // Stay tracked until the upload itself is queued. Do not await it: the next
     // segment must be able to record while up to maxInflight uploads run.
+    const epoch = flightEpoch;
     const job = (async () => {
       try {
         const blob = await stopRecorder(current);
+        if (epoch !== flightEpoch) return;
         if (!meta || !activeSession || !blob || typeof blob.size !== "number" || blob.size <= 0) return;
         const t1 = Date.now() - activeSession.startedAt;
         trackUpload({ ...meta, t1_ms: t1 }, blob);
@@ -115,7 +159,9 @@ export function createCaptureController(deps) {
       }
     })();
     inflight.add(job);
-    return job.finally(() => inflight.delete(job));
+    return job.finally(() => {
+      if (epoch === flightEpoch) inflight.delete(job);
+    });
   }
 
   async function beginSegment(my) {
@@ -184,6 +230,7 @@ export function createCaptureController(deps) {
     get pendingRoom() { return pendingRoom; },
     get lastError() { return lastError; },
     get inflight() { return inflight.size; },
+    get lastSeq() { return seq; },
     get gaps() { return gaps; },
     canEditRoom() { return state === "idle" || state === "error"; },
     fail,
@@ -191,6 +238,7 @@ export function createCaptureController(deps) {
       if (state === "preparing" || state === "recording" || state === "waiting" || state === "draining") {
         throw new Error("已經在聽，請先停止");
       }
+      abandonInflight();
       const my = ++generation;
       const pinnedRoom = String(deps.roomId() || "class");
       const pinnedId = deps.newId();
@@ -234,7 +282,8 @@ export function createCaptureController(deps) {
       setState("draining");
       clearTimer();
       try {
-        await finishCurrent();
+        const timedOut = await waitFor(finishCurrent(), uploadTimeoutMs);
+        if (timedOut) lastError = lastError || "上傳逾時，已停止等待";
         releaseStream();
         recorder = null;
         await settleUploads();

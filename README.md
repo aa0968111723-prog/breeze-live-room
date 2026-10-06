@@ -26,6 +26,8 @@
 
 正式安裝包有兩種，不要裝進同一個資料夾。App 用 `Breeze-Live-Room-Setup.exe`。原始碼包在 [GitHub Releases](https://github.com/aa0968111723-prog/breeze-live-room/releases)：下載 ZIP、解壓縮後雙擊 `install.bat`；第一次安裝自動準備 Python、套件、模型與工具，並建立啟動／更新／診斷桌面捷徑。
 
+桌面捷徑的檢查、結束代碼與 `BREEZE_SKIP_SHORTCUT`／`BREEZE_REQUIRE_SHORTCUT` 見 [安裝說明](docs/INSTALL.md#安裝)。
+
 關閉字幕程式後雙擊 `update.bat` 更新；`rollback.bat` 回復前版。更新保留 `.env` 與字幕資料，先核對發布包 SHA256、準備新環境並備份。維護者推送版本標籤後，GitHub 自動測試 Windows 一鍵安裝與真實辨識，通過才發布。尚未建立正式 Release 時更新器會明確提示。完整流程見 [長期維護說明](docs/MAINTENANCE.md)。
 
 ## 中文與英譯
@@ -50,6 +52,10 @@
 
 Windows workflow 增加 Python 3.11／3.12、錄音與觀眾端測試，以及含中文／空白路徑的安裝與真實推論檢查。執行結果以該提交的 GitHub Actions 為準；不先宣稱通過。
 
-目前未完成真實麥克風、30 分鐘中文、2 小時場次、3 台手機及真金鑰英譯驗收。瀏覽器整合在本輪環境受阻，Chromium 下載回傳無效檔案。正式使用門檻見 [驗收清單](docs/RELEASE-CHECKLIST.md)。
+目前未完成真實麥克風、30 分鐘中文、2 小時場次、3 台手機及真金鑰英譯驗收。瀏覽器整合在本輪環境受阻，Chromium 下載回傳無效檔案。正式使用門檻見 [驗收清單](docs/RELEASE-CHECKLIST.md)。實機項目與門檻見 [實機驗收清單](docs/DEVICE-ACCEPTANCE.md)，每一項都還是尚未驗證。
+
+## 實機輔助檢查
+
+在主持機本機（才能拿到 loopback 權杖）對已啟動的服務執行 `scripts/device_check.py`。它不會印出權杖。`watch` 每隔數秒把佇列深度、拒絕、缺段與記憶體寫進 CSV／JSON；`export` 下載該房的 JSON／SRT，並對編號、時間格式、單調、重疊、結束晚於開始、seq 是否重複、缺號各印 PASS／FAIL；`listen` 以聽眾身份連上 `/ws/listen`，記錄每則字幕的到達時間。沒有安裝 `websockets` 時，`listen` 會說明並略過，不影響另外兩個指令。
 
 本版未包含前次提出的全部 10 個追加面向；那些是後續功能工作包。

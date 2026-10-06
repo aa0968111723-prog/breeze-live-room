@@ -34,6 +34,7 @@ jobs:
         shell: pwsh
         env:
           BREEZE_NONINTERACTIVE: "1"
+          BREEZE_REQUIRE_SHORTCUT: "1"
         run: |
           $target = Join-Path $env:RUNNER_TEMP 'Breeze test 測試'
           New-Item -ItemType Directory -Force $target | Out-Null
@@ -43,7 +44,11 @@ jobs:
             cmd /c install.bat
             if ($LASTEXITCODE -ne 0) { throw 'Windows install failed' }
             powershell -NoProfile -ExecutionPolicy Bypass -File .\install-shortcut.ps1 -CheckOnly
-            if ($LASTEXITCODE -ne 0) { throw 'Desktop shortcut target is incorrect' }
+            if ($LASTEXITCODE -eq 2) { throw 'Desktop shortcut was not created (CheckOnly exit 2)' }
+            elseif ($LASTEXITCODE -eq 1) { throw 'Desktop shortcut target or working directory is incorrect (CheckOnly exit 1)' }
+            elseif ($LASTEXITCODE -ne 0) { throw "Desktop shortcut check failed (exit $LASTEXITCODE)" }
+            powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\ci\read_shortcuts.ps1 -Out data\shortcut-readback.json
+            if ($LASTEXITCODE -ne 0) { throw 'Shortcut read-back mismatch' }
             cmd /c doctor.bat
             if ($LASTEXITCODE -ne 0) { throw 'Preflight failed' }
             cmd /c verify.bat
@@ -59,5 +64,7 @@ jobs:
         if: always()
         with:
           name: windows-runtime-check
-          path: ${{ runner.temp }}/Breeze test 測試/data/runtime-check*.json
+          path: |
+            ${{ runner.temp }}/Breeze test 測試/data/runtime-check*.json
+            ${{ runner.temp }}/Breeze test 測試/data/shortcut-readback.json
           if-no-files-found: ignore

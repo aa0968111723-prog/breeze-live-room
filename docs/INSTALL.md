@@ -19,6 +19,8 @@ App 安裝：雙擊 `Breeze-Live-Room-Setup.exe`。不必先裝 Python。設定�
 6. 首次複製 `.env.example` 為 `.env`；既有檔案保留。沒有金鑰就是中文模式。
 7. 所有啟動前檢查通過才顯示完成；桌面捷徑建立失敗時仍可使用 `start.bat`。
 
+安裝會在桌面建立三個捷徑：Breeze Live Room（`start.bat`）、Breeze Update（`update.bat`）、Breeze Doctor（`doctor.bat`）。`install-shortcut.ps1 -CheckOnly` 的結束代碼：0 表示正常；1 表示目標或目錄不正確（例如搬移安裝資料夾後），請再執行 `install.bat` 或 `install-shortcut.ps1`；2 表示捷徑不存在。`BREEZE_SKIP_SHORTCUT=1` 略過捷徑。`BREEZE_REQUIRE_SHORTCUT=1` 時捷徑失敗會讓安裝失敗；未設定時失敗不影響安裝。`install_runtime` 先讀行程環境變數，`.env` 只補尚未設定的鍵（`app/settings.fill_process_environ`）。第一次安裝時 `.env` 還不存在，請用環境變數設定。Breeze Update 捷徑執行的是沒有 `--check` 的 `update.bat`，雙擊會進行真正的更新。
+
 ## 主持機速度自檢
 
 先關閉字幕服務，再雙擊 `verify.bat`。它會使用固定公開英文樣本完成兩次真實本機辨識，不會送到翻譯 API，結果存到 `data/runtime-check.json`。

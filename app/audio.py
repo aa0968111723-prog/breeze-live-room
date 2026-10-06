@@ -185,6 +185,8 @@ async def convert_to_wav_async(src: Path, work: Path, ffmpeg: str, timeout: int 
     """Run ffmpeg off the event loop and kill it when the timeout fires."""
     import asyncio
 
+    from app.aio import wait_bounded
+
     wav = work / "audio.wav"
     proc = await asyncio.create_subprocess_exec(
         ffmpeg, "-y", "-i", str(src), "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(wav),
@@ -192,7 +194,7 @@ async def convert_to_wav_async(src: Path, work: Path, ffmpeg: str, timeout: int 
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        _, stderr = await wait_bounded(proc.communicate(), timeout)
     except TimeoutError as exc:
         raise AudioError(422, "ffmpeg 轉檔逾時") from exc
     finally:
