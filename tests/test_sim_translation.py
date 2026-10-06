@@ -36,9 +36,15 @@ def _seq(zh: str) -> int:
 
 @pytest.mark.anyio
 async def test_push_returns_before_slow_translation():
-    """B-b1. Opt-in push returns at Chinese. English arrives later on the listener."""
+    """B-b1. Opt-in push returns at Chinese. English arrives later on the listener.
+
+    The translation takes the spec's 40 virtual s. translate_timeout_s is raised to 60
+    virtual s for this test only: with the default 40 s timeout a 40 s translation
+    races its own timeout and English legitimately ends as "timeout" on a slow runner.
+    """
     translator = ScriptedTranslator(lambda zh: ("ok", 40.0))
-    async with serving(asr=TextAsr(1.5), translator=translator) as (app, client, token):
+    settings = sim_settings(translate_timeout_s=60 * SCALE)
+    async with serving(settings=settings, asr=TextAsr(1.5), translator=translator) as (app, client, token):
         await open_room(client, token, "class")
         async with Listener(app, "class") as listener:
             started = __import__("time").monotonic()

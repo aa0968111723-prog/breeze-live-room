@@ -28,12 +28,17 @@ from tests.test_round2 import auth, breaking_decoder
 
 @pytest.mark.anyio
 async def test_stop_latency_not_bound_by_translation():
-    """B-f1. Opt-in push returns at Chinese, so stop is ASR plus the short flush grace, not 40s of English."""
+    """B-f1. Opt-in push returns at Chinese, so stop is ASR plus the short flush grace, not 40s of English.
+
+    stop() is pressed right after the fifth slice is handed to upload (drain=False), so
+    the measured time includes settling that last upload, as host.html does before
+    /api/session/end. On main that upload waits for English (about 40 virtual s).
+    """
     translator = ScriptedTranslator(lambda zh: ("ok", 40.0))
     async with serving(asr=TextAsr(1.5), translator=translator) as (app, client, token):
         await open_room(client, token, "class")
         host = VirtualHost(client, token, "class", "s")
-        await host.run(5)
+        await host.run(5, drain=False)
         resp = await host.stop()
         assert resp.status_code == 200, resp.text
         assert host.stop_elapsed_v <= vlimit(3.5)

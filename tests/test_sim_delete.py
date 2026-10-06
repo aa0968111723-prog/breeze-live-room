@@ -70,7 +70,14 @@ async def test_delete_notifies_listeners():
 
 @pytest.mark.anyio
 async def test_inflight_translation_does_not_resurrect():
-    """B-d3. English that finishes after the delete must not come back."""
+    """B-d3. English that finishes after the delete must not come back.
+
+    The three uploads are left running (drain=False) and the room is deleted as soon
+    as all three zh_ready lines are on the listener, while their 20 virtual s English
+    is still in flight. Then every translation is allowed to finish and the test waits
+    a further 30 virtual s before checking store, bus, export and the listener.
+    """
+    import asyncio
     import time
 
     translator = ScriptedTranslator(lambda zh: ("ok", 20.0))
@@ -78,19 +85,26 @@ async def test_inflight_translation_does_not_resurrect():
         await open_room(client, token, "class")
         async with Listener(app, "class") as listener:
             host = VirtualHost(client, token, "class", "s")
-            await host.run(3, pace=False)
+            await host.run(3, pace=False, drain=False)
             assert await listener.wait_for(
                 lambda: len({m.get("seq") for m in listener.messages if m.get("status") == "zh_ready"}) >= 3,
                 10,
             )
             before = len(listener.messages)
+            assert len(translator.finished) < 3, "delete must happen while English is still in flight"
             await _delete(client, token, "class")
-            deadline = time.monotonic() + 2
+            if host._tasks:
+                await asyncio.wait(host._tasks)
+            deadline = time.monotonic() + 10
             while time.monotonic() < deadline and len(translator.finished) < len(translator.started):
-                await __import__("asyncio").sleep(0.01)
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(30 * SCALE)
             ids = {"class:s:1", "class:s:2", "class:s:3"}
             later = [m for m in listener.messages[before:] if m.get("id") in ids and m.get("type") != "captions_cleared"]
             assert later == []
+        flush = getattr(app.state.store, "flush", None)
+        if flush is not None:
+            await asyncio.to_thread(flush)
         assert await export_json(client, token, "class") == []
         assert app.state.store.room_rows("class") == []
         assert app.state.bus.history("class") == []

@@ -12,6 +12,7 @@ of asyncio delay cannot stretch a 1000-segment SRT by minutes.
 from __future__ import annotations
 
 import asyncio
+import gc
 import io
 import json
 import os
@@ -428,7 +429,9 @@ class VirtualHost:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def run(self, count: int, text_of=None, pace: bool = True, on_each=None) -> None:
+    async def run(self, count: int, text_of=None, pace: bool = True, on_each=None, drain: bool = True) -> None:
+        """Record ``count`` slices. drain=False returns once the last slice is handed to
+        upload, like pressing stop right after speaking; stop() then settles uploads."""
         text_of = text_of or (lambda i: f"第{i}句")
         for seq in range(1, count + 1):
             await self._wait_slot()
@@ -446,6 +449,8 @@ class VirtualHost:
             self._track(task)
             if on_each is not None:
                 task.add_done_callback(lambda done, seq=seq: on_each(seq))
+        if not drain:
+            return
         if self._tasks:
             await asyncio.wait(self._tasks)
         for task in self._all:
@@ -569,6 +574,14 @@ async def _run_100min_async() -> SimReport:
     tracing = tracemalloc.is_tracing()
     if not tracing:
         tracemalloc.start()
+    # Host, server and both listeners share one process here, and every real
+    # millisecond is 1/SCALE virtual milliseconds. A full GC pass over pytest,
+    # httpx and the app's import-time objects can block the loop for tens of ms
+    # on a CI runner, which the recorder model would book as a multi-second
+    # pause that a browser plus a separate server never see. Freeze what exists
+    # before the class starts so collections only scan objects made during it.
+    gc.collect()
+    gc.freeze()
     snapshots: list[dict] = []
     listeners: list[Listener] = []
     host: VirtualHost | None = None
@@ -635,6 +648,7 @@ async def _run_100min_async() -> SimReport:
         await stop(app)
         if not tracing and tracemalloc.is_tracing():
             tracemalloc.stop()
+        gc.unfreeze()
     return report
 
 
