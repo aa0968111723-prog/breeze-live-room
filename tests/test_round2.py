@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -84,16 +85,42 @@ def app_for(**kwargs):
     )
 
 
+def append_listen_key(app, path: str) -> str:
+    """Present the open room's listen key. A path that already has k= is left alone."""
+    base, _, query = path.partition("?")
+    room = "class"
+    if query:
+        for part in query.split("&"):
+            name, _, value = part.partition("=")
+            if name == "k" and value:
+                return path
+            if name == "room_id" and value:
+                room = urllib.parse.unquote(value)
+    book = getattr(app.state, "room_book", None)
+    room_obj = book.get(room) if book is not None else None
+    key = str(room_obj.get("listen_key") or "") if room_obj else ""
+    if not key:
+        return path
+    quoted = urllib.parse.quote(key, safe="")
+    if query:
+        return f"{base}?{query}&k={quoted}"
+    return f"{base}?k={quoted}"
+
+
 class Socket:
-    def __init__(self, app, path: str):
+    def __init__(self, app, path: str, client=("127.0.0.1", 5000), headers=None, with_key: bool = True):
         self.app = app
         self.path = path
+        self.client = client
+        self.headers = headers
+        self.with_key = with_key
         self.out: asyncio.Queue = asyncio.Queue()
         self.inc: asyncio.Queue = asyncio.Queue()
         self.task: asyncio.Task | None = None
 
     async def __aenter__(self):
-        path, _, query = self.path.partition("?")
+        path = append_listen_key(self.app, self.path) if self.with_key else self.path
+        path, _, query = path.partition("?")
         scope = {
             "type": "websocket",
             "asgi": {"version": "3.0"},
@@ -102,8 +129,8 @@ class Socket:
             "path": path,
             "raw_path": path.encode(),
             "query_string": query.encode(),
-            "headers": [(b"host", b"127.0.0.1:8780")],
-            "client": ("127.0.0.1", 5000),
+            "headers": self.headers if self.headers is not None else [(b"host", b"127.0.0.1:8780")],
+            "client": self.client,
             "server": ("127.0.0.1", 8780),
             "subprotocols": [],
         }
