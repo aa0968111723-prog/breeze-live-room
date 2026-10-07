@@ -69,6 +69,57 @@ def parse_glossary(raw: str, limit: int = 40) -> list[dict]:
     return rows
 
 
+# These separators are line breaks for str.splitlines but must not wipe a glossary.
+_LEGACY_BREAKS = ("\x85", "\u2028", "\u2029")
+
+
+def strict_legacy_rows(raw: str, limit: int = 40, max_en: int = 80) -> tuple[list[dict], list[dict]]:
+    """Parse a host textarea without dropping rows or cutting English short.
+
+    Any rejected entry means the caller must not save. An empty box is rejected
+    so it cannot clear the room. `parse_glossary` still truncates for old callers.
+    """
+    if not isinstance(raw, str):
+        return [], [{"line": 0, "reason": "text 必須是文字"}]
+    for mark in _LEGACY_BREAKS:
+        if mark in raw:
+            return [], [{"line": 0, "reason": "術語含有不可見的換行，沒有寫入"}]
+    rows: list[dict] = []
+    rejected: list[dict] = []
+    for line_no, line in enumerate(raw.split("\n"), start=1):
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        split = _split_glossary(text)
+        if split is None:
+            continue
+        left, right = split
+        en = right.strip()
+        if "|" in left:
+            parts = [part.strip() for part in left.split("|")]
+            zh = parts[0].strip()
+            aliases = [part for part in parts[1:] if part]
+        else:
+            zh = left.strip()
+            aliases = []
+        if not zh or not en:
+            continue
+        if len(rows) >= limit:
+            return [], [{"line": line_no, "reason": f"術語超過 {limit} 條"}]
+        if len(en) > max_en:
+            rejected.append({"line": line_no, "reason": f"第 {line_no} 行的英文超過 {max_en} 字"})
+            continue
+        row = {"zh": zh, "en": en}
+        if aliases:
+            row["aliases"] = aliases
+        rows.append(row)
+    if rejected:
+        return [], rejected
+    if not rows:
+        return [], [{"line": 0, "reason": "沒有有效的術語，不會清空這個房間的詞表"}]
+    return rows, []
+
+
 # A single session's t0/t1 stay relative to that session. Export places later sessions
 # after the previous cue so a 100-minute class, and a second take, stay monotonic.
 _MAX_TIMELINE_MS = 48 * 60 * 60 * 1000

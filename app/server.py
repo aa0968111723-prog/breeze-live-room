@@ -28,7 +28,7 @@ from app.rooms import RoomBook, RoomIdError, validate_room_id, validate_session_
 from app.settings import Settings, fill_process_environ
 from app.share import list_share_hosts, listen_url
 from app.store import CaptionStore
-from app.textutil import export_text, parse_glossary
+from app.textutil import export_text, strict_legacy_rows
 from app.translate import Translator
 
 class GlossaryConflict(Exception):
@@ -1047,7 +1047,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         raw = await _read_capped(request, GLOSSARY_MAX_BODY)
         try:
             body = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             raise HTTPException(status_code=400, detail="需要 JSON") from exc
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail="需要 JSON 物件")
@@ -1083,24 +1083,68 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         raw = await _read_capped(request, GLOSSARY_MAX_BODY)
         try:
             body = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             raise HTTPException(status_code=400, detail="需要 JSON") from exc
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail="需要 JSON 物件")
         try:
             room_id = validate_room_id(str(body.get("room_id") or ""))
+            # The old client still sends session_id. The glossary is per room, so it is ignored.
             validate_session_id(str(body.get("session_id") or "default"))
         except RoomIdError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        rows = parse_glossary(str(body.get("text") or ""))
+        expected: int | None = None
+        if "if_version" in body:
+            raw_version = body.get("if_version")
+            if isinstance(raw_version, bool) or not isinstance(raw_version, int):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "ok": False,
+                        "count": 0,
+                        "accepted": [],
+                        "rejected": [{"line": 0, "reason": "if_version 必須是整數"}],
+                    },
+                )
+            expected = int(raw_version)
+            current = pipeline.room_glossary_version(room_id)
+            if expected != current:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "ok": False,
+                        "count": 0,
+                        "version": current,
+                        "rejected": [{"line": 0, "reason": "術語表版本不符"}],
+                    },
+                )
+        text = body.get("text")
+        if not isinstance(text, str):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "count": 0,
+                    "accepted": [],
+                    "rejected": [{"line": 0, "reason": "text 必須是文字"}],
+                },
+            )
+        rows, problems = strict_legacy_rows(text)
+        if problems:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "count": 0, "accepted": [], "rejected": problems},
+            )
         accepted, rejected = validate_terms(legacy_terms(rows))
-        if rejected:
+        if rejected or not accepted:
+            if not rejected:
+                rejected = [{"line": 0, "reason": "沒有有效的術語，不會清空這個房間的詞表"}]
             return JSONResponse(
                 status_code=400,
                 content={"ok": False, "count": 0, "accepted": accepted, "rejected": rejected},
             )
         try:
-            await _save_room_glossary(room_id, accepted)
+            await _save_room_glossary(room_id, accepted, expected_version=expected)
         except GlossaryConflict as exc:
             return JSONResponse(
                 status_code=409,

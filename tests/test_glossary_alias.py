@@ -262,10 +262,13 @@ async def test_legacy_post_keeps_the_old_response_shape():
                 json={"room_id": "legacy", "session_id": "b", "text": crowded},
                 headers={**auth(token), "content-type": "application/json"},
             )
-            assert again.json() == {"ok": True, "count": 40}
+            assert again.status_code == 400, again.text
+            assert again.json()["ok"] is False
+            assert again.json()["count"] == 0
+            assert any("40" in item["reason"] for item in again.json()["rejected"])
             stored = (await _get(client, token, "legacy")).json()
-            assert len(stored["terms"]) == 40
-            assert stored["terms"][-1]["zh"] == "詞39"
+            assert [item["zh"] for item in stored["terms"]] == ["般若", "開示", "菩薩"]
+            assert stored["version"] == 1
     finally:
         await stop(app)
 
