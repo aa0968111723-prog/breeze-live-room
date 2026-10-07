@@ -16,6 +16,7 @@ from pathlib import Path
 
 from app.aio import cancellation_pending, wait_bounded
 from app.audio import AudioError, riff_duration_seconds, wav_duration_seconds, wav_rms
+from app.glossary import guarded_flags, missing_locked, normalize
 from app.rtf import RtfMeter
 from app.settings import Settings
 from app.textutil import annotate_question
@@ -23,6 +24,25 @@ from app.translate import TranslateResult, Translator
 
 FAILURES = {"error", "missing", "timeout", "cancelled"}
 TERMINAL = FAILURES | {"ready", "translate_failed", "silent", "zh_ready"}
+_READY_TRANSLATION = {"ok", "off", "no_key"}
+
+
+def _copy_terms(terms) -> list[dict]:
+    copied = []
+    for item in terms or []:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        aliases = row.get("aliases") or []
+        row["aliases"] = [alias for alias in aliases if isinstance(alias, str)] if isinstance(aliases, list) else []
+        copied.append(row)
+    return copied
+
+
+def _copy_flags(flags) -> list[dict]:
+    if not isinstance(flags, list):
+        return []
+    return [dict(item) for item in flags if isinstance(item, dict)]
 
 
 class PipelineError(Exception):
@@ -51,6 +71,9 @@ class Segment:
     cursor: int = 0
     translate_queued: bool = False
     room_gen: int = 0
+    term_flags: list = field(default_factory=list)
+    glossary_version: int = 0
+    glossary_snapshot: list = field(default_factory=list)
 
     @property
     def key(self) -> tuple[str, str, int]:
@@ -61,7 +84,7 @@ class Segment:
         return f"{self.room_id}:{self.session_id}:{self.seq}"
 
     def public(self) -> dict:
-        return {
+        payload = {
             "type": "final" if self.status in {"ready", "silent"} else "update",
             "id": self.id,
             "room_id": self.room_id,
@@ -79,6 +102,11 @@ class Segment:
             "t0_ms": self.t0_ms,
             "t1_ms": self.t1_ms,
         }
+        if self.glossary_version:
+            payload["glossary_version"] = self.glossary_version
+        if self.term_flags:
+            payload["term_flags"] = _copy_flags(self.term_flags)
+        return payload
 
 
 class Pipeline:
@@ -145,10 +173,80 @@ class Pipeline:
         self._recent_zh: dict[tuple[str, str], deque] = {}
         self._tasks: list[asyncio.Task] = []
         self._workers = False
-        self.glossary: dict[tuple[str, str], list[dict]] = {}
+        # One glossary per room. It outlives sessions, room close, and the caption TTL.
+        self.room_glossaries: dict[str, dict] = {}
 
     def get(self, room_id: str, session_id: str, seq: int) -> Segment | None:
         return self.results.get((room_id, session_id, seq))
+
+    def room_glossary_view(self, room_id: str) -> dict:
+        current = self.room_glossaries.get(room_id)
+        if current is None:
+            return {"room_id": room_id, "version": 0, "terms": [], "updated_at": 0.0}
+        return {
+            "room_id": room_id,
+            "version": int(current["version"]),
+            "terms": _copy_terms(current["terms"]),
+            "updated_at": float(current.get("updated_at") or 0),
+        }
+
+    def room_glossary_version(self, room_id: str) -> int:
+        current = self.room_glossaries.get(room_id)
+        return int(current["version"]) if current else 0
+
+    def terms_for(self, room_id: str) -> list[dict]:
+        current = self.room_glossaries.get(room_id)
+        if not current:
+            return []
+        return _copy_terms(current["terms"])
+
+    def export_room_glossary(self, room_id: str) -> dict | None:
+        current = self.room_glossaries.get(room_id)
+        if current is None:
+            return None
+        return {
+            "room_id": room_id,
+            "version": int(current["version"]),
+            "terms": _copy_terms(current["terms"]),
+            "updated_at": float(current.get("updated_at") or 0),
+        }
+
+    def replace_room_glossary(self, room_id: str, terms: list[dict]) -> dict:
+        current = self.room_glossaries.get(room_id)
+        record = {
+            "room_id": room_id,
+            "version": (int(current["version"]) + 1) if current else 1,
+            "terms": _copy_terms(terms),
+            "updated_at": time.time(),
+        }
+        self.room_glossaries[room_id] = record
+        return record
+
+    def install_room_glossary(self, row: dict) -> None:
+        room_id = str(row.get("room_id") or "")
+        terms = row.get("terms")
+        if not room_id or not isinstance(terms, list):
+            return
+        try:
+            version = int(row.get("version") or 0)
+            updated_at = float(row.get("updated_at") or 0)
+        except (TypeError, ValueError):
+            return
+        self.room_glossaries[room_id] = {
+            "room_id": room_id,
+            "version": version,
+            "terms": _copy_terms(terms),
+            "updated_at": updated_at,
+        }
+
+    def restore_room_glossary(self, room_id: str, previous: dict | None) -> None:
+        if previous is None:
+            self.room_glossaries.pop(room_id, None)
+            return
+        self.room_glossaries[room_id] = previous
+
+    def clear_room_glossary(self, room_id: str) -> None:
+        self.room_glossaries.pop(room_id, None)
 
     def try_admit(self, limit: int | None = None) -> bool:
         return self.try_admit_count() if limit is None else self._admit_with_limit(limit)
@@ -277,7 +375,10 @@ class Pipeline:
         self._flight.clear()
 
     def drop_room(self, room_id: str) -> None:
-        """Forget one ended room. A later host open uses a new generation, so late jobs cannot refill it."""
+        """Forget one ended room. The glossary stays; only a room delete clears it.
+
+        A later host open uses a new generation, so late jobs cannot refill captions.
+        """
         self._room_gen[room_id] = self._room_gen.get(room_id, 1) + 1
         keys = {key for key in self.results if key[0] == room_id}
         keys.update(key for key in self._flight if key[0] == room_id)
@@ -309,14 +410,13 @@ class Pipeline:
         groups.update(group for group in self._max_seq if group[0] == room_id)
         groups.update(group for group in self._closed if group[0] == room_id)
         groups.update(group for group in self._session_ord if group[0] == room_id)
-        groups.update(group for group in self.glossary if group[0] == room_id)
         for group in groups:
             self._held.pop(group, None)
             self._next.pop(group, None)
             self._max_seq.pop(group, None)
             self._closed.discard(group)
             self._session_ord.pop(group, None)
-            self.glossary.pop(group, None)
+        # room_glossaries stays. Close and idle drop captions, not the room's terms.
         self._room_sessions.pop(room_id, None)
         for stamp in [stamp for stamp in self._gap_since if stamp[0] == room_id]:
             self._gap_since.pop(stamp, None)
@@ -439,6 +539,7 @@ class Pipeline:
         segment.zh = ""
         segment.en = ""
         segment.zh_raw = ""
+        segment.term_flags = []
         segment.translate_queued = False
         segment.status = "cancelled"
         segment.translate_status = ""
@@ -455,6 +556,7 @@ class Pipeline:
             "zh": segment.zh,
             "zh_raw": segment.zh_raw,
             "en": segment.en,
+            "term_flags": _copy_flags(segment.term_flags),
             "t0_ms": segment.t0_ms,
             "t1_ms": segment.t1_ms,
             "session_ord": segment.session_ord,
@@ -489,6 +591,7 @@ class Pipeline:
             zh=row.get("zh") or "",
             zh_raw=row.get("zh_raw") or "",
             en=row.get("en") or "",
+            term_flags=_copy_flags(row.get("term_flags")),
             status=row.get("status") or "ready",
             translate_status=row.get("translate_status") or "",
             error=row.get("error") or "",
@@ -504,7 +607,8 @@ class Pipeline:
         return segment
 
     def invalidate_room(self, room_id: str) -> None:
-        """Drop this room's captions. The live session keeps its seq counter and can continue."""
+        """Drop this room's captions and its glossary. The live session keeps its seq counter."""
+        self.clear_room_glossary(room_id)
         self._room_gen[room_id] = self._room_gen.get(room_id, 1) + 1
         sealed = self._sealed.setdefault(room_id, set())
         for (rid, sid), max_seq in list(self._max_seq.items()):
@@ -727,6 +831,9 @@ class Pipeline:
             "t0_ms": segment.t0_ms,
             "t1_ms": segment.t1_ms,
         }
+        flags = _copy_flags(segment.term_flags)
+        if flags:
+            event["term_flags"] = flags
         self.events.append(dict(event))
         if len(self.events) > self.settings.history_limit * 2:
             del self.events[: len(self.events) - self.settings.history_limit * 2]
@@ -1295,7 +1402,7 @@ class Pipeline:
                 self._release(segment)
                 return segment
             segment.zh_raw = text
-            segment.zh = annotate_question(text)
+            segment.zh = annotate_question(normalize(text, self.terms_for(segment.room_id)))
             segment.status = "zh_ready"
             # Retry sets version to max(existing + 1, 1). Keep it; do not hard-reset to 1.
             segment.version = max(segment.version, 1)
@@ -1499,6 +1606,7 @@ class Pipeline:
             return
         segment.translate_queued = False
         segment.en = ""
+        segment.term_flags = []
         segment.translate_status = translate_status
         segment.error = error
         segment.status = "translate_failed"
@@ -1604,20 +1712,32 @@ class Pipeline:
             return False
         if zh_snapshot is not None and segment.zh != zh_snapshot:
             segment.translate_queued = False
+            segment.term_flags = []
             return False
-        segment.en = translated.text or ""
+        # Only a successful translation may fill `en`. off/no_key stay ready with an empty line.
+        # Anything else, including a failure that echoed Chinese, publishes blank English.
+        segment.en = (translated.text or "") if translated.status == "ok" else ""
         segment.translate_status = translated.status
         segment.error = translated.detail
-        segment.status = "ready" if translated.status in {"ok", "off", "no_key"} else "translate_failed"
+        segment.status = "ready" if translated.status in _READY_TRANSLATION else "translate_failed"
         segment.translate_queued = False
         segment.version = segment.version + 1
         if epoch is not None and not self._epoch_current(segment, epoch):
             segment.en = ""
+            segment.term_flags = []
             return False
         if zh_snapshot is not None and segment.zh != zh_snapshot:
             segment.en = ""
+            segment.term_flags = []
             segment.translate_queued = False
             return False
+        zh_for_flags = zh_snapshot if zh_snapshot is not None else segment.zh
+        snapshot = segment.glossary_snapshot
+        flags: list = []
+        if translated.status == "ok" and segment.en:
+            flags.extend(missing_locked(zh_for_flags, snapshot, segment.en))
+        flags.extend(guarded_flags(zh_for_flags, snapshot))
+        segment.term_flags = flags
         self.results[segment.key] = segment
         self._emit(segment)
         return True
@@ -1634,12 +1754,14 @@ class Pipeline:
             self._fail_translation(segment, "skipped", "英譯排隊太久，中文仍保留")
             return
         zh_snapshot = segment.zh
-        glossary = self.glossary.get((segment.room_id, segment.session_id), [])
+        terms = self.terms_for(segment.room_id)
+        segment.glossary_snapshot = terms
+        segment.glossary_version = self.room_glossary_version(segment.room_id)
         context = self._context(segment)
         kwargs = {}
         params = inspect.signature(self.translator.translate).parameters
         if "glossary" in params:
-            kwargs["glossary"] = glossary
+            kwargs["glossary"] = terms
         if "context" in params:
             kwargs["context"] = context
         if "deadline" in params:
@@ -1758,6 +1880,7 @@ class Pipeline:
                 zh=row.get("zh") or "",
                 zh_raw=row.get("zh_raw") or "",
                 en=row.get("en") or "",
+                term_flags=_copy_flags(row.get("term_flags")),
                 status=row.get("status") or "ready",
                 translate_status=row.get("translate_status") or "",
                 error=row.get("error") or "",
@@ -1805,7 +1928,7 @@ class Pipeline:
             raise PipelineError(409, "這段已取消或缺少，不能重譯")
         if zh is not None:
             segment.zh_raw = segment.zh_raw or segment.zh
-            segment.zh = annotate_question(zh.strip())
+            segment.zh = annotate_question(normalize(zh.strip(), self.terms_for(room_id)))
             self._remember_zh(segment)
         # A second retranslate replaces the queued attempt instead of stacking one.
         segment.status = "zh_ready"

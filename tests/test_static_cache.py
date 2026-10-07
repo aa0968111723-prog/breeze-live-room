@@ -74,6 +74,7 @@ async def assert_revalidates(client: AsyncClient, path: str) -> Response:
     resp = await client.get(path)
     assert resp.status_code == 200, path
     assert resp.headers["cache-control"] == "no-cache", path
+    assert resp.headers["referrer-policy"] == "no-referrer", path
     assert resp.headers["etag"], path
     assert resp.headers["last-modified"], path
     etag = resp.headers["etag"]
@@ -81,10 +82,12 @@ async def assert_revalidates(client: AsyncClient, path: str) -> Response:
     assert cached.status_code == 304, path
     assert cached.content == b"", path
     assert cached.headers["cache-control"] == "no-cache", path
+    assert cached.headers["referrer-policy"] == "no-referrer", path
     assert cached.headers["etag"] == etag, path
     mismatch = await client.get(path, headers={"if-none-match": '"not-the-file"'})
     assert mismatch.status_code == 200, path
     assert mismatch.headers["cache-control"] == "no-cache", path
+    assert mismatch.headers["referrer-policy"] == "no-referrer", path
     return resp
 
 
@@ -122,14 +125,16 @@ async def test_module_imports_carry_a_content_version():
         expected = stored_text(STATIC / "host.html")
         assert host.text == stamp_static_imports(expected, STATIC)
         host_versions = import_versions(host.text, STATIC)
-        assert set(host_versions) == {"recorder_machine.js", "room_client.js", "host_caption.js"}
+        assert set(host_versions) == {
+            "recorder_machine.js", "room_client.js", "host_caption.js", "host_glossary.js",
+        }
 
         room = await assert_revalidates(client, "/r/class")
         assert room.headers["content-type"].startswith("text/html")
         expected = stored_text(STATIC / "room.html")
         assert room.text == stamp_static_imports(expected, STATIC)
         room_versions = import_versions(room.text, STATIC)
-        assert set(room_versions) == {"room_client.js"}
+        assert set(room_versions) == {"room_client.js", "room_prefs.js", "room_view.js"}
         assert room_versions["room_client.js"] == host_versions["room_client.js"]
 
         for page in ("/static/host.html", "/static/room.html"):
@@ -138,7 +143,9 @@ async def test_module_imports_carry_a_content_version():
                 host_versions if page.endswith("host.html") else room_versions
             )
 
-        for name, token in host_versions.items():
+        versions = dict(host_versions)
+        versions.update(room_versions)
+        for name, token in versions.items():
             prefix, suffix = token.rsplit("-", 1)
             assert prefix == version, token
             assert len(suffix) == 8 and all(ch in "0123456789abcdef" for ch in suffix)
@@ -149,6 +156,7 @@ async def test_module_imports_carry_a_content_version():
             ranged = await client.get(url, headers={"range": "bytes=0-9"})
             assert ranged.status_code == 206, url
             assert ranged.headers["cache-control"] == "no-cache", url
+            assert ranged.headers["referrer-policy"] == "no-referrer", url
             assert ranged.content == served.content[:10]
             ignored = await client.get(f"/static/{name}?v=not-a-real-token")
             assert ignored.status_code == 200
@@ -176,7 +184,9 @@ async def test_changed_module_changes_its_import_version(monkeypatch, tmp_path):
         first = await client.get("/")
         assert first.status_code == 200
         before = import_versions(first.text, copied)
-        assert set(before) == {"recorder_machine.js", "room_client.js", "host_caption.js"}
+        assert set(before) == {
+            "recorder_machine.js", "room_client.js", "host_caption.js", "host_glossary.js",
+        }
         nested = await client.get("/static/room_client.js?v=" + before["room_client.js"])
         assert nested.status_code == 200
         assert nested.headers["cache-control"] == "no-cache"

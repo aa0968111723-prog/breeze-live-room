@@ -846,11 +846,19 @@ async def test_srt_100_minute_session_formats_hours(tmp_path):
                     assert hello["gap"] is True
                     assert "backfill" in hello
                     backfill = hello["backfill"]
-                    assert len(backfill) == half * 2
-                    assert len({item["id"] for item in backfill}) == half * 2
-                    assert [(item["session_id"], item["seq"]) for item in backfill] == (
-                        [("s1", seq) for seq in range(1, half + 1)] + [("s2", seq) for seq in range(1, half + 1)]
+                    # The class is still 1000 rows (export and caption_state above).
+                    # An audience replay is only the last 200, under the byte budget.
+                    full = (
+                        [("s1", seq) for seq in range(1, half + 1)]
+                        + [("s2", seq) for seq in range(1, half + 1)]
                     )
+                    assert len(full) == half * 2
+                    assert len(backfill) == 200
+                    assert len({item["id"] for item in backfill}) == 200
+                    assert [(item["session_id"], item["seq"]) for item in backfill] == full[-200:]
+                    assert (backfill[0]["session_id"], backfill[0]["seq"]) != ("s1", 1)
+                    encoded = json.dumps(backfill, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                    assert len(encoded) <= 100 * 1024
                     calls = asr.calls
                     again = await push(
                         client, token, "class", "s1", 3, "s1-3".encode(),
@@ -1488,6 +1496,9 @@ async def test_active_room_expires_each_caption_not_the_whole_room():
 def test_device_acceptance_storage_off_export_covers_a_class():
     """A 100-minute export fits in the room caption cap. Storage is for restart, not for that export."""
     text = Path("docs/DEVICE-ACCEPTANCE.md").read_text(encoding="utf-8")
+    assert "再送一次術語，然後" not in text
+    assert "只在按儲存時送出" in text
+    assert "401 不會自動再送一次術語" in text
     assert "沒開儲存時 100 分鐘匯出會缺掉大部分" not in text
     assert "BREEZE_ROOM_CAPTION_CAP" in text
     assert "預設 5000" in text
