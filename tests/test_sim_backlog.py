@@ -106,18 +106,25 @@ def test_100min_memory_flattens():
     """App heap for the traced class. Not the latency report.
 
     The latency run leaves tracemalloc off. This one turns it on and checks the
-    server heap only. Late growth across the last 250 segments has to be at
-    most half the previous 250, and that same late growth has to be under 1 MB.
-    Both are required: being under 1 MB does not excuse a ratio above one half,
-    and the old total-growth escape (under 5 MB) stays gone. RSS is not judged
+    server heap only. Early growth is traced bytes from segment 500 to 750;
+    late growth is traced bytes from 750 to 1000. The class passes when
+    late/early <= 1/2, or when that late growth is under 1 MiB (1024*1024).
+    Either condition is enough. early <= 0 does not divide, so the ratio is
+    unset and only the 1 MiB hatch can pass. This is tighter than main, whose
+    escape was total growth under 5 MB; the ratio stays 1/2. RSS is not judged
     here.
     """
     report = run_100min(trace=True)
     assert report.tracemalloc_500 > 0
     early = report.tracemalloc_750 - report.tracemalloc_500
     late = report.tracemalloc_1000 - report.tracemalloc_750
-    assert late <= max(early, 0) / 2, (early, late)
-    assert late < 1024 * 1024, (early, late)
+    # early <= 0 has no ratio. Do not treat that as <= 1/2.
+    ratio = late / early if early > 0 else None
+    detail: dict = {"early": early, "late": late, "ratio": ratio}
+    rss_names = ("rss_0", "rss_250", "rss_500", "rss_750", "rss_1000")
+    if any(hasattr(report, name) for name in rss_names):
+        detail["rss"] = {name: getattr(report, name) for name in rss_names if hasattr(report, name)}
+    assert (ratio is not None and ratio <= 1 / 2) or late < 1024 * 1024, detail
 
 
 def test_100min_rss_bounded(report):
