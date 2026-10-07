@@ -232,21 +232,25 @@ def normalize(text: str, glossary) -> str:
     """Longest match, repeated until another pass would not change the line.
 
     One pass can turn an alias into text that matches a different alias. Repeat so
-    normalize(normalize(x)) stays equal to normalize(x). A cycle is left unrewritten.
+    normalize(normalize(x)) stays equal to normalize(x). A canonical written by an
+    earlier pass stays in the sentence: a later alias may overlap it only when the
+    canonical is still a substring afterwards. A cycle, or a chain that does not
+    settle, is left unrewritten. The match tables are built once for every pass.
     """
     current = text or ""
     if not current:
         return current
+    tables = _tables(glossary)
     seen = {current}
     for _ in range(8):
-        rewritten, _flags = _apply(current, glossary)
+        rewritten, _flags = _apply(current, glossary, tables)
         if rewritten == current:
             return current
         if rewritten in seen:
             return text or ""
         seen.add(rewritten)
         current = rewritten
-    rewritten, _flags = _apply(current, glossary)
+    rewritten, _flags = _apply(current, glossary, tables)
     if rewritten != current:
         return text or ""
     return current
@@ -327,10 +331,10 @@ def term_hit(en: str, term: dict) -> bool:
     return re.search(pattern, hay) is not None
 
 
-def _apply(text: str, glossary) -> tuple[str, list[dict]]:
+def _apply(text: str, glossary, tables=None) -> tuple[str, list[dict]]:
     if not text:
         return text or "", []
-    canon, alias, en_of = _tables(glossary)
+    canon, alias, en_of = tables if tables is not None else _tables(glossary)
     if not canon and not alias:
         return text, []
     folded = _match_key(text)
@@ -338,6 +342,10 @@ def _apply(text: str, glossary) -> tuple[str, list[dict]]:
     if len(folded) != len(text):
         return text, []
     guards = _guard_spans(folded)
+    # Canonicals already in this sentence stay put. An alias may overlap one only
+    # when the output still contains that canonical, so 戊甲乙 becomes 戊丙丁 and
+    # the next pass cannot turn the new 丙丁 into 庚辛.
+    protected = _exact_canon_spans(text, folded, canon)
     longest = 1
     for key in canon:
         longest = max(longest, len(key))
@@ -354,15 +362,18 @@ def _apply(text: str, glossary) -> tuple[str, list[dict]]:
         for size in range(limit, 1, -1):
             key = folded[index:index + size]
             if key in canon:
-                chosen = (size, canon[key])
-                break
-            if key not in alias:
+                replacement = canon[key]
+            elif key in alias:
+                if _overlaps(index, index + size, guards):
+                    if suppressed is None:
+                        suppressed = alias[key]
+                    continue
+                replacement = alias[key]
+            else:
                 continue
-            if _overlaps(index, index + size, guards):
-                if suppressed is None:
-                    suppressed = alias[key]
+            if not _keeps_canons(text, index, index + size, replacement, protected):
                 continue
-            chosen = (size, alias[key])
+            chosen = (size, replacement)
             break
         if chosen is not None:
             out.append(chosen[1])
@@ -374,6 +385,36 @@ def _apply(text: str, glossary) -> tuple[str, list[dict]]:
         out.append(text[index])
         index += 1
     return "".join(out), flags
+
+
+def _exact_canon_spans(text: str, folded: str, canon: dict[str, str]) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    if not canon:
+        return spans
+    longest = max(len(key) for key in canon)
+    index = 0
+    while index < len(text):
+        found = 0
+        limit = min(longest, len(text) - index)
+        for size in range(limit, 1, -1):
+            surface = canon.get(folded[index:index + size])
+            if surface is not None and len(surface) == size and text.startswith(surface, index):
+                found = size
+                break
+        if found:
+            spans.append((index, index + found))
+            index += found
+        else:
+            index += 1
+    return spans
+
+
+def _keeps_canons(text: str, start: int, end: int, replacement: str, spans: list[tuple[int, int]]) -> bool:
+    pieces = [text[left:right] for left, right in spans if start < right and end > left]
+    if not pieces:
+        return True
+    output = text[:start] + replacement + text[end:]
+    return all(piece and piece in output for piece in pieces)
 
 
 def _tables(glossary) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:

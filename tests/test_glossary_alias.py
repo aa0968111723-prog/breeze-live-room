@@ -124,6 +124,50 @@ def test_overlapping_terms_normalize_until_stable():
     assert normalize(normalize("柴學舍長", accepted), accepted) == once
 
 
+def test_replaced_canonical_is_not_eaten_across_the_boundary():
+    """戊甲乙 becomes 戊丙丁. The next pass must not turn that 丙丁 into 庚辛."""
+    glossary = [
+        {"zh": "丙丁", "aliases": ["甲乙"], "en": "a", "lock": True, "category": "", "note": ""},
+        {"zh": "庚辛", "aliases": ["戊丙"], "en": "b", "lock": True, "category": "", "note": ""},
+    ]
+    accepted, rejected = validate_terms(glossary)
+    assert rejected == []
+    assert normalize("戊甲乙", accepted) == "戊丙丁"
+    assert normalize("戊丙丁", accepted) == "戊丙丁"
+    assert normalize(normalize("戊甲乙", accepted), accepted) == "戊丙丁"
+
+
+def test_normalize_cycle_returns_the_original_sentence(monkeypatch):
+    """A rewrite that revisits an earlier line is dropped, not the last rewrite."""
+    def fake_apply(text, glossary, tables=None):
+        del glossary, tables
+        nxt = {"起": "甲", "甲": "乙", "乙": "甲"}[text]
+        return nxt, []
+
+    monkeypatch.setattr("app.glossary._apply", fake_apply)
+    assert normalize("起", []) == "起"
+
+
+def test_normalize_builds_match_tables_once(monkeypatch):
+    glossary = [
+        {"zh": "禪學社", "aliases": ["柴學社"], "en": "Zen Club", "lock": True, "category": "", "note": ""},
+        {"zh": "社長", "aliases": ["舍長"], "en": "president", "lock": True, "category": "", "note": ""},
+    ]
+    accepted, rejected = validate_terms(glossary)
+    assert rejected == []
+    calls = {"n": 0}
+    import app.glossary as glossary_mod
+    real = glossary_mod._tables
+
+    def wrapped(rows):
+        calls["n"] += 1
+        return real(rows)
+
+    monkeypatch.setattr("app.glossary._tables", wrapped)
+    assert normalize("柴學舍長", accepted) == "禪學社長"
+    assert calls["n"] == 1
+
+
 def test_bad_aliases_are_rejected_with_reasons():
     accepted, rejected = validate_terms([
         {"zh": "開示", "en": "Dharma talk", "aliases": ["開", "開始", "法師"]},
