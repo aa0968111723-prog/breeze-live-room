@@ -48,6 +48,16 @@ def _num(value: float) -> int | float:
     return number
 
 
+def _in_flight_age(seconds: float) -> float:
+    """Seconds an in-flight recognizer has run.
+
+    ``round(x, 3)`` of a sub-millisecond age is 0.0, which looks idle. Publish
+    microsecond precision and never 0 while recognition is actually running.
+    """
+    number = round(max(float(seconds), 0.0), 6)
+    return number if number > 0 else 0.000001
+
+
 def _stat(values: list[float]) -> dict:
     if not values:
         return {"p50": None, "p95": None, "max": None}
@@ -297,8 +307,8 @@ class RtfMeter:
             elapsed = max(0.0, now - float(started))
             longest = max(longest, elapsed)
             by_room[room] = max(by_room.get(room, 0.0), elapsed)
-        published = {room: round(value, 3) for room, value in by_room.items() if value > 0 or room}
-        return round(longest, 3), published
+        published = {room: _in_flight_age(value) for room, value in by_room.items() if value > 0 or room}
+        return _in_flight_age(longest), published
 
     def snapshot(self, session: tuple[str, str] | None = None) -> dict:
         """``rtf.session`` is the requested session, or the one updated most recently.
@@ -308,6 +318,7 @@ class RtfMeter:
         ``backlog_audio_s`` is decoded audio still queued or being recognized.
         ``backlog_s`` is audio received but not yet inside recognition.
         ``asr_active_s`` is how long the oldest in-flight recognition has run.
+        Idle is integer 0; an in-flight age is always positive.
         """
         chosen = session if session is not None else self._latest
         window = self._window_summary()

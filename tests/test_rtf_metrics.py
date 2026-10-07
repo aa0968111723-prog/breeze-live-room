@@ -1021,8 +1021,14 @@ async def test_backlog_is_counted_from_upload_and_cleared_when_asr_starts():
             assert asr.calls == 0
             release_decode.set()
             assert await asyncio.to_thread(asr.started.wait, 2)
-            await asyncio.sleep(0.05)
-            started = (await client.get("/api/metrics", headers=auth(token))).json()
+            started = None
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                started = (await client.get("/api/metrics", headers=auth(token))).json()
+                if started["asr_active_s"] > 0 and started["backlog_s"] == 0:
+                    break
+                await asyncio.sleep(0.01)
+            assert started is not None
             assert started["backlog_audio_s"] == pytest.approx(1.0)
             assert started["backlog_s"] == 0
             assert started["backlog_estimated"] is False
@@ -1349,8 +1355,17 @@ def test_asr_active_age_grows_until_recognition_ends():
     assert idle["asr_active_by_room"] == {}
     meter.note_asr_active(("room", "s", 1), "room")
     first = meter.snapshot()["asr_active_s"]
-    time.sleep(0.05)
-    second = meter.snapshot()
+    assert first > 0
+    for _ in range(100):
+        assert meter.snapshot()["asr_active_s"] > 0
+    second = None
+    deadline = time.perf_counter() + 1
+    while time.perf_counter() < deadline:
+        second = meter.snapshot()
+        if second["asr_active_s"] > first:
+            break
+        time.sleep(0.001)
+    assert second is not None
     assert second["asr_active_s"] > first
     assert second["asr_active_by_room"]["room"] == pytest.approx(second["asr_active_s"], abs=0.02)
     meter.clear_asr_active(("room", "s", 1))
@@ -1432,15 +1447,24 @@ async def test_stuck_recognition_grows_decoded_backlog_then_timeout_clears_it():
             task = asyncio.create_task(push(client, token, 1, blob))
             assert await asyncio.to_thread(asr.started.wait, 2)
             first = (await client.get("/api/metrics", headers=auth(token))).json()
-            await asyncio.sleep(0.2)
-            second = (await client.get("/api/metrics", headers=auth(token))).json()
+            assert first["asr_active_s"] > 0
+            second = None
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                second = (await client.get("/api/metrics", headers=auth(token))).json()
+                if (
+                    second["asr_active_s"] > first["asr_active_s"]
+                    and second["oldest_wait_ms"] > first["oldest_wait_ms"]
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            assert second is not None
             assert first["backlog_audio_s"] == pytest.approx(20.0, abs=0.001)
             assert second["backlog_audio_s"] == pytest.approx(20.0, abs=0.001)
             assert first["backlog_s"] == 0 and second["backlog_s"] == 0
             assert first["inflight"] == 1 and second["inflight"] == 1
             assert second["oldest_wait_ms"] > first["oldest_wait_ms"]
             assert second["asr_active_s"] > first["asr_active_s"]
-            assert first["asr_active_s"] > 0
             assert second["asr_active_by_room"]["class"] == pytest.approx(second["asr_active_s"], abs=0.05)
             done = await asyncio.wait_for(task, 3)
             assert done.status_code == 408, done.text

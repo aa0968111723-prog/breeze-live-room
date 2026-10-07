@@ -13,7 +13,7 @@ token). It never prints that token.
 ``watch`` records ``backlog_audio_s`` for the "peak backlog under 12 seconds"
 check: decoded audio still queued or currently being recognized. ``backlog_s``
 is the separate upload estimate and is not that gate. ``asr_active_s`` is how
-long the oldest in-flight recognition has already run.
+long the oldest in-flight recognition has already run (0 only when idle).
 """
 from __future__ import annotations
 
