@@ -9,6 +9,10 @@ from pathlib import Path
 
 PREFIX = 'BREEZE_RESULT '
 
+def sampling_strategy(beam_size):
+    # Zero preserves pywhispercpp's greedy default; beam search is opt-in.
+    return 1 if beam_size > 1 else 0
+
 def emit(value):
     print(PREFIX + json.dumps(value, ensure_ascii=True), flush=True)
 
@@ -39,7 +43,7 @@ def main():
             os.chdir(paths.cwd)
         engine = LocalModel(str(model), context_params={'use_gpu': False, 'flash_attn': True},
             n_threads=args.threads, language='zh', audio_ctx=args.context,
-            params_sampling_strategy=0 if args.beam == 1 else 1,
+            params_sampling_strategy=sampling_strategy(args.beam),
             greedy={'best_of': args.best or 5}, beam_search={'beam_size': args.beam or 5, 'patience': -1.0},
             print_progress=False, print_realtime=False, print_timestamps=False, no_context=True)
     finally:

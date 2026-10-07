@@ -5,10 +5,12 @@ import threading
 from pathlib import Path
 import uvicorn
 from app.settings import Settings, fill_process_environ
+from app.desktop_update import cleanup_downloads
 
 def main():
     if sys.stdin.readline().strip() != 'start':
         return
+    cleanup_downloads()
     root = Path(__file__).resolve().parents[1]
     os.chdir(root)
     fill_process_environ(root / '.env')

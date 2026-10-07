@@ -1,11 +1,13 @@
 import hashlib
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
 from app.desktop_update import (
+    cleanup_downloads,
     SETUP_NAME,
     assert_https,
     parse_sha256_sidecar,
@@ -13,6 +15,21 @@ from app.desktop_update import (
     plan,
     stream_verified,
 )
+
+def test_cleanup_removes_only_old_app_downloads(tmp_path, monkeypatch):
+    monkeypatch.setattr('app.desktop_update.tempfile.gettempdir', lambda: str(tmp_path))
+    for name, old in [('BreezeUpdate-old', True), ('BreezeUpdate-recent', False)]:
+        folder = tmp_path / name
+        folder.mkdir()
+        (folder / SETUP_NAME).write_bytes(b'installer')
+        (folder / 'breeze-update.json').write_text(json.dumps({'repository': 'aa0968111723-prog/breeze-live-room', 'filename': SETUP_NAME, 'created_at': time.time() - (7200 if old else 0)}))
+    unrelated = tmp_path / 'BreezeUpdate-unrelated'
+    unrelated.mkdir()
+    (unrelated / 'notes.txt').write_text('user file')
+    assert cleanup_downloads() == 1
+    assert not (tmp_path / 'BreezeUpdate-old').exists()
+    assert (tmp_path / 'BreezeUpdate-recent' / SETUP_NAME).exists()
+    assert (unrelated / 'notes.txt').read_text() == 'user file'
 
 
 def release(tag="v0.4.0", **extra):

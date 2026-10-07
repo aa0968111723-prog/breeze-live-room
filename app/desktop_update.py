@@ -7,6 +7,7 @@ import json
 import os
 import re
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -152,7 +153,41 @@ def download_update(chosen: dict) -> dict:
     digest = parse_sha256_sidecar(sidecar)
     destination = Path(tempfile.mkdtemp(prefix='BreezeUpdate-')) / SETUP_NAME
     stream_verified(chosen["setup_url"], destination, digest, limit=int(chosen["bytes"]))
+    (destination.parent / 'breeze-update.json').write_text(json.dumps({
+        'repository': REPOSITORY, 'filename': SETUP_NAME, 'created_at': time.time()}), encoding='utf-8')
     return {"status": "ready", "version": chosen["version"], "path": str(destination), "sha256": digest}
+
+
+def cleanup_downloads(minimum_age_s: float = 3600) -> int:
+    """Remove old App-created downloads at startup; retain active/unknown files."""
+    removed = 0
+    for folder in Path(tempfile.gettempdir()).glob('BreezeUpdate-*'):
+        if not folder.is_dir() or folder.is_symlink() or (hasattr(folder, 'is_junction') and folder.is_junction()):
+            continue
+        marker = folder / 'breeze-update.json'
+        try:
+            if marker.stat().st_size > 4096:
+                continue
+            record = json.loads(marker.read_text(encoding='utf-8'))
+            if record.get('repository') != REPOSITORY or record.get('filename') != SETUP_NAME:
+                continue
+            if time.time() - float(record['created_at']) < minimum_age_s:
+                continue
+            installer = folder / SETUP_NAME
+            if installer.is_symlink():
+                continue
+            # Windows keeps executing EXEs locked. Permission errors leave the
+            # marker in place for a later startup rather than disrupting Setup.
+            installer.unlink(missing_ok=True)
+            marker.unlink()
+            try:
+                folder.rmdir()  # Never recursively delete unexpected user files.
+            except OSError:
+                pass
+            removed += 1
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return removed
 
 
 def fetch_text(url: str, limit: int = 4096) -> str:

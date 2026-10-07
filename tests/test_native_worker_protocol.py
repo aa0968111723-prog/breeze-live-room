@@ -3,6 +3,11 @@ import sys
 from pathlib import Path
 import pytest
 from app.native_asr import NativeResidentAsr
+from app.native_worker import sampling_strategy
+
+@pytest.mark.parametrize('beam,expected', [(0, 0), (1, 0), (5, 1)])
+def test_beam_search_requires_explicit_beam_size(beam, expected):
+    assert sampling_strategy(beam) == expected
 
 def engine(tmp_path, monkeypatch, behavior):
     helper = tmp_path / 'worker.py'
