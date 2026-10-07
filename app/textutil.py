@@ -25,17 +25,45 @@ def should_join(prev: str, nxt: str, gap_ms: int) -> bool:
     return True
 
 
+def _split_glossary(text: str) -> tuple[str, str] | None:
+    # A line that already has "=" keeps the old split, including a later fullwidth equals.
+    if "=" in text:
+        left, right = text.split("=", 1)
+        return left, right
+    index = text.find("＝")
+    if index < 0:
+        return None
+    return text[:index], text[index + 1 :]
+
+
 def parse_glossary(raw: str, limit: int = 40) -> list[dict]:
+    """Legacy host textarea. `zh=en` results stay the same, including the silent cap of 40.
+
+    Also accepts a fullwidth equals, and `標準詞|別名1|別名2=English`.
+    Strict rejection lives on the room glossary API, not here.
+    """
     rows = []
     for line in (raw or "").splitlines():
         text = line.strip()
-        if not text or text.startswith("#") or "=" not in text:
+        if not text or text.startswith("#"):
             continue
-        zh, en = text.split("=", 1)
-        zh = zh.strip()[:40]
-        en = en.strip()[:80]
+        split = _split_glossary(text)
+        if split is None:
+            continue
+        left, right = split
+        en = right.strip()[:80]
+        if "|" in left:
+            parts = [part.strip() for part in left.split("|")]
+            zh = parts[0].strip()[:40]
+            aliases = [part for part in parts[1:] if part]
+        else:
+            zh = left.strip()[:40]
+            aliases = []
         if zh and en:
-            rows.append({"zh": zh, "en": en})
+            row = {"zh": zh, "en": en}
+            if aliases:
+                row["aliases"] = aliases
+            rows.append(row)
         if len(rows) >= limit:
             break
     return rows
