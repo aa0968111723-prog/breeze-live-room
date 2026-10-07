@@ -29,7 +29,6 @@ from app.glossary import (
     legacy_box_block,
     legacy_omitted_count,
     legacy_terms,
-    preserve_rich_fields,
     validate_terms,
 )
 from app.pipeline import Pipeline, PipelineError, Segment
@@ -48,7 +47,7 @@ class GlossaryConflict(Exception):
 
 
 class GlossaryRejected(Exception):
-    """Legacy fields kept from PUT made the merged list invalid. Nothing was written."""
+    """The textarea must not replace this glossary, or the new rows are invalid. Nothing was written."""
 
     def __init__(self, accepted: list, rejected: list) -> None:
         self.accepted = accepted
@@ -1044,9 +1043,10 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         `expected_version=None` means the legacy client, which does not send if_version:
         the version read under the lock is the one written against.
         `preserve_rich` is the textarea path. Under this lock, a stored glossary
-        longer than the textarea cap, or one with lock, note, category, or aliases,
-        is refused and nothing is written. Otherwise omitted terms are dropped and
-        counted, and PUT fields stay on terms the new text still names.
+        the textarea cannot round-trip is refused and nothing is written. That is
+        more than LEGACY_BOX_LIMIT rows, lock off, a note, a category, or text the
+        `zh|alias=en` line would change. Aliases the line can show are editable:
+        an omitted alias is deleted with the omitted terms and counted.
         """
         async with _glossary_lock(room_id):
             current = pipeline.room_glossary_version(room_id)
@@ -1059,8 +1059,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 if reason:
                     raise GlossaryRejected([], [{"line": 0, "reason": reason}])
                 deleted = legacy_omitted_count(prior, terms)
-                merged = preserve_rich_fields(prior, terms)
-                accepted, rejected = validate_terms(merged)
+                accepted, rejected = validate_terms(terms)
                 if rejected or not accepted:
                     if not rejected:
                         rejected = [{"line": 0, "reason": "沒有有效的術語，不會清空這個房間的詞表"}]

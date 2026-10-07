@@ -9,6 +9,8 @@ from __future__ import annotations
 import re
 import unicodedata
 
+from app.textutil import strict_legacy_rows
+
 SCHEMA_VERSION = 1
 MAX_TERMS = 200
 # The host textarea still refuses more than this many lines. Raising it waits on a product decision.
@@ -101,43 +103,6 @@ def is_locked(term: dict) -> bool:
     return True
 
 
-def preserve_rich_fields(existing, incoming: list[dict]) -> list[dict]:
-    """Keep lock, note, category, and aliases a legacy line cannot express.
-
-    The canonical term is `zh`. A term still present in the new text keeps the fields
-    the host set with PUT. Aliases typed on the legacy line replace the stored ones.
-    An omitted alias list does not wipe them. Terms absent from the new text are dropped.
-    The legacy HTTP path calls this only when the stored glossary fits the textarea.
-    A longer table, or one with lock, note, category, or aliases, is refused first.
-    """
-    prior: dict[str, dict] = {}
-    for term in existing or []:
-        if isinstance(term, dict) and isinstance(term.get("zh"), str) and term["zh"]:
-            prior.setdefault(term["zh"], term)
-    merged = []
-    for term in incoming:
-        zh = term.get("zh")
-        old = prior.get(zh) if isinstance(zh, str) else None
-        kept = {
-            "zh": zh,
-            "en": term.get("en") or "",
-            "aliases": list(term.get("aliases") or []),
-            "lock": term.get("lock", True),
-            "category": term.get("category") or "",
-            "note": term.get("note") or "",
-        }
-        if old is None:
-            merged.append(kept)
-            continue
-        if not kept["aliases"]:
-            kept["aliases"] = list(old.get("aliases") or [])
-        kept["lock"] = is_locked(old)
-        kept["note"] = old.get("note") or ""
-        kept["category"] = old.get("category") or ""
-        merged.append(kept)
-    return merged
-
-
 def legacy_terms(rows: list[dict]) -> list[dict]:
     """Old `zh=en` rows become locked terms. Aliases are kept when the line had them."""
     terms = []
@@ -153,34 +118,63 @@ def legacy_terms(rows: list[dict]) -> list[dict]:
     return terms
 
 
+# The host page has no separate editor. Rich fields are changed with this request.
+_LEGACY_EDIT_PLACE = "請用 PUT /api/rooms/{room_id}/glossary 修改"
+_LEGACY_RICH = "含備註、分類或未鎖定的詞，或文字框無法原樣表示的內容"
+
+
+def _box_aliases(term: dict) -> list[str]:
+    raw = term.get("aliases") or []
+    if not isinstance(raw, list):
+        return []
+    return [alias for alias in raw if isinstance(alias, str) and alias]
+
+
+def _term_unexpressable(term) -> bool:
+    """True when a legacy line would drop or change this term.
+
+    `zh|alias=en` round-trips aliases. Lock off, a note, a category, or text the
+    line would rewrite (a `|` inside the canonical, a padded alias) does not.
+    """
+    if not isinstance(term, dict):
+        return False
+    if not is_locked(term):
+        return True
+    if str(term.get("note") or "").strip():
+        return True
+    if str(term.get("category") or "").strip():
+        return True
+    zh = term.get("zh")
+    en = term.get("en")
+    if not isinstance(zh, str) or not isinstance(en, str):
+        return True
+    aliases = _box_aliases(term)
+    left = "|".join([zh, *aliases]) if aliases else zh
+    rows, problems = strict_legacy_rows(left + "=" + en, limit=LEGACY_BOX_LIMIT)
+    if problems or len(rows) != 1:
+        return True
+    row = rows[0]
+    return row.get("zh") != zh or row.get("en") != en or list(row.get("aliases") or []) != aliases
+
+
 def legacy_box_block(terms) -> str:
     """Why the textarea must not replace this glossary. Empty when the box may edit it.
 
-    Lock off, a note, a category, or any alias cannot be shown in `zh|alias=en`,
-    and more than LEGACY_BOX_LIMIT rows cannot be shown either. Refusing the post
-    is what stops one visible line from deleting the rest.
+    More than LEGACY_BOX_LIMIT rows cannot be shown. Lock off, a note, a category,
+    or text that does not round-trip through `zh|alias=en` cannot be shown either.
+    Aliases that survive that syntax do not lock the box. Refusing the post is what
+    stops one visible line from deleting a field the box cannot write back.
     """
     rows = list(terms or [])
-    advanced = False
-    for term in rows:
-        if not isinstance(term, dict):
-            continue
-        if not is_locked(term):
-            advanced = True
-        if str(term.get("note") or "").strip():
-            advanced = True
-        if str(term.get("category") or "").strip():
-            advanced = True
-        aliases = term.get("aliases") or []
-        if isinstance(aliases, list) and any(str(alias or "").strip() for alias in aliases):
-            advanced = True
+    rich = any(_term_unexpressable(term) for term in rows)
     count = len(rows)
-    if count > LEGACY_BOX_LIMIT and advanced:
-        return f"這個房間的術語表有 {count} 條／含進階欄位，請用術語表編輯器修改"
+    limit = f"（主持頁最多 {LEGACY_BOX_LIMIT} 條）"
+    if count > LEGACY_BOX_LIMIT and rich:
+        return f"這個房間的術語表有 {count} 條{limit}，而且{_LEGACY_RICH}，這裡只能看、不能改。{_LEGACY_EDIT_PLACE}"
     if count > LEGACY_BOX_LIMIT:
-        return f"這個房間的術語表有 {count} 條，請用術語表編輯器修改"
-    if advanced:
-        return "這個房間的術語表含進階欄位，請用術語表編輯器修改"
+        return f"這個房間的術語表有 {count} 條{limit}，這裡只能看、不能改。{_LEGACY_EDIT_PLACE}"
+    if rich:
+        return f"這個房間的術語表{_LEGACY_RICH}，這裡只能看、不能改。{_LEGACY_EDIT_PLACE}"
     return ""
 
 
@@ -465,11 +459,32 @@ def _exact_canon_spans(text: str, folded: str, canon: dict[str, str]) -> list[tu
 
 
 def _keeps_canons(text: str, start: int, end: int, replacement: str, spans: list[tuple[int, int]]) -> bool:
-    pieces = [text[left:right] for left, right in spans if start < right and end > left]
-    if not pieces:
+    """True when every protected canonical this edit touches still occurs afterwards.
+
+    A piece that does not overlap the edit stays in the prefix or the suffix, so it
+    is not rebuilt. An overlapping piece is kept when it still occurs outside the
+    edit or across the short junction around the replacement. This matches searching
+    the whole rewritten line without copying that line on every candidate.
+    """
+    for left, right in spans:
+        if start >= right or end <= left:
+            continue
+        piece = text[left:right]
+        if not piece or not _piece_in_replacement(text, start, end, replacement, piece):
+            return False
+    return True
+
+
+def _piece_in_replacement(text: str, start: int, end: int, replacement: str, piece: str) -> bool:
+    """Whether `piece` occurs in `text[:start] + replacement + text[end:]`."""
+    if text.find(piece, 0, start) != -1:
         return True
-    output = text[:start] + replacement + text[end:]
-    return all(piece and piece in output for piece in pieces)
+    if text.find(piece, end) != -1:
+        return True
+    span = len(piece) - 1
+    head = text[max(0, start - span):start] if span else ""
+    tail = text[end:end + span] if span else ""
+    return piece in head + replacement + tail
 
 
 def _tables(glossary) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
@@ -583,7 +598,8 @@ def _parse_term(item) -> tuple[dict | None, list[str]]:
                 problems.append("別名是空的，不能當別名")
                 continue
             if _has_control(text):
-                problems.append(f"別名「{_clip(text)}」含有控制字元")
+                visible = "".join(ch if not _has_control(ch) else f"U+{ord(ch):04X}" for ch in text)
+                problems.append(f"別名「{_clip(visible)}」含有控制字元")
                 continue
             if len(text) > MAX_ALIAS:
                 problems.append(f"別名「{_clip(text)}」超過 {MAX_ALIAS} 字")

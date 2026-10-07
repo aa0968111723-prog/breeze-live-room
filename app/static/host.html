@@ -12,7 +12,7 @@ h1 { font-size: 30px; margin: 0 0 6px; }
 p { line-height: 1.5; }
 button, input, select, textarea { font-size: 18px; }
 button { min-height: 44px; padding: 10px 16px; margin: 8px 8px 0 0; border: 0; border-radius: 12px; background: #8a5424; color: #fff; }
-button:disabled { opacity: .45; }
+button:disabled, button[aria-disabled="true"] { opacity: .45; }
 button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid #c47a32; outline-offset: 2px; }
 .lead { color: #6b5644; margin-top: 0; }
 #go { min-height: 56px; padding: 14px 28px; font-size: 22px; font-weight: 750; }
@@ -65,9 +65,9 @@ textarea[readonly] { background: #f3eadb; color: #6b5644; }
 <label>分享位址 <select id="nic"></select></label>
 </div>
 <div class="card">
-<label>這場術語，一行一個，例如 般若=prajna
-<textarea id="glossary" rows="4"></textarea></label>
-<p id="glossary-note" class="warn"></p>
+<label>這個房間的術語<span id="glossary-readonly"></span>，一行一個，例如 般若=prajna，別名寫成 禪學社|柴學社=Zen Club
+<textarea id="glossary" rows="4" aria-describedby="glossary-note"></textarea></label>
+<p id="glossary-note" class="warn" role="status"></p>
 <button id="save-terms" class="secondary" type="button">儲存術語</button>
 <button id="export" class="secondary" type="button">匯出 SRT</button>
 <label>跳過序號 <input id="skip-seq" inputmode="numeric" value="1" style="width:5em"></label>
@@ -82,7 +82,7 @@ textarea[readonly] { background: #f3eadb; color: #6b5644; }
 import { createCaptureController } from "/static/recorder_machine.js";
 import { connectRoom, createCaptionView, mergeCaptionUpdate } from "/static/room_client.js";
 import { applyCaption } from "/static/host_caption.js";
-import { glossaryBoxText, glossaryLegacyBlock, glossarySaveLine, glossarySaveRequest, glossaryTransportLine } from "/static/host_glossary.js";
+import { glossaryApplyLoadFailure, glossaryApplyLoaded, glossaryEdit, glossaryMarkSaved, glossaryPrepareLoad, glossaryRefusal, glossaryRoomState, glossarySaveDecision, glossarySaveLine, glossaryTextDirty, glossaryTransportLine } from "/static/host_glossary.js";
 const roomEl = document.querySelector("#room");
 const log = document.querySelector("#log");
 const status = document.querySelector("#status");
@@ -99,8 +99,7 @@ let holdRoom = "";
 let captionConn = null;
 let listenedRoom = "";
 let listenKey = "";
-let glossaryVersion = null;
-let glossaryLocked = false;
+let glossaryState = glossaryRoomState();
 const view = createCaptionView(80);
 const captions = view.items;
 const phaseLabels = {
@@ -209,55 +208,81 @@ async function recoverAuth() {
     authJob = null;
   }
 }
-function glossaryText() {
+function syncGlossaryText() {
   const box = document.querySelector("#glossary");
-  return box ? box.value : "";
+  if (box) glossaryState = glossaryEdit(glossaryState, box.value);
+}
+function paintGlossary() {
+  const box = document.querySelector("#glossary");
+  if (box) {
+    if (box.value !== glossaryState.text) box.value = glossaryState.text;
+    box.readOnly = !!glossaryState.readOnly;
+  }
+  const saveBtn = document.querySelector("#save-terms");
+  if (saveBtn) saveBtn.setAttribute("aria-disabled", glossaryState.locked || glossaryState.readOnly ? "true" : "false");
+  const note = document.querySelector("#glossary-note");
+  if (note) note.textContent = glossaryState.note || "";
+  const mark = document.querySelector("#glossary-readonly");
+  if (mark) mark.textContent = glossaryState.readOnly ? "（唯讀）" : "";
+}
+function glossaryText() {
+  syncGlossaryText();
+  return glossaryState.text;
 }
 async function loadGlossary(roomId) {
-  // Fill the box from the server and remember that version. A failed load leaves both alone.
+  // Fill the box from the server and remember that room and version.
+  // A room switch clears both before the GET, so a failed load cannot keep the previous room.
+  // A reconnect keeps unsaved text and the version already on screen.
   if (!token) return;
+  syncGlossaryText();
   const room = String(roomId || roomEl.value || "class").trim() || "class";
+  glossaryState = glossaryPrepareLoad(glossaryState, room);
+  paintGlossary();
+  const generation = glossaryState.generation;
   let resp;
   try {
     resp = await hostFetch("/api/rooms/" + encodeURIComponent(room) + "/glossary", { cache: "no-store" });
   } catch (err) {
+    glossaryState = glossaryApplyLoadFailure(glossaryState, room, generation);
+    paintGlossary();
     return;
   }
-  if (!resp || !resp.ok) return;
+  if (!resp || !resp.ok) {
+    glossaryState = glossaryApplyLoadFailure(glossaryState, room, generation);
+    paintGlossary();
+    return;
+  }
   if ((String(roomEl.value || "class").trim() || "class") !== room) return;
   let data = null;
   try {
     data = await resp.json();
   } catch (err) {
+    glossaryState = glossaryApplyLoadFailure(glossaryState, room, generation);
+    paintGlossary();
     return;
   }
   if ((String(roomEl.value || "class").trim() || "class") !== room) return;
-  if (!data || !Array.isArray(data.terms) || !Number.isInteger(data.version)) return;
-  const block = glossaryLegacyBlock(data.terms);
-  glossaryVersion = data.version;
-  glossaryLocked = block.locked;
-  const box = document.querySelector("#glossary");
-  if (box) {
-    box.value = glossaryBoxText(data.terms);
-    box.readOnly = block.locked;
+  syncGlossaryText();
+  if (!data || !Array.isArray(data.terms) || !Number.isInteger(data.version)) {
+    glossaryState = glossaryApplyLoadFailure(glossaryState, room, generation);
+    paintGlossary();
+    return;
   }
-  const saveBtn = document.querySelector("#save-terms");
-  if (saveBtn) saveBtn.disabled = block.locked;
-  const note = document.querySelector("#glossary-note");
-  if (note) note.textContent = block.note || "";
+  glossaryState = glossaryApplyLoaded(glossaryState, room, generation, data.terms, data.version);
+  paintGlossary();
 }
-async function postGlossary(room, sessionId, headers) {
-  const text = glossaryText();
+async function postGlossary(selectorRoom, sessionId, headers) {
+  syncGlossaryText();
   // if_version is the version stored when this box was filled. Do not GET a new
   // version here: a page left open must send the old one and receive 409.
-  const request = glossarySaveRequest(room, sessionId, text, glossaryVersion, glossaryLocked);
+  // The room is the one whose glossary is on screen, not the last recording session.
+  const request = glossarySaveDecision(glossaryState, selectorRoom, sessionId);
   if (!request.post) {
     if (request.reason === "empty") return null;
-    const reason = request.reason === "locked"
-      ? "請用術語表編輯器修改"
-      : "讀不到目前的術語表版本，請重新整理頁面後再儲存";
+    const reason = glossaryRefusal(glossaryState, request.reason);
+    const status = request.reason === "no-version" ? 409 : 400;
     return {
-      status: 409,
+      status,
       async json() {
         return { ok: false, rejected: [{ line: 0, reason }] };
       },
@@ -267,7 +292,10 @@ async function postGlossary(room, sessionId, headers) {
   const sent = headers
     ? await fetch("/api/glossary", { method: "POST", headers, body: payload })
     : await hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: payload });
-  if (sent && sent.ok) await loadGlossary(room);
+  if (sent && sent.ok) {
+    glossaryState = glossaryMarkSaved(glossaryState);
+    await loadGlossary(request.body.room_id);
+  }
   return sent;
 }
 async function reportGlossary(room, sessionId, headers) {
@@ -510,6 +538,8 @@ go.onclick = async () => {
     const activeRoom = ctl.session ? ctl.session.roomId : room;
     await hostFetch("/api/session/active", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: activeRoom, active: true }) });
     line("開始聽了。每一段都是完整錄音。");
+    syncGlossaryText();
+    if (glossaryTextDirty(glossaryState)) line("術語尚未儲存，請按「儲存術語」。沒按儲存的詞不會套用。");
   } catch (err) {
     status.className = "warn";
     status.textContent = micError(err);
@@ -554,19 +584,24 @@ document.querySelector("#try").onclick = async () => {
     status.textContent = micError(err);
   }
 };
+document.querySelector("#glossary").addEventListener("input", () => {
+  syncGlossaryText();
+});
 document.querySelector("#save-terms").onclick = async () => {
   if (!token || !ctl.session) { line("開始聽之後才會把術語存到這個房間。"); return; }
-  if (glossaryLocked) {
-    const note = document.querySelector("#glossary-note");
-    line((note && note.textContent) || "請用術語表編輯器修改");
-    return;
-  }
-  if (!String(glossaryText() || "").trim()) {
-    line("術語是空的，沒有覆蓋這個房間已儲存的詞表。");
+  syncGlossaryText();
+  const selector = (roomEl.value || "class").trim() || "class";
+  const decision = glossarySaveDecision(glossaryState, selector, ctl.session.id);
+  if (!decision.post) {
+    if (decision.reason === "empty") {
+      line("術語是空的，沒有覆蓋這個房間已儲存的詞表。");
+      return;
+    }
+    line(glossaryRefusal(glossaryState, decision.reason));
     return;
   }
   try {
-    await reportGlossary(ctl.session.roomId, ctl.session.id);
+    await reportGlossary(selector, ctl.session.id);
   } catch (err) {
     line(glossaryTransportLine(err));
   }

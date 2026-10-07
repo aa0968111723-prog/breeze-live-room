@@ -124,6 +124,54 @@ def test_overlapping_terms_normalize_until_stable():
     assert normalize(normalize("柴學舍長", accepted), accepted) == once
 
 
+def test_keeps_canons_matches_the_rewritten_line():
+    from app.glossary import _keeps_canons
+
+    text = "丙丁戊甲乙丙丁庚"
+    spans = [(0, 2), (5, 7)]
+    samples = (
+        (0, 2, "丙丁"),
+        (3, 5, "庚辛"),
+        (1, 3, "甲乙"),
+        (5, 7, "空性"),
+        (0, 4, "丙丁戊甲"),
+        (2, 6, "戊甲乙丙"),
+    )
+    for start, end, replacement in samples:
+        pieces = [text[left:right] for left, right in spans if start < right and end > left]
+        output = text[:start] + replacement + text[end:]
+        naive = (not pieces) or all(piece and piece in output for piece in pieces)
+        assert _keeps_canons(text, start, end, replacement, spans) is naive, (start, end, replacement)
+
+
+def test_overlapping_alias_is_kept_when_the_canon_string_survives():
+    glossary = [{"zh": "丙丁", "aliases": ["甲丙"], "en": "a", "lock": True, "category": "", "note": ""}]
+    accepted, rejected = validate_terms(glossary)
+    assert rejected == []
+    assert normalize("甲丙丁", accepted) == "丙丁丁"
+    assert normalize("丙丁甲乙", accepted) == "丙丁甲乙"
+
+
+def test_long_alias_expansion_keeps_the_written_canon():
+    """A 2-character alias expanding to a 20-character canonical must stay fast at 5000 characters.
+
+    Rebuilding the whole line for every candidate was about half a second to a second here.
+    """
+    canon = "丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥"
+    assert len(canon) == 20
+    glossary = [{"zh": canon, "aliases": ["甲乙"], "en": "a", "lock": True, "category": "", "note": ""}]
+    accepted, rejected = validate_terms(glossary)
+    assert rejected == []
+    text = "甲乙" * 2500
+    assert len(text) == 5000
+    started = time.perf_counter()
+    out = normalize(text, accepted)
+    elapsed = time.perf_counter() - started
+    assert out == canon * 2500
+    assert normalize(out, accepted) == out
+    assert elapsed < 1.0, elapsed
+
+
 def test_replaced_canonical_is_not_eaten_across_the_boundary():
     """戊甲乙 becomes 戊丙丁. The next pass must not turn that 丙丁 into 庚辛."""
     glossary = [

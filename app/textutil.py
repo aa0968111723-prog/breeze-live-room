@@ -172,7 +172,9 @@ def strict_legacy_rows(raw: str, limit: int = 40, max_en: int = 80) -> tuple[lis
                 # Whitespace-only, including a fullwidth space, is an empty alias.
                 # A zero-width character is not stripped; validation rejects it later.
                 if not part:
-                    rejected.append({"line": line_no, "reason": "別名是空的，不能當別名"})
+                    reason = "別名是空的，不能當別名"
+                    if not rejected or rejected[-1].get("line") != line_no or rejected[-1].get("reason") != reason:
+                        rejected.append({"line": line_no, "reason": reason})
                     line_bad = True
                     continue
                 aliases.append(part)
@@ -187,7 +189,7 @@ def strict_legacy_rows(raw: str, limit: int = 40, max_en: int = 80) -> tuple[lis
         if len(rows) >= limit:
             return [], [{"line": line_no, "reason": f"術語超過 {limit} 條"}]
         if len(en) > max_en:
-            rejected.append({"line": line_no, "reason": f"第 {line_no} 行的英文超過 {max_en} 字"})
+            rejected.append({"line": line_no, "reason": f"英文超過 {max_en} 字"})
             continue
         row = {"zh": zh, "en": en, "line": line_no}
         if aliases:

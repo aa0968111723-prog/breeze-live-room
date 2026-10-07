@@ -224,17 +224,43 @@ async def test_legacy_post_does_not_store_terms_put_would_reject(tmp_path):
             assert rejected == []
             round_trip = await _put(client, token, "class", view["terms"], view["version"])
             assert round_trip.status_code == 200, round_trip.text
-            replaced = await client.post(
+            # An alias the textarea can show is editable. The same line saves again.
+            echoed = await client.post(
                 "/api/glossary",
-                json={"room_id": "class", "session_id": "s", "text": "般若=prajna\n", "if_version": 2},
+                json={
+                    "room_id": "class",
+                    "session_id": "s",
+                    "text": "禪學社|柴學社=Zen Club\n",
+                    "if_version": 2,
+                },
                 headers={**auth(token), "content-type": "application/json"},
             )
-            assert replaced.status_code in (400, 409), replaced.text
+            assert echoed.status_code == 200, echoed.text
+            assert echoed.json()["deleted"] == 0
+            echoed_view = (await _get(client, token, "class")).json()
+            assert echoed_view["version"] == 3
+            assert echoed_view["terms"][0]["aliases"] == ["柴學社"]
+            # A note is not in the textarea syntax, so a legacy replace is refused.
+            noted = await _put(
+                client, token, "class",
+                [{**echoed_view["terms"][0], "note": "主持人備註"}],
+                echoed_view["version"],
+            )
+            assert noted.status_code == 200, noted.text
+            replaced = await client.post(
+                "/api/glossary",
+                json={"room_id": "class", "session_id": "s", "text": "般若=prajna\n", "if_version": 4},
+                headers={**auth(token), "content-type": "application/json"},
+            )
+            assert replaced.status_code == 400, replaced.text
             assert replaced.json()["ok"] is False
+            assert any("PUT /api/rooms/" in item["reason"] for item in replaced.json()["rejected"])
+            assert all("編輯器" not in item["reason"] for item in replaced.json()["rejected"])
             current = (await _get(client, token, "class")).json()
-            assert current["version"] == 2
+            assert current["version"] == 4
             assert current["terms"][0]["zh"] == "禪學社"
             assert current["terms"][0]["aliases"] == ["柴學社"]
+            assert current["terms"][0]["note"] == "主持人備註"
             stale = await _put(client, token, "class", [_term("空性", en="emptiness")], 1)
             assert stale.status_code == 409
             assert (await _get(client, token, "class")).json()["terms"][0]["zh"] == "禪學社"

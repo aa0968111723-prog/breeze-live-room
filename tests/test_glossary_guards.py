@@ -12,6 +12,7 @@ from httpx import ASGITransport, AsyncClient
 from app.dispatch import RoomBus, for_listener
 from app.glossary import (
     guarded_flags,
+    legacy_box_block,
     missing_locked,
     normalize,
     prompt_terms,
@@ -322,6 +323,29 @@ async def test_t_leg1_empty_legacy_post_does_not_clear():
         await stop(app)
 
 
+def test_legacy_box_block_names_the_put_path_and_allows_alias_round_trip():
+    assert legacy_box_block([_term("般若", en="prajna")]) == ""
+    assert legacy_box_block([_term("禪學社", ["柴學社"], en="Zen Club")]) == ""
+    assert legacy_box_block([{**_term("般若", en="prajna"), "note": "  "}]) == ""
+    noted = legacy_box_block([{**_term("禪學社", en="Zen Club"), "note": "備註"}])
+    assert "PUT /api/rooms/{room_id}/glossary" in noted
+    assert "主持頁最多 40 條" not in noted
+    assert "編輯器" not in noted
+    assert "進階欄位" not in noted
+    assert "備註" in noted
+    unlocked = legacy_box_block([_term("禪學社", en="Zen Club", lock=False)])
+    assert "PUT /api/rooms/{room_id}/glossary" in unlocked
+    assert "未鎖定" in unlocked or "備註" in unlocked
+    many = [_term(f"詞{i:02d}", en="e") for i in range(41)]
+    over = legacy_box_block(many)
+    assert "41" in over
+    assert "主持頁最多 40 條" in over
+    assert "PUT /api/rooms/{room_id}/glossary" in over
+    assert "編輯器" not in over
+    weird = legacy_box_block([_term("禪學社", ["柴|學社"], en="Zen Club")])
+    assert "PUT /api/rooms/{room_id}/glossary" in weird
+
+
 @pytest.mark.anyio
 async def test_t_leg2_legacy_post_ignores_session_and_rejects_a_stale_version():
     app = app_for(settings=_settings(), translator=Translator(enabled=False))
@@ -353,9 +377,10 @@ async def test_t_leg2_legacy_post_ignores_session_and_rejects_a_stale_version():
                 client, token, "class", "禪學社=Zen Club\n般若=prajna", session_id="another-session",
                 if_version=1,
             )
-            assert replaced.status_code in (400, 409), replaced.text
+            assert replaced.status_code == 400, replaced.text
             assert replaced.json()["ok"] is False
-            assert any("進階" in item["reason"] or "編輯器" in item["reason"] for item in replaced.json()["rejected"])
+            assert any("PUT /api/rooms/" in item["reason"] for item in replaced.json()["rejected"])
+            assert all("編輯器" not in item["reason"] for item in replaced.json()["rejected"])
             current = (await _get(client, token, "class")).json()
             assert current["version"] == 1
             term = current["terms"][0]
@@ -653,7 +678,7 @@ async def test_legacy_post_keeps_put_fields_when_the_line_repeats_the_term():
             )
             assert saved.status_code == 200, saved.text
             edited = await _post(client, token, "class", "禪學社=Zen Society", if_version=1)
-            assert edited.status_code in (400, 409), edited.text
+            assert edited.status_code == 400, edited.text
             view = (await _get(client, token, "class")).json()
             term = view["terms"][0]
             assert view["version"] == 1
@@ -663,13 +688,14 @@ async def test_legacy_post_keeps_put_fields_when_the_line_repeats_the_term():
             assert term["note"] == "主持人備註"
             assert term["category"] == "社團"
             typed = await _post(client, token, "class", "禪學社|新別名=Zen Society", if_version=view["version"])
-            assert typed.status_code in (400, 409), typed.text
+            assert typed.status_code == 400, typed.text
             renamed = (await _get(client, token, "class")).json()["terms"][0]
             assert renamed["aliases"] == ["柴學社"]
             assert renamed["note"] == "主持人備註"
             assert renamed["lock"] is False
             assert renamed["en"] == "Zen Club"
-            # A stored alias makes the textarea read-only, so the post cannot delete it or collide.
+            # The alias round-trips, so the box may edit it. Keeping the alias and also
+            # using it as another canonical is still rejected, and the stored alias stays.
             clash_saved = await _put(
                 client, token, "side",
                 [_term("禪學社", ["柴學社"], en="Zen Club", lock=True)],
@@ -679,11 +705,12 @@ async def test_legacy_post_keeps_put_fields_when_the_line_repeats_the_term():
             side_version = (await _get(client, token, "side")).json()["version"]
             clash = await _post(
                 client, token, "side",
-                "禪學社=Zen Club\n柴學社=other",
+                "禪學社|柴學社=Zen Club\n柴學社=other",
                 if_version=side_version,
             )
-            assert clash.status_code in (400, 409), clash.text
-            assert any("進階" in item["reason"] or "編輯器" in item["reason"] for item in clash.json()["rejected"])
+            assert clash.status_code == 400, clash.text
+            assert any("柴學社" in item["reason"] and "標準詞" in item["reason"] for item in clash.json()["rejected"])
+            assert all("編輯器" not in item["reason"] for item in clash.json()["rejected"])
             after = (await _get(client, token, "side")).json()
             assert after["version"] == side_version
             assert after["terms"][0]["aliases"] == ["柴學社"]
@@ -784,12 +811,31 @@ async def test_l7_advanced_glossary_legacy_post_does_not_delete():
             for room, term in cases:
                 saved = await _put(client, token, room, [term], 0)
                 assert saved.status_code == 200, (room, saved.text)
+                if room == "alias":
+                    posted = await _post(client, token, room, "禪學社|柴學社=Zen Club", if_version=1)
+                    assert posted.status_code == 200, posted.text
+                    assert posted.json()["deleted"] == 0
+                    reloaded = (await _get(client, token, room)).json()
+                    assert reloaded["version"] == 2
+                    assert reloaded["terms"][0]["aliases"] == ["柴學社"]
+                    edited = await _post(client, token, room, "禪學社|新別名=Zen Club", if_version=2)
+                    assert edited.status_code == 200, edited.text
+                    changed = (await _get(client, token, room)).json()
+                    assert changed["terms"][0]["zh"] == "禪學社"
+                    assert changed["terms"][0]["aliases"] == ["新別名"]
+                    assert changed["terms"][0]["en"] == "Zen Club"
+                    dropped = await _post(client, token, room, "禪學社=Zen Club", if_version=changed["version"])
+                    assert dropped.status_code == 200, dropped.text
+                    assert dropped.json()["deleted"] == 0
+                    cleared = (await _get(client, token, room)).json()
+                    assert cleared["terms"][0]["aliases"] == []
+                    again = await _post(client, token, room, "禪學社|柴學社=Zen Club", if_version=cleared["version"])
+                    assert again.status_code == 200, again.text
+                    continue
                 posted = await _post(client, token, room, "般若=prajna", if_version=1)
-                assert posted.status_code in (400, 409), (room, posted.text)
-                assert any(
-                    "進階" in item["reason"] or "編輯器" in item["reason"]
-                    for item in posted.json()["rejected"]
-                )
+                assert posted.status_code == 400, (room, posted.text)
+                assert any("PUT /api/rooms/" in item["reason"] for item in posted.json()["rejected"])
+                assert all("編輯器" not in item["reason"] for item in posted.json()["rejected"])
                 view = (await _get(client, token, room)).json()
                 assert view["version"] == 1, room
                 assert view["terms"][0]["zh"] == "禪學社"
@@ -823,7 +869,11 @@ async def test_legacy_box_cannot_shrink_a_large_glossary_and_a_stale_page_is_409
             assert stale.status_code == 409, stale.text
             shrunk = await _post(client, token, "class", "般若=prajna", if_version=1)
             assert shrunk.status_code == 400, shrunk.text
-            assert any("200" in item["reason"] and "編輯器" in item["reason"] for item in shrunk.json()["rejected"])
+            assert any(
+                "200" in item["reason"] and "40" in item["reason"] and "PUT /api/rooms/" in item["reason"]
+                for item in shrunk.json()["rejected"]
+            )
+            assert all("編輯器" not in item["reason"] for item in shrunk.json()["rejected"])
             view = (await _get(client, token, "class")).json()
             assert view["version"] == 1
             assert len(view["terms"]) == 200
