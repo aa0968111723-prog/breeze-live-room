@@ -129,7 +129,7 @@ async def test_module_imports_carry_a_content_version():
         expected = stored_text(STATIC / "room.html")
         assert room.text == stamp_static_imports(expected, STATIC)
         room_versions = import_versions(room.text, STATIC)
-        assert set(room_versions) == {"room_client.js"}
+        assert set(room_versions) == {"room_client.js", "room_prefs.js", "room_view.js"}
         assert room_versions["room_client.js"] == host_versions["room_client.js"]
 
         for page in ("/static/host.html", "/static/room.html"):
@@ -138,7 +138,9 @@ async def test_module_imports_carry_a_content_version():
                 host_versions if page.endswith("host.html") else room_versions
             )
 
-        for name, token in host_versions.items():
+        versions = dict(host_versions)
+        versions.update(room_versions)
+        for name, token in versions.items():
             prefix, suffix = token.rsplit("-", 1)
             assert prefix == version, token
             assert len(suffix) == 8 and all(ch in "0123456789abcdef" for ch in suffix)
