@@ -366,6 +366,9 @@ async def test_queued_translation_past_the_timeout_is_skipped_without_dropping_c
             skipped = [item for item in history if item.get("translate_status") == "skipped"]
             assert len(skipped) >= 2
             assert {item["zh"] for item in skipped} >= {"太舊", "也太舊"}
+            assert app.state.pipeline.translate_stale >= 2
+            assert app.state.pipeline.translate_skipped == 0
+            assert app.state.pipeline.translate_timeouts == 0
             for item in skipped:
                 assert item["en"] == ""
                 assert item["status"] == "translate_failed"

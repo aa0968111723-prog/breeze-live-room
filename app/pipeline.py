@@ -133,6 +133,10 @@ class Pipeline:
         self._seeded: set[str] = set()
         self._flushing: set[tuple[str, str]] = set()
         self.translate_skipped = 0
+        self.translate_timeouts = 0
+        self.translate_stale = 0
+        self.translate_errors = 0
+        self.translate_waiter_timeouts = 0
         self._translate_busy = 0
         self._recent_zh: dict[tuple[str, str], deque] = {}
         self._tasks: list[asyncio.Task] = []
@@ -206,6 +210,10 @@ class Pipeline:
             "results": len(self.results),
             "translate_queued": 0 if self._translate_q is None else self._translate_q.qsize(),
             "translate_skipped": self.translate_skipped,
+            "translate_timeouts": self.translate_timeouts,
+            "translate_stale": self.translate_stale,
+            "translate_errors": self.translate_errors,
+            "translate_waiter_timeouts": self.translate_waiter_timeouts,
         }
         payload.update(self._rtf.snapshot())
         return payload
@@ -1371,16 +1379,13 @@ class Pipeline:
         try:
             old_epoch, _old_at, old = self._translate_q.get_nowait()
         except asyncio.QueueEmpty:
-            self.translate_skipped += 1
             loop.call_soon(self._skip_backlog, segment, epoch)
             return
         self._translate_q.task_done()
-        self.translate_skipped += 1
         loop.call_soon(self._skip_backlog, old, old_epoch)
         try:
             self._translate_q.put_nowait(item)
         except asyncio.QueueFull:
-            self.translate_skipped += 1
             loop.call_soon(self._skip_backlog, segment, epoch)
 
     def _skip_backlog(self, segment: Segment, epoch: int) -> None:
@@ -1397,6 +1402,22 @@ class Pipeline:
         self._fail_translation(segment, "skipped_backlog", "英譯積壓，略過較舊的段落，中文仍保留")
         self._wake(segment.key, segment)
 
+    def _account_translate_failure(self, translate_status: str) -> None:
+        """Count one published failure. A skip that never lands is not counted."""
+        if translate_status == "skipped_backlog":
+            self.translate_skipped += 1
+            return
+        bucket = {
+            "timeout": "translate_timeouts",
+            # Queued longer than the translate budget. The row status stays "skipped".
+            "skipped": "translate_stale",
+            "error": "translate_errors",
+            "waiter_timeout": "translate_waiter_timeouts",
+        }.get(translate_status)
+        if bucket is None:
+            return
+        setattr(self, bucket, getattr(self, bucket) + 1)
+
     def _fail_translation(self, segment: Segment, translate_status: str, error: str) -> None:
         if self._stale(segment) or segment.key not in self._emitted_segs:
             segment.translate_queued = False
@@ -1408,6 +1429,7 @@ class Pipeline:
         segment.status = "translate_failed"
         segment.version += 1
         self.results[segment.key] = segment
+        self._account_translate_failure(translate_status)
         self._emit(segment)
 
     def _queue_translate(self, segment: Segment) -> None:
@@ -1438,7 +1460,7 @@ class Pipeline:
             self._discard_waiter(segment.key, fut)
             if segment.translate_queued and segment.status == "zh_ready":
                 segment.translate_queued = False
-                self._fail_translation(segment, "timeout", "英譯逾時，不假設沒有計費。中文仍保留")
+                self._fail_translation(segment, "waiter_timeout", "英譯逾時，不假設沒有計費。中文仍保留")
                 self._wake(segment.key, segment)
 
     async def _translate_loop(self) -> None:
