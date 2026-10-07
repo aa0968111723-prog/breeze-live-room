@@ -242,8 +242,22 @@ def verdict_p95(snapshot: dict, room: str | None = None) -> float | None:
     return None
 
 
+def _sample_count(snapshot: dict, room: str | None = None) -> int:
+    """Samples the verdict may use. A room that only failed recognition counts as zero."""
+    rows = _session_rows(snapshot, room)
+    if rows:
+        return sum(int(row.get("count") or 0) for row in rows)
+    if room:
+        return 0
+    rtf = snapshot.get("rtf") if isinstance(snapshot, dict) else None
+    session = rtf.get("session") if isinstance(rtf, dict) else None
+    if isinstance(session, dict):
+        return int(session.get("count") or 0)
+    return 0
+
+
 def render(snapshot: dict, source: str, room: str | None = None) -> tuple[str, int]:
-    """Text report and process exit code. Max session p95 < 0.9 passes; a missing sample fails."""
+    """Text report and process exit code. Max session p95 < 0.9 passes; no sample fails."""
     rtf = snapshot.get("rtf") if isinstance(snapshot, dict) else None
     if not isinstance(rtf, dict) or not isinstance(rtf.get("session"), dict):
         text = "這份結果沒有 rtf。請更新到會回報辨識即時率的版本。\n" + UNVERIFIED
@@ -264,6 +278,9 @@ def render(snapshot: dict, source: str, room: str | None = None) -> tuple[str, i
     timeouts = snapshot.get("asr_timeouts")
     if timeouts is not None:
         lines.append(f"辨識逾時（不計入 RTF）：{int(timeouts)}")
+    errors = snapshot.get("asr_errors")
+    if errors is not None:
+        lines.append(f"辨識錯誤（不計入 RTF）：{int(errors)}")
     rows = rtf.get("sessions") if isinstance(rtf.get("sessions"), list) else []
     if len(rows) > 1:
         for row in rows:
@@ -274,10 +291,11 @@ def render(snapshot: dict, source: str, room: str | None = None) -> tuple[str, i
                 f"房間 {row.get('room_id')}/{row.get('session_id')}："
                 f"{int(row.get('count') or 0)} 段，RTF p95 {_fmt_rtf(row_p95)}"
             )
+    sample_count = _sample_count(snapshot, room)
     if room and not _session_rows(snapshot, room):
         lines.append(f"結果：FAIL（沒有房間 {room} 的 RTF 樣本，門檻 p95 < {P95_LIMIT}）")
         code = 1
-    elif p95 is None:
+    elif p95 is None or sample_count <= 0:
         lines.append(f"結果：FAIL（沒有 RTF 樣本，門檻 p95 < {P95_LIMIT}）")
         code = 1
     elif float(p95) < P95_LIMIT:

@@ -308,7 +308,7 @@ function recognitionSpeedView(data, listening) {
   const block = stats && stats.rtf;
   const p50 = block && block.p50 != null ? Number(block.p50) : null;
   const p95 = block && block.p95 != null ? Number(block.p95) : null;
-  if (!count || p50 == null || p95 == null || Number.isNaN(p50) || Number.isNaN(p95)) return empty;
+  if (!(count > 0) || p50 == null || p95 == null || Number.isNaN(p50) || Number.isNaN(p95)) return empty;
   let tone = "speed-ok";
   let word = "跟得上";
   if (p95 >= 0.9) {

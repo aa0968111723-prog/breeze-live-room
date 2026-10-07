@@ -407,6 +407,7 @@ async def test_silence_skip_does_not_record_rtf():
             assert body["backlog_audio_s"] == 0
             assert body["backlog_s"] == 0
             assert body["asr_timeouts"] == 0
+            assert body["asr_errors"] == 0
             assert body["silent_skipped"] == 1
             assert body["asr_empty"] == 0
             assert body["last_process_ms"] is None
@@ -554,12 +555,9 @@ def _extract_function(source: str, name: str) -> str:
 
 def _node_bin() -> str:
     found = shutil.which("node")
-    if found:
-        return found
-    candidate = Path("/workspace/zen-bridge-qa/node22/bin/node")
-    if candidate.is_file():
-        return str(candidate)
-    pytest.skip("node is not installed")
+    if not found:
+        pytest.skip("node is not installed")
+    return found
 
 
 def test_host_speed_line_wording_for_each_band():
@@ -598,7 +596,15 @@ def test_host_speed_line_wording_for_each_band():
     cases = [
         {"data": None, "listening": listening, "text": empty, "tone": "speed-empty"},
         {"data": {}, "listening": listening, "text": empty, "tone": "speed-empty"},
-        {"data": sample(None, None, count=0), "listening": listening, "text": empty, "tone": "speed-empty"},
+        {"data": sample(None, None, count=0), "listening": listening, "text": empty, "tone": "speed-empty", "absent": ["跟得上"]},
+        {"data": sample(0, 0, count=0), "listening": listening, "text": empty, "tone": "speed-empty", "absent": ["跟得上", "0.00"]},
+        {
+            "data": {"rtf": {"sessions": [{"room_id": "class", "session_id": "live", "count": 0, "rtf": {"p50": 0, "p95": 0}}]}},
+            "listening": listening,
+            "text": empty,
+            "tone": "speed-empty",
+            "absent": ["跟得上"],
+        },
         {"data": sample(0.42, 0.50), "listening": None, "text": empty, "tone": "speed-empty", "absent": ["0.42", "0.99"]},
         {"data": sample(0.42, 0.50), "listening": {"roomId": "class", "sessionId": "brand-new"}, "text": empty, "tone": "speed-empty", "absent": ["0.42", "0.99", "1.20"]},
         {"data": sample(0.42, 0.50), "listening": listening, "text": line(0.42, 0.50, "跟得上"), "tone": "speed-ok", "absent": ["接近上限", "跟不上", "最近 200"]},
@@ -687,6 +693,7 @@ async def test_asr_timeout_is_not_an_rtf_sample():
             body = (await client.get("/api/metrics", headers=auth(token))).json()
             assert EXISTING <= set(body)
             assert body["asr_timeouts"] == 1
+            assert body["asr_errors"] == 0
             assert body["silent_skipped"] == 0
             assert body["asr_empty"] == 0
             assert body["last_process_ms"] is None
@@ -834,7 +841,24 @@ def test_percentile_cache_recomputes_only_when_a_sample_arrives(monkeypatch):
     meter.note_timeout(("room", "s"))
     second = meter.snapshot()
     assert calls["n"] == used
-    assert second["rtf"]["window"] is first["rtf"]["window"]
+    assert second["rtf"]["window"] == first["rtf"]["window"]
+    assert second["rtf"]["window"] is not first["rtf"]["window"]
+    assert second["rtf"]["session"] is not first["rtf"]["session"]
+    saved_p95 = first["asr_rtf_p95"]
+    saved_window = first["rtf"]["window"]["rtf"]["p95"]
+    saved_recent = first["rtf"]["sessions"][0]["recent"]["rtf"]["p95"]
+    second["rtf"]["window"]["rtf"]["p95"] = 999
+    second["rtf"]["window"]["count"] = 0
+    second["rtf"]["sessions"][0]["rtf"]["p95"] = 999
+    second["rtf"]["sessions"][0]["recent"]["rtf"]["p95"] = 999
+    second["rtf"]["session"]["rtf"]["p95"] = 999
+    again = meter.snapshot()
+    assert calls["n"] == used
+    assert again["asr_rtf_p95"] == saved_p95
+    assert again["rtf"]["window"]["count"] == 2
+    assert again["rtf"]["window"]["rtf"]["p95"] == saved_window
+    assert again["rtf"]["sessions"][0]["recent"]["rtf"]["p95"] == saved_recent
+    assert again["rtf"]["session"]["rtf"]["p95"] == saved_window
     assert second["backlog_s"] == 1.5
     assert second["backlog_estimated"] is True
     assert second["silent_skipped"] == 1
@@ -977,6 +1001,7 @@ async def test_empty_asr_is_counted_apart_from_silence_and_timeouts():
             assert empty.json()["status"] == "silent"
             body = (await client.get("/api/metrics", headers=auth(token))).json()
             assert body["asr_empty"] == 1
+            assert body["asr_errors"] == 0
             assert body["silent_skipped"] == 0
             assert body["asr_timeouts"] == 0
             assert body["rtf"]["session"]["count"] == 1
@@ -986,9 +1011,198 @@ async def test_empty_asr_is_counted_apart_from_silence_and_timeouts():
             assert failed.json()["status"] == "error"
             after = (await client.get("/api/metrics", headers=auth(token))).json()
             assert after["asr_empty"] == 1
+            assert after["asr_errors"] == 1
             assert after["silent_skipped"] == 0
             assert after["asr_timeouts"] == 0
-            assert after["rtf"]["session"]["count"] == 2
+            assert after["asr_samples"] == 1
+            assert after["rtf"]["session"]["count"] == 1
+            assert after["rtf"]["window"]["count"] == 1
+            assert after["rtf"]["sessions"][0]["count"] == 1
+            assert after["rtf"]["sessions"][0]["asr_errors"] == 1
+            assert after["rtf"]["sessions"][0]["asr_empty"] == 1
             assert asr.calls == 2
+    finally:
+        await app.state.shutdown()
+
+
+def _rtf_check():
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "tools" / "rtf_check.py"
+    spec = importlib.util.spec_from_file_location("rtf_check_metrics_gate", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_asr_errors_are_counted_apart_from_samples():
+    meter = RtfMeter()
+    meter.record_ms(200, 1000, ("room", "class"))
+    before = meter.snapshot()["asr_rtf_p95"]
+    meter.note_error(("room", "class"))
+    meter.note_error(("room", "class"))
+    snap = meter.snapshot()
+    assert snap["asr_errors"] == 2
+    assert snap["asr_timeouts"] == 0
+    assert snap["asr_empty"] == 0
+    assert snap["asr_samples"] == 1
+    assert snap["asr_rtf_p95"] == before
+    assert snap["rtf"]["window"]["count"] == 1
+    assert _rows(snap)[("room", "class")]["asr_errors"] == 2
+    assert _rows(snap)[("room", "class")]["count"] == 1
+    meter.note_error(("room", "next"))
+    after = meter.snapshot()
+    assert after["asr_errors"] == 3
+    assert after["rtf"]["session"]["count"] == 0
+    assert after["rtf"]["window"]["count"] == 1
+    assert after["asr_rtf_p95"] == before
+    meter.drop_room("room")
+    dropped = meter.snapshot()
+    assert dropped["asr_errors"] == 3
+    assert dropped["rtf"]["sessions"] == []
+    text = Path("scripts/device_check.py").read_text(encoding="utf-8")
+    assert '"asr_errors"' in text
+    assert "asr_errors={row.get('asr_errors')}" in text
+
+
+@pytest.mark.anyio
+async def test_all_asr_errors_leave_no_sample_and_fail_rtf_check():
+    class AlwaysFail:
+        def __init__(self):
+            self.calls = 0
+
+        def transcribe(self, wav: Path, prompt: str) -> AsrResult:
+            del wav, prompt
+            self.calls += 1
+            return AsrResult(ok=False, text="", error="找不到 Breeze 模型")
+
+    asr = AlwaysFail()
+    app = app_for(asr)
+    blob = wave_bytes(1.0)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            for seq in range(1, 11):
+                failed = await push(client, token, seq, blob)
+                assert failed.status_code == 422, failed.text
+                assert failed.json()["status"] == "error"
+            body = (await client.get("/api/metrics", headers=auth(token))).json()
+            assert asr.calls == 10
+            assert body["asr_errors"] == 10
+            assert body["asr_samples"] == 0
+            assert body["asr_rtf_p95"] is None
+            assert body["asr_rtf_p50"] is None
+            assert body["asr_timeouts"] == 0
+            assert body["asr_empty"] == 0
+            assert body["silent_skipped"] == 0
+            assert body["rtf"]["window"]["count"] == 0
+            assert body["rtf"]["session"]["count"] == 0
+            assert body["rtf"]["session"]["rtf"]["p95"] is None
+            assert body["backlog_s"] == 0
+            row = _rows(body)[("class", "s")]
+            assert row["count"] == 0
+            assert row["asr_errors"] == 10
+            assert row["recent"]["count"] == 0
+            text, code = _rtf_check().render(body, "十段全錯")
+            assert code != 0
+            assert "結果：PASS" not in text
+            assert "FAIL" in text
+            assert "沒有 RTF 樣本" in text
+            assert "辨識錯誤（不計入 RTF）：10" in text
+    finally:
+        await app.state.shutdown()
+
+
+@pytest.mark.anyio
+async def test_mixed_asr_results_record_only_successes():
+    class Mixed:
+        def __init__(self):
+            self.calls = 0
+
+        def transcribe(self, wav: Path, prompt: str) -> AsrResult:
+            del wav, prompt
+            self.calls += 1
+            if self.calls % 2 == 0:
+                return AsrResult(ok=False, text="沒算", error="辨識失敗")
+            return AsrResult(ok=True, text="中文")
+
+    asr = Mixed()
+    app = app_for(asr)
+    blob = wave_bytes(1.0)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            codes = []
+            for seq in range(1, 5):
+                resp = await push(client, token, seq, blob)
+                codes.append(resp.status_code)
+            assert codes == [200, 422, 200, 422]
+            body = (await client.get("/api/metrics", headers=auth(token))).json()
+            assert asr.calls == 4
+            assert body["asr_errors"] == 2
+            assert body["asr_empty"] == 0
+            assert body["asr_samples"] == 2
+            assert body["rtf"]["window"]["count"] == 2
+            assert body["rtf"]["session"]["count"] == 2
+            assert body["asr_rtf_p95"] is not None
+            assert _rows(body)[("class", "s")]["asr_errors"] == 2
+            assert _rows(body)[("class", "s")]["count"] == 2
+            text, code = _rtf_check().render(body, "混合")
+            assert code == 0
+            assert "結果：PASS" in text
+            assert "辨識錯誤（不計入 RTF）：2" in text
+    finally:
+        await app.state.shutdown()
+
+
+@pytest.mark.anyio
+async def test_asr_exception_is_counted_and_not_a_sample():
+    class Boom:
+        def __init__(self):
+            self.calls = 0
+
+        def transcribe(self, wav: Path, prompt: str) -> AsrResult:
+            del wav, prompt
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("模型炸了")
+            return AsrResult(ok=True, text="中文")
+
+    asr = Boom()
+    app = app_for(asr)
+    blob = wave_bytes(1.0)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            failed = await push(client, token, 1, blob)
+            assert failed.status_code == 422, failed.text
+            assert failed.json()["status"] == "error"
+            assert "模型炸了" in failed.json()["detail"]
+            body = (await client.get("/api/metrics", headers=auth(token))).json()
+            assert body["asr_errors"] == 1
+            assert body["asr_timeouts"] == 0
+            assert body["asr_empty"] == 0
+            assert body["asr_samples"] == 0
+            assert body["asr_rtf_p95"] is None
+            assert body["rtf"]["window"]["count"] == 0
+            assert body["rtf"]["session"]["count"] == 0
+            assert body["backlog_s"] == 0
+            assert _rows(body)[("class", "s")]["asr_errors"] == 1
+            assert _rows(body)[("class", "s")]["count"] == 0
+            text, code = _rtf_check().render(body, "例外")
+            assert code != 0
+            assert "結果：PASS" not in text
+            done = await push(client, token, 2, blob)
+            assert done.status_code == 200, done.text
+            after = (await client.get("/api/metrics", headers=auth(token))).json()
+            assert asr.calls == 2
+            assert after["asr_errors"] == 1
+            assert after["asr_samples"] == 1
+            assert after["rtf"]["window"]["count"] == 1
+            assert after["rtf"]["session"]["count"] == 1
+            assert after["asr_rtf_p95"] is not None
+            assert _rows(after)[("class", "s")]["asr_errors"] == 1
+            assert _rows(after)[("class", "s")]["count"] == 1
     finally:
         await app.state.shutdown()

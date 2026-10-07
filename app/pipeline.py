@@ -1180,7 +1180,8 @@ class Pipeline:
         slot_wait_s = 0.0
         try:
             segment.status = "decoding"
-            decode_mark = time.monotonic()
+            # perf_counter: monotonic steps by ~15.6 ms on Windows Python <= 3.12.
+            decode_mark = time.perf_counter()
             try:
                 wav = await wait_bounded(
                     asyncio.to_thread(self._decode_sync, work, audio, decoder),
@@ -1195,7 +1196,7 @@ class Pipeline:
             except Exception as exc:
                 self.fail_received(segment, str(exc)[:180] or "解碼失敗", status="error")
                 return segment
-            decode_s = time.monotonic() - decode_mark
+            decode_s = time.perf_counter() - decode_mark
             if segment.key in self._cancel:
                 self.fail_received(segment, "主持端取消這段", status="cancelled")
                 return segment
@@ -1222,10 +1223,11 @@ class Pipeline:
             if audio_s > 0:
                 self._rtf.note_waiting(segment.key, audio_s, estimated=False)
             record_s: float | None = None
+            asr_ok = False
             try:
-                slot_mark = time.monotonic()
+                slot_mark = time.perf_counter()
                 async with self._asr_slots:
-                    slot_wait_s = time.monotonic() - slot_mark
+                    slot_wait_s = time.perf_counter() - slot_mark
                     # Backlog ends when this segment's recognition starts, not when it returns.
                     self._rtf.clear_waiting(segment.key)
                     asr_started = time.monotonic()
@@ -1240,12 +1242,15 @@ class Pipeline:
                         self.fail_received(segment, "辨識逾時", status="timeout")
                         return segment
                     record_s = time.monotonic() - asr_started
+                    asr_ok = bool(asr.ok)
             except Exception as exc:
+                self._rtf.note_error((segment.room_id, segment.session_id))
                 self.fail_received(segment, str(exc)[:180] or "辨識失敗", status="error")
                 return segment
             finally:
                 self._rtf.clear_waiting(segment.key)
-                if record_s is not None:
+                # ok=False is an error, not a speed sample. An empty ok result still counts.
+                if record_s is not None and asr_ok:
                     self._rtf.record(
                         record_s,
                         audio_s,
@@ -1268,6 +1273,7 @@ class Pipeline:
                     segment.zh = ""
                     self._release(segment)
                     return segment
+                self._rtf.note_error((segment.room_id, segment.session_id))
                 segment.status = "error"
                 segment.error = asr.error or "辨識失敗"
                 segment.zh_raw = text

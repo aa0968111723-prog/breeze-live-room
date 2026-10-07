@@ -3,10 +3,11 @@
 A class is about 1000 slices. The recent window keeps 200 samples. Each
 (room, session) keeps its own capped series, so two rooms that take turns
 do not wipe each other. A new session in the same room replaces only that
-room. ASR timeouts are counted and are not samples.
+room. ASR timeouts and ASR errors are counted and are not samples.
 
 Percentile summaries are cached per bucket and recomputed only when that
-bucket receives a sample. Waiting audio, timeouts, and the skip counters
+bucket receives a sample. Callers receive a copy, so editing a snapshot
+cannot change the cache. Waiting audio, timeouts, and the skip counters
 are read live so a metrics poll still sees them.
 
 ``last_process_ms`` is not stored here. It is the pipeline's decode-plus-
@@ -14,6 +15,7 @@ recognition time for the last slice and does not include ASR slot wait.
 """
 from __future__ import annotations
 
+import copy
 from collections import deque
 
 WINDOW_LIMIT = 200
@@ -91,12 +93,14 @@ class RtfMeter:
         self._timeouts: dict[tuple[str, str], int] = {}
         self._silent: dict[tuple[str, str], int] = {}
         self._empty: dict[tuple[str, str], int] = {}
+        self._errors: dict[tuple[str, str], int] = {}
         self._latest: tuple[str, str] | None = None
         # key -> (seconds, estimated). Key is the segment (room, session, seq).
         self._waiting: dict[tuple, tuple[float, bool]] = {}
         self._asr_timeouts = 0
         self._silent_skipped = 0
         self._asr_empty = 0
+        self._asr_errors = 0
         self._last_rtf: float | None = None
 
     def note_waiting(self, key: tuple, seconds: float, estimated: bool = False) -> None:
@@ -127,11 +131,21 @@ class RtfMeter:
         if session is not None:
             self._empty[session] = self._empty.get(session, 0) + 1
 
+    def note_error(self, session: tuple[str, str] | None = None) -> None:
+        """ASR returned ok=False or raised. Not an RTF sample and not a timeout."""
+        self._asr_errors += 1
+        if session is None:
+            return
+        self._bucket(session)
+        self._errors[session] = self._errors.get(session, 0) + 1
+        self._latest = session
+
     def _forget_session(self, key: tuple[str, str]) -> None:
         self._sessions.pop(key, None)
         self._timeouts.pop(key, None)
         self._silent.pop(key, None)
         self._empty.pop(key, None)
+        self._errors.pop(key, None)
         self._bucket_rev.pop(key, None)
         self._bucket_cache.pop(key, None)
 
@@ -140,7 +154,7 @@ class RtfMeter:
         stale = [key for key in self._sessions if key[0] == room_id]
         for key in stale:
             self._forget_session(key)
-        for store in (self._timeouts, self._silent, self._empty):
+        for store in (self._timeouts, self._silent, self._empty, self._errors):
             for key in [key for key in store if key[0] == room_id]:
                 store.pop(key, None)
         waiting = [key for key in self._waiting if isinstance(key, tuple) and key and key[0] == room_id]
@@ -252,7 +266,8 @@ class RtfMeter:
             item["asr_timeouts"] = int(self._timeouts.get(key, 0))
             item["silent_skipped"] = int(self._silent.get(key, 0))
             item["asr_empty"] = int(self._empty.get(key, 0))
-            sessions.append(item)
+            item["asr_errors"] = int(self._errors.get(key, 0))
+            sessions.append(_published(item))
         if chosen is not None and chosen not in self._sessions:
             chosen_summary = summarize([], SESSION_LIMIT)
             chosen_summary["recent"] = summarize([], WINDOW_LIMIT)
@@ -266,6 +281,7 @@ class RtfMeter:
             "asr_timeouts": self._asr_timeouts,
             "silent_skipped": self._silent_skipped,
             "asr_empty": self._asr_empty,
+            "asr_errors": self._asr_errors,
             "asr_rtf_last": None if self._last_rtf is None else _num(self._last_rtf),
             "asr_rtf_p50": rtf_block["p50"],
             "asr_rtf_p95": rtf_block["p95"],
@@ -277,8 +293,13 @@ class RtfMeter:
             "decode_ms_p95": window["decode_ms"]["p95"],
             "asr_samples": window["count"],
             "rtf": {
-                "window": window,
-                "session": chosen_summary,
+                "window": _published(window),
+                "session": _published(chosen_summary),
                 "sessions": sessions,
             },
         }
+
+
+def _published(summary: dict) -> dict:
+    """Deep copy so a caller cannot write through into the percentile cache."""
+    return copy.deepcopy(summary)

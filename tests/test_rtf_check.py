@@ -41,7 +41,23 @@ def test_render_pass_fail_and_unverified_note():
     assert "沒有 RTF 樣本" in empty
     for report in (slow, fast, empty):
         assert "辨識逾時（不計入 RTF）：0" in report
+        assert "辨識錯誤（不計入 RTF）：0" in report
         assert "尚未驗證" in report
+
+
+def test_render_fails_when_there_is_no_sample_even_if_p95_is_zero():
+    snap = rtf_check.snapshot_from_pairs([])
+    snap["asr_rtf_p95"] = 0
+    snap["asr_errors"] = 10
+    snap["rtf"]["session"]["count"] = 0
+    snap["rtf"]["session"]["rtf"]["p95"] = 0
+    snap["rtf"]["window"]["count"] = 0
+    snap["rtf"]["window"]["rtf"]["p95"] = 0
+    text, code = rtf_check.render(snap, "全錯")
+    assert code != 0
+    assert "結果：PASS" not in text
+    assert "沒有 RTF 樣本" in text
+    assert "辨識錯誤（不計入 RTF）：10" in text
 
 
 def test_render_lists_each_room_without_counting_timeouts_as_samples():
