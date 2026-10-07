@@ -218,3 +218,71 @@ async def test_429_retry_lands_once():
         seqs = [row["seq"] for row in rows]
         assert seqs == list(range(1, 31))
         assert len(seqs) == len(set(seqs))
+
+
+@pytest.mark.anyio
+async def test_traced_upload_stays_inside_one_slice():
+    """A traced multipart upload has to finish inside one compressed slice.
+
+    The 100-minute run traces every allocation and compresses a 6s slice to
+    60ms. Starlette's per-byte multipart parser then blocks the event loop
+    for most of that slice, and the host books the overrun as recorder wait
+    and as the same stretch on the last cue. One slice-sized body must come
+    back well inside 60ms while tracing is on, and the audio bytes must survive.
+    The bulk of the body is an unused field: the audio itself stays one byte,
+    so the silence scan is not what the clock is measuring.
+    """
+    import time
+    import tracemalloc
+
+    from fastapi import Request
+
+    from tests.sim import TextAsr, open_room, post_segment, serving, sim_settings
+    from tests.test_round2 import auth
+
+    weird = "甲\r\n--not-the-boundary\r\n乙".encode()
+    # A few hundred kilobytes, the size of one noisy spoken slice. Kept out of
+    # the audio part so the silence scan is not what the clock measures.
+    pad = "x" * (512 * 1024)
+    original_form = Request.form
+
+    async def per_byte_parser(self, *args, **kwargs):
+        raise RuntimeError("multipart must not use the per-byte form parser")
+
+    # Starlette walks multipart one byte at a time on the event loop. Under the
+    # allocation tracer that is most of a compressed slice, so a push that still
+    # calls Request.form() fails here instead of only on a lucky slow run.
+    Request.form = per_byte_parser
+    tracemalloc.start(1)
+    try:
+        async with serving(asr=TextAsr(0), settings=sim_settings(translate=False)) as (app, client, token):
+            del app
+            await open_room(client, token, "class")
+            warm = await post_segment(client, token, "class", "s", 1, b"warm", 0, 6000)
+            assert warm.status_code == 200, warm.text
+            odd = await post_segment(client, token, "class", "s", 2, weird, 6000, 12000)
+            assert odd.status_code == 200, odd.text
+            assert odd.json().get("zh") == weird.decode()
+            started = time.perf_counter()
+            resp = await client.post(
+                "/api/push",
+                params={"room_id": "class", "session_id": "s", "seq": "3"},
+                data={
+                    "room_id": "class",
+                    "session_id": "s",
+                    "seq": "3",
+                    "t0_ms": "12000",
+                    "t1_ms": "18000",
+                    "wait_translation": "0",
+                    "pad": pad,
+                },
+                files={"audio": ("a.webm", b"x", "audio/webm")},
+                headers={**auth(token), "x-breeze-async-translation": "1"},
+            )
+            elapsed = time.perf_counter() - started
+        assert resp.status_code == 200, resp.text
+        assert resp.json().get("zh") == "x"
+        assert elapsed < 0.06, elapsed
+    finally:
+        Request.form = original_form
+        tracemalloc.stop()

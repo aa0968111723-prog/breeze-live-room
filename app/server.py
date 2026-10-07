@@ -8,6 +8,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import unquote_to_bytes
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -127,6 +128,294 @@ async def _read_upload(upload, limit: int) -> bytes:
     if total == 0:
         raise AudioError(400, "沒有收到音訊")
     return b"".join(chunks)
+
+
+class _PushFormError(Exception):
+    """Multipart body is not a form this route can read."""
+
+
+class _MemoryUpload:
+    """File part kept in memory. read() does not hop to the threadpool."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+        self._pos = 0
+
+    async def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = len(self._data) - self._pos
+        end = self._pos + size
+        if end > len(self._data):
+            end = len(self._data)
+        block = self._data[self._pos:end]
+        self._pos = end
+        return block
+
+    async def close(self) -> None:
+        self._data = b""
+        self._pos = 0
+
+
+class _PushForm:
+    """Last field wins, same as Starlette's form mapping."""
+
+    def __init__(self) -> None:
+        self._values: dict[str, str | _MemoryUpload] = {}
+
+    def add(self, name: str, value: str | _MemoryUpload) -> None:
+        self._values[name] = value
+
+    def get(self, name: str, default=None):
+        return self._values.get(name, default)
+
+    async def close(self) -> None:
+        for value in self._values.values():
+            close = getattr(value, "close", None)
+            if close is not None:
+                await close()
+        self._values.clear()
+
+
+def _multipart_boundary(content_type: str) -> bytes | None:
+    media, _, rest = content_type.partition(";")
+    if media.strip().lower() != "multipart/form-data":
+        return None
+    for section in rest.split(";"):
+        piece = section.strip()
+        if not piece.lower().startswith("boundary="):
+            continue
+        raw = piece.split("=", 1)[1].strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+            raw = raw[1:-1]
+        if not raw or len(raw) > 200:
+            return None
+        try:
+            token = raw.encode("latin-1")
+        except UnicodeEncodeError:
+            return None
+        if b"\r" in token or b"\n" in token:
+            return None
+        return token
+    return None
+
+
+def _boundary_line(body: bytes, at: int, token: bytes) -> tuple[bool, int] | None:
+    """Return (closing, index after the line) when a boundary line starts at `at`."""
+    if not body.startswith(token, at):
+        return None
+    index = at + len(token)
+    while index < len(body) and body[index] in (0x20, 0x09):
+        index += 1
+    closing = False
+    if body.startswith(b"--", index):
+        closing = True
+        index += 2
+        while index < len(body) and body[index] in (0x20, 0x09):
+            index += 1
+    if index == len(body):
+        return (True, index) if closing else None
+    if body.startswith(b"\r\n", index):
+        return closing, index + 2
+    return None
+
+
+def _find_boundary(body: bytes, start: int, token: bytes) -> tuple[int, bool, int] | None:
+    """Next boundary at or after `start`: (line start, closing, resume)."""
+    if start == 0:
+        opened = _boundary_line(body, 0, token)
+        if opened is not None:
+            closing, resume = opened
+            return 0, closing, resume
+    needle = b"\r\n" + token
+    scan = start
+    while True:
+        at = body.find(needle, scan)
+        if at < 0:
+            return None
+        opened = _boundary_line(body, at + 2, token)
+        if opened is not None:
+            closing, resume = opened
+            return at, closing, resume
+        scan = at + 2
+
+
+def _split_semicolon(value: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    quoted = False
+    escaped = False
+    for index, char in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quoted:
+            escaped = True
+            continue
+        if char == '"':
+            quoted = not quoted
+            continue
+        if char == ";" and not quoted:
+            parts.append(value[start:index])
+            start = index + 1
+    parts.append(value[start:])
+    return parts
+
+
+def _unquote_param(raw: str) -> str:
+    text = raw.strip()
+    if text.startswith('"'):
+        chars: list[str] = []
+        escaped = False
+        for char in text[1:]:
+            if escaped:
+                chars.append(char)
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                break
+            chars.append(char)
+        text = "".join(chars)
+    else:
+        text = text.split()[0] if text else ""
+    try:
+        return text.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+
+
+def _decode_ext_param(raw: str) -> str:
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        text = text[1:-1]
+    charset, sep, rest = text.partition("'")
+    if not sep:
+        return _unquote_param(raw)
+    _lang, sep2, encoded = rest.partition("'")
+    if not sep2:
+        return _unquote_param(raw)
+    data = unquote_to_bytes(encoded)
+    for encoding in (charset or "utf-8", "utf-8"):
+        try:
+            return data.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return data.decode("latin-1")
+
+
+def _disposition_params(value: str) -> dict[str, str]:
+    params: dict[str, str] = {}
+    for index, piece in enumerate(_split_semicolon(value)):
+        piece = piece.strip()
+        if index == 0 or "=" not in piece:
+            continue
+        key, _, raw = piece.partition("=")
+        key = key.strip().lower()
+        if not key:
+            continue
+        params[key] = _decode_ext_param(raw.strip()) if key.endswith("*") else _unquote_param(raw.strip())
+    return params
+
+
+def _decode_field(data: bytes) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
+
+
+def _header_map(blob: bytes) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if not blob:
+        return headers
+    for line in blob.decode("latin-1").split("\r\n"):
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        headers[key.strip().lower()] = value.strip()
+    return headers
+
+
+def _add_part(form: _PushForm, raw: bytes, files: list[int], fields: list[int]) -> None:
+    sep = raw.find(b"\r\n\r\n")
+    if sep < 0:
+        raise _PushFormError("part has no header")
+    params = _disposition_params(_header_map(raw[:sep]).get("content-disposition", ""))
+    name = params.get("name", "")
+    if not name:
+        raise _PushFormError("part has no name")
+    is_file = "filename" in params or "filename*" in params
+    if is_file:
+        files[0] += 1
+        if files[0] > 1000:
+            raise _PushFormError("too many files")
+        form.add(name, _MemoryUpload(raw[sep + 4:]))
+        return
+    fields[0] += 1
+    if fields[0] > 1000:
+        raise _PushFormError("too many fields")
+    form.add(name, _decode_field(raw[sep + 4:]))
+
+
+def _parse_multipart(body: bytes, boundary: bytes) -> _PushForm:
+    token = b"--" + boundary
+    found = _find_boundary(body, 0, token)
+    if found is None:
+        raise _PushFormError("missing boundary")
+    _line, closing, resume = found
+    form = _PushForm()
+    if closing:
+        return form
+    counts = [0]
+    fields = [0]
+    pos = resume
+    while True:
+        nxt = _find_boundary(body, pos, token)
+        if nxt is None:
+            raise _PushFormError("truncated multipart")
+        line_start, closing, resume = nxt
+        _add_part(form, body[pos:line_start], counts, fields)
+        if closing:
+            return form
+        pos = resume
+
+
+async def _read_body_capped(request: Request, limit: int, settings: Settings) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(status_code=413, detail=f"音訊超過 {settings.max_audio_bytes} bytes，已拒絕")
+        chunks.append(chunk)
+    if len(chunks) == 1:
+        return chunks[0]
+    return b"".join(chunks)
+
+
+async def _push_form(request: Request, settings: Settings):
+    """Read the upload form.
+
+    python-multipart walks the body one byte at a time on the event loop.
+    A traced few-hundred-kilobyte slice then holds the loop longer than the
+    compressed 6s period, so the host books a recorder wait. Bulk search
+    stays on the loop but does not scale with every byte.
+    """
+    content_type = request.headers.get("content-type", "")
+    if content_type.split(";", 1)[0].strip().lower() != "multipart/form-data":
+        return await request.form()
+    boundary = _multipart_boundary(content_type)
+    if boundary is None:
+        raise HTTPException(status_code=400, detail="上傳格式不正確")
+    body = await _read_body_capped(request, settings.max_audio_bytes + 65536, settings)
+    try:
+        return _parse_multipart(body, boundary)
+    except _PushFormError as exc:
+        raise HTTPException(status_code=400, detail="上傳格式不正確") from exc
 
 
 def _field(form, request: Request, name: str) -> str:
@@ -842,7 +1131,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 reserved_key = query_key
         form = None
         try:
-            form = await request.form()
+            form = await _push_form(request, settings)
             try:
                 room_id = validate_room_id(_field(form, request, "room_id"))
                 session_id = validate_session_id(_field(form, request, "session_id"))
