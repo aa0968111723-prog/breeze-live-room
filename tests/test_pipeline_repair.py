@@ -10,7 +10,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.asr import AsrResult
-from app.pipeline import Segment
+from app.pipeline import Pipeline, Segment
 from app.server import create_app
 from app.settings import Settings
 from app.store import CaptionStore
@@ -366,6 +366,9 @@ async def test_queued_translation_past_the_timeout_is_skipped_without_dropping_c
             skipped = [item for item in history if item.get("translate_status") == "skipped"]
             assert len(skipped) >= 2
             assert {item["zh"] for item in skipped} >= {"太舊", "也太舊"}
+            assert app.state.pipeline.translate_stale >= 2
+            assert app.state.pipeline.translate_skipped == 0
+            assert app.state.pipeline.translate_timeouts == 0
             for item in skipped:
                 assert item["en"] == ""
                 assert item["status"] == "translate_failed"
@@ -1117,6 +1120,49 @@ async def test_emitted_segment_index_respects_caption_cap():
             assert 1 not in kept
     finally:
         await stop(app)
+
+
+def test_tr_epoch_is_bounded_by_room_caption_cap(tmp_path):
+    """Translation epochs follow the caption cap and are not reused after a drop.
+
+    A long class used to keep one epoch per segment for the life of the process.
+    Trimming the caption index drops epochs that are no longer live. Another
+    room is left alone. A dropped epoch number cannot match an in-flight worker.
+    """
+    pipe = Pipeline(
+        asr=None,
+        translator=Translator(enabled=False),
+        prompt="",
+        tmp=tmp_path,
+        settings=Settings(room_caption_cap=3),
+    )
+    for seq in range(1, 8):
+        key = ("class", "s", seq)
+        pipe._index[key] = {"session_ord": seq, "version": 1}
+        pipe._next_epoch(key)
+        pipe._trim_index("class")
+    class_epochs = [key for key in pipe._tr_epoch if key[0] == "class"]
+    assert len(class_epochs) <= 3
+    assert {key[2] for key in class_epochs} <= {5, 6, 7}
+    other = ("room-b", "s", 1)
+    pipe._index[other] = {"session_ord": 1, "version": 1}
+    held_other = pipe._next_epoch(other)
+    newer = ("class", "s", 8)
+    pipe._index[newer] = {"session_ord": 8, "version": 1}
+    pipe._next_epoch(newer)
+    pipe._trim_index("class")
+    assert pipe._tr_epoch.get(other) == held_other
+    class_epochs = [key for key in pipe._tr_epoch if key[0] == "class"]
+    assert len(class_epochs) <= 3
+    assert newer in pipe._tr_epoch
+    segment = Segment(room_id="class", session_id="s", seq=1)
+    held = pipe._next_epoch(segment.key)
+    pipe._drop_epoch(segment.key)
+    assert pipe._epoch_current(segment, held) is False
+    recycled = pipe._next_epoch(segment.key)
+    assert recycled != held
+    assert pipe._epoch_current(segment, held) is False
+    assert pipe._epoch_current(segment, recycled) is True
 
 
 @pytest.mark.anyio

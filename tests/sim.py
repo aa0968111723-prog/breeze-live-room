@@ -189,6 +189,20 @@ def _sleep_cancel(delay_s: float, cancel) -> bool:
     return cancel.wait(delay_s)
 
 
+def _deadline_margin(room_s: float) -> float:
+    """Real seconds to finish before the caller's translate deadline.
+
+    Strictest of the three reviews of the Windows 3.12 failure (run
+    37580495810): at least 50 ms, at least a tenth of the time still left,
+    and at least 20 ms plus three monotonic ticks. A fixed 20 ms early wake
+    was eaten by two 15.6 ms ticks (thread wait lands on the next tick,
+    asyncio.timeout fires one tick early). The scripted line still occupies
+    the worker until this margin before the deadline.
+    """
+    tick = time.get_clock_info("monotonic").resolution
+    return max(0.05, float(room_s) * 0.1, 0.02 + 3 * tick)
+
+
 class ScriptedTranslator(Translator):
     """plan(zh) -> ("ok", delay_v) | ("raise", exc) | ("block", event)."""
 
@@ -210,8 +224,9 @@ class ScriptedTranslator(Translator):
                 if deadline is not None:
                     # Finish inside the caller's timeout. A sleep equal to the deadline
                     # races asyncio.wait_for and comes back as "timeout" instead of English.
+                    # The margin has to cover a coarse monotonic clock, not a fixed 20 ms.
                     room = deadline - time.monotonic()
-                    delay = min(delay, max(0.0, room - min(0.02, room * 0.1)))
+                    delay = min(delay, max(0.0, room - _deadline_margin(room)))
                 if _sleep_cancel(delay, cancel):
                     return _timeout_result()
                 return _ok_result(zh)
@@ -654,6 +669,10 @@ class SimReport:
     storm_rejects: int = 0
     retries: list[int] = field(default_factory=list)
     translate_skipped: int = 0
+    # seq, translate_status, has_en. From caption state, not the export file.
+    translate_rows: list = field(default_factory=list)
+    translate_queued_at_export: int = 0
+    translate_busy_at_export: int = 0
 
 
 def _zh_ready_times(listeners: list[Listener]) -> dict[int, float]:
@@ -768,7 +787,12 @@ def _sample_server_memory() -> tuple[int, int]:
 
 
 def _class_plan(zh: str):
-    """2s English, except a 40s window on segments 300-330 (the translate timeout)."""
+    """2s English, except segments 300-330, which take almost the whole 40s budget.
+
+    Slow is not a timeout. The translator finishes one deadline margin early,
+    so those lines come back in English unless the queue drops them. A timeout
+    in that window is a harness failure, not the backlog the test is measuring.
+    """
     seq = _seq_of(zh)
     if 300 <= seq <= 330:
         return ("ok", 40.0)
@@ -915,12 +939,25 @@ async def _run_100min_async(*, trace: bool) -> SimReport:
             flush = getattr(app.state.store, "flush", None)
             if flush is not None:
                 await asyncio.to_thread(flush)
+            # Sample the queue before export. A line still in flight would be
+            # missing English in the file without a finished status yet.
+            pipe = app.state.pipeline
+            queued_at_export = 0 if pipe._translate_q is None else pipe._translate_q.qsize()
+            busy_at_export = int(pipe._translate_busy)
             srt_resp = await client.get("/api/export", params={"room_id": room, "kind": "srt"}, headers=auth(token))
             json_resp = await client.get("/api/export", params={"room_id": room, "kind": "json"}, headers=auth(token))
             assert srt_resp.status_code == 200, srt_resp.text
             assert json_resp.status_code == 200, json_resp.text
             final = (await client.get("/api/metrics", headers=auth(token))).json()
             state = caption_rows(app, room)
+            translate_rows = [
+                {
+                    "seq": int(row.get("seq") or 0),
+                    "translate_status": str(row.get("translate_status") or ""),
+                    "has_en": bool(row.get("en")),
+                }
+                for row in state
+            ]
             pipe = app.state.pipeline
             _, rss_0 = mem_at.get(0, (0, 0))
             _, rss_250 = mem_at.get(250, (0, 0))
@@ -960,6 +997,9 @@ async def _run_100min_async(*, trace: bool) -> SimReport:
                 storm_rejects=int(storm["rejects"]),
                 retries=list(host.retries),
                 translate_skipped=int(getattr(pipe, "translate_skipped", 0) or 0),
+                translate_rows=translate_rows,
+                translate_queued_at_export=queued_at_export,
+                translate_busy_at_export=busy_at_export,
             )
             await host.stop()
     finally:

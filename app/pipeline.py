@@ -129,10 +129,17 @@ class Pipeline:
         self._translate_q: asyncio.Queue | None = None
         self._translate_pool: ThreadPoolExecutor | None = None
         self._tr_epoch: dict[tuple[str, str, int], int] = {}
+        # Per-room clock. Epochs only increase, so dropping a key cannot
+        # make a later upload reuse a number an in-flight worker still holds.
+        self._tr_clock: dict[str, int] = {}
         self._version_floor: dict[tuple[str, str, int], int] = {}
         self._seeded: set[str] = set()
         self._flushing: set[tuple[str, str]] = set()
         self.translate_skipped = 0
+        self.translate_timeouts = 0
+        self.translate_stale = 0
+        self.translate_errors = 0
+        self.translate_waiter_timeouts = 0
         self._translate_busy = 0
         self._recent_zh: dict[tuple[str, str], deque] = {}
         self._tasks: list[asyncio.Task] = []
@@ -206,6 +213,10 @@ class Pipeline:
             "results": len(self.results),
             "translate_queued": 0 if self._translate_q is None else self._translate_q.qsize(),
             "translate_skipped": self.translate_skipped,
+            "translate_timeouts": self.translate_timeouts,
+            "translate_stale": self.translate_stale,
+            "translate_errors": self.translate_errors,
+            "translate_waiter_timeouts": self.translate_waiter_timeouts,
         }
         payload.update(self._rtf.snapshot())
         return payload
@@ -306,6 +317,7 @@ class Pipeline:
             self._gap_since.pop(stamp, None)
         for key in [key for key in self._tr_epoch if key[0] == room_id]:
             self._tr_epoch.pop(key, None)
+        self._tr_clock.pop(room_id, None)
         self._flushing = {group for group in self._flushing if group[0] != room_id}
         for group in [group for group in self._recent_zh if group[0] == room_id]:
             self._recent_zh.pop(group, None)
@@ -459,6 +471,7 @@ class Pipeline:
             # Same cap as the compact index. The set used to live until drop_room,
             # so a long class kept one tuple per segment forever.
             self._emitted_segs.discard(key)
+        self._trim_epochs(room_id)
 
     def _rehydrate(self, key: tuple[str, str, int]) -> Segment | None:
         row = self._index.get(key)
@@ -524,8 +537,7 @@ class Pipeline:
             self._wake(key, blank)
         for group in [group for group in self._held if group[0] == room_id]:
             self._held.pop(group, None)
-        for key in [key for key in self._tr_epoch if key[0] == room_id]:
-            self._tr_epoch[key] = self._tr_epoch.get(key, 0) + 1
+        self._drop_room_epochs(room_id)
         # A single-caption delete still in flight must not unseal what this room delete sealed.
         self._braced.pop(room_id, None)
         self._mute_backlog.pop(room_id, None)
@@ -557,7 +569,7 @@ class Pipeline:
         flight = self._flight.get(key)
         if flight is not None and not flight.done():
             return
-        self._tr_epoch[key] = self._tr_epoch.get(key, 0) + 1
+        self._drop_epoch(key)
         self.results.pop(key, None)
         self._index.pop(key, None)
         self._hashes.pop(key, None)
@@ -652,7 +664,7 @@ class Pipeline:
             braced.discard(ident)
         self._sealed.setdefault(room_id, set()).add(ident)
         self._braced_dropped.pop(ident, None)
-        self._tr_epoch[key] = self._tr_epoch.get(key, 0) + 1
+        self._drop_epoch(key)
         self._index.pop(key, None)
         self._hashes.pop(key, None)
         self._emitted_segs.discard(key)
@@ -1313,6 +1325,34 @@ class Pipeline:
             return self._abandon(segment)
         return self.results.get(segment.key, segment)
 
+    def _next_epoch(self, key: tuple[str, str, int]) -> int:
+        room = key[0]
+        clock = self._tr_clock.get(room, 0) + 1
+        self._tr_clock[room] = clock
+        self._tr_epoch[key] = clock
+        return clock
+
+    def _drop_epoch(self, key: tuple[str, str, int]) -> None:
+        """Invalidate in-flight work for this seq and forget the entry.
+
+        The room clock only moves forward, so a later upload of the same seq
+        cannot reuse an epoch an in-flight worker still holds.
+        """
+        room = key[0]
+        self._tr_clock[room] = self._tr_clock.get(room, 0) + 1
+        self._tr_epoch.pop(key, None)
+
+    def _drop_room_epochs(self, room_id: str) -> None:
+        self._tr_clock[room_id] = self._tr_clock.get(room_id, 0) + 1
+        for key in [key for key in self._tr_epoch if key[0] == room_id]:
+            self._tr_epoch.pop(key, None)
+
+    def _trim_epochs(self, room_id: str) -> None:
+        """Keep translation epochs inside the caption cap. One int per live row."""
+        live = {key for key in self._index if key[0] == room_id}
+        for key in [key for key in self._tr_epoch if key[0] == room_id and key not in live]:
+            self._tr_epoch.pop(key, None)
+
     def _epoch_current(self, segment: Segment, epoch: int) -> bool:
         return (
             not self._stale(segment)
@@ -1341,8 +1381,7 @@ class Pipeline:
     def _put_translation(self, segment: Segment) -> None:
         assert self._translate_q is not None
         self._drop_queued(segment.key)
-        epoch = self._tr_epoch.get(segment.key, 0) + 1
-        self._tr_epoch[segment.key] = epoch
+        epoch = self._next_epoch(segment.key)
         item = (epoch, time.monotonic(), segment)
         # Epoch travels with the queue item. The segment object is shared, so a
         # later retranslate must not change which attempt a worker already holds.
@@ -1371,16 +1410,13 @@ class Pipeline:
         try:
             old_epoch, _old_at, old = self._translate_q.get_nowait()
         except asyncio.QueueEmpty:
-            self.translate_skipped += 1
             loop.call_soon(self._skip_backlog, segment, epoch)
             return
         self._translate_q.task_done()
-        self.translate_skipped += 1
         loop.call_soon(self._skip_backlog, old, old_epoch)
         try:
             self._translate_q.put_nowait(item)
         except asyncio.QueueFull:
-            self.translate_skipped += 1
             loop.call_soon(self._skip_backlog, segment, epoch)
 
     def _skip_backlog(self, segment: Segment, epoch: int) -> None:
@@ -1397,6 +1433,22 @@ class Pipeline:
         self._fail_translation(segment, "skipped_backlog", "英譯積壓，略過較舊的段落，中文仍保留")
         self._wake(segment.key, segment)
 
+    def _account_translate_failure(self, translate_status: str) -> None:
+        """Count one published failure. A skip that never lands is not counted."""
+        if translate_status == "skipped_backlog":
+            self.translate_skipped += 1
+            return
+        bucket = {
+            "timeout": "translate_timeouts",
+            # Queued longer than the translate budget. The row status stays "skipped".
+            "skipped": "translate_stale",
+            "error": "translate_errors",
+            "waiter_timeout": "translate_waiter_timeouts",
+        }.get(translate_status)
+        if bucket is None:
+            return
+        setattr(self, bucket, getattr(self, bucket) + 1)
+
     def _fail_translation(self, segment: Segment, translate_status: str, error: str) -> None:
         if self._stale(segment) or segment.key not in self._emitted_segs:
             segment.translate_queued = False
@@ -1408,6 +1460,7 @@ class Pipeline:
         segment.status = "translate_failed"
         segment.version += 1
         self.results[segment.key] = segment
+        self._account_translate_failure(translate_status)
         self._emit(segment)
 
     def _queue_translate(self, segment: Segment) -> None:
@@ -1438,7 +1491,7 @@ class Pipeline:
             self._discard_waiter(segment.key, fut)
             if segment.translate_queued and segment.status == "zh_ready":
                 segment.translate_queued = False
-                self._fail_translation(segment, "timeout", "英譯逾時，不假設沒有計費。中文仍保留")
+                self._fail_translation(segment, "waiter_timeout", "英譯逾時，不假設沒有計費。中文仍保留")
                 self._wake(segment.key, segment)
 
     async def _translate_loop(self) -> None:

@@ -66,7 +66,9 @@ def test_env_example_matches_code_defaults():
 
     A value that is not the default becomes the default of a new install.
     BREEZE_ASR and BREEZE_DATA_PATH are the install profile above; every other
-    key must leave Settings unchanged from Settings.from_env({}).
+    key must leave Settings unchanged from Settings.from_env({}). from_env({})
+    itself must match the Settings() field defaults, so a dataclass default
+    that drifts away from the from_env fallback is caught too.
     """
     root = Path(__file__).resolve().parents[1]
     example_path = root / ".env.example"
@@ -74,6 +76,9 @@ def test_env_example_matches_code_defaults():
     assert example["BREEZE_MAX_AUDIO_BYTES"] == "2097152"
     assert example["BREEZE_UPLOAD_READ_TIMEOUT"] == "20"
     bare = Settings.from_env({})
+    builtin = Settings()
+    for name in Settings.__dataclass_fields__:
+        assert getattr(bare, name) == getattr(builtin, name), name
     loaded = Settings.from_env({}, env_file=example_path)
     for key, value in example.items():
         if key in _DIRECT_DEFAULTS:
