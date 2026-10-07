@@ -898,18 +898,50 @@ def test_replay_gate_address_cap_bounds_rotating_cids_and_keys():
     now["t"] = 20.0
     assert bounded.allow("10.1.0.2", "b")[0] is True
     now["t"] = 30.0
-    assert bounded.allow("10.1.0.3", "c")[0] is True
+    kept = list(bounded._ip_hits["10.1.0.1"])
+    assert bounded.allow("10.1.0.3", "c")[0] is False
+    assert bounded._ip_hits["10.1.0.1"] == kept
+    assert ("10.1.0.3", "c") not in bounded._client_hits
+    assert set(bounded._ip_hits) == {"10.1.0.1", "10.1.0.2"}
+    assert len(bounded._client_hits) == 2
+    assert bounded.allow("10.1.0.1", "a")[0] is True
+    assert bounded._ip_hits["10.1.0.1"] == [10.0, 30.0]
+    now["t"] = 91.0
+    assert bounded.allow("10.1.0.9", "fresh")[0] is True
     assert "10.1.0.1" not in bounded._ip_hits
     assert ("10.1.0.1", "a") not in bounded._client_hits
-    assert set(bounded._ip_hits) == {"10.1.0.2", "10.1.0.3"}
-    assert len(bounded._client_hits) == 2
-    now["t"] = 80.0
-    assert bounded.allow("10.1.0.9", "fresh")[0] is True
     assert "10.1.0.2" not in bounded._ip_hits
     assert ("10.1.0.2", "b") not in bounded._client_hits
-    assert "10.1.0.3" in bounded._ip_hits
+    assert "10.1.0.9" in bounded._ip_hits
     assert len(bounded._ip_hits) <= 2
     assert len(bounded._client_hits) <= 2
+
+    now["t"] = 0.0
+    throttled = _ReplayGate(4, 4, window_s=0.4, clock=lambda: now["t"], max_keys=10)
+    assert throttled.allow("10.9.0.1", "a")[0] is True
+    now["t"] = 0.5
+    assert throttled.allow("10.9.0.2", "b")[0] is True
+    assert "10.9.0.1" in throttled._ip_hits
+    now["t"] = 1.0
+    assert throttled.allow("10.9.0.2", "b")[0] is True
+    assert "10.9.0.1" not in throttled._ip_hits
+
+    now["t"] = 5.0
+    v6 = _ReplayGate(2, 2, clock=lambda: now["t"])
+    assert v6.allow("2001:db8:1:2::1", "a")[0] is True
+    assert v6.allow("2001:db8:1:2::ffff", "b")[0] is True
+    assert v6.allow("2001:db8:1:2::abc", "c")[0] is False
+    assert v6.allow("2001:db8:9:9::1", "c")[0] is True
+    assert set(v6._ip_hits) == {"2001:db8:1:2::/64", "2001:db8:9:9::/64"}
+    mapped = _ReplayGate(1, 1, clock=lambda: now["t"])
+    assert mapped.allow("203.0.113.50", "a")[0] is True
+    assert mapped.allow("::ffff:203.0.113.50", "b")[0] is False
+    assert list(mapped._ip_hits) == ["203.0.113.50"]
+    plain = _ReplayGate(1, 1, clock=lambda: now["t"])
+    assert plain.allow("not-an-ip", "a")[0] is True
+    assert plain.allow("not-an-ip", "b")[0] is False
+    assert "not-an-ip" in plain._ip_hits
+    assert plain.allow("other-name", "a")[0] is True
 
     now["t"] = 0.0
     again = _ReplayGate(1, 1, window_s=60.0, clock=lambda: now["t"])

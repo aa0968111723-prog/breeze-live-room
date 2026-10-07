@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -361,8 +362,34 @@ def _cap_replay_hello(hello: dict, budget: int = AUDIENCE_BACKFILL_BYTES) -> dic
 
 
 # Replay buckets are keyed by the TCP peer, not by whatever id the client sends.
-# A full table drops expired keys, then the quietest one, instead of growing forever.
+# IPv6 peers in one /64 share a bucket. A full table drops expired keys and then
+# refuses a new peer; it does not zero a peer that is still inside the window.
+# The expired-key scan runs at most once a second. Admitting a new key at the
+# cap still drops expired keys immediately.
 _REPLAY_KEY_CAP = 4096
+
+
+def _replay_address_key(ip: str) -> str:
+    """One bucket per IPv4 address, or per IPv6 /64. Unparseable text stays as-is."""
+    text = (ip or "").strip()
+    if not text:
+        return ""
+    host = text
+    if host.startswith("[") and "]" in host:
+        host = host[1:host.index("]")]
+    if "%" in host:
+        host = host.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return text
+    mapped = addr.ipv4_mapped if isinstance(addr, ipaddress.IPv6Address) else None
+    if mapped is not None:
+        return str(mapped)
+    if isinstance(addr, ipaddress.IPv6Address):
+        network = ipaddress.IPv6Network((addr, 64), strict=False)
+        return f"{network.network_address}/64"
+    return str(addr)
 
 
 class _ReplayGate:
@@ -391,6 +418,7 @@ class _ReplayGate:
         self.window_s = float(window_s)
         self.max_keys = max(1, int(max_keys))
         self._clock = clock or time.monotonic
+        self._swept_at: float | None = None
         self._ip_hits: dict[str, list[float]] = {}
         self._client_hits: dict[tuple[str, str], list[float]] = {}
 
@@ -409,16 +437,19 @@ class _ReplayGate:
         self._drop_expired(self._ip_hits, now)
         self._drop_expired(self._client_hits, now)
 
+    def _sweep(self, now: float) -> None:
+        if self._swept_at is not None and now - self._swept_at < 1.0:
+            return
+        self._forget_expired(now)
+        self._swept_at = now
+
     def _make_room(self, store: dict, now: float) -> None:
         if len(store) < self.max_keys:
             return
-        # This table only. The other one may hold an empty bucket not stamped yet.
+        # Expired keys only. A peer still inside the window keeps its hits.
         self._drop_expired(store, now)
-        while len(store) >= self.max_keys:
-            oldest = min(store, key=lambda key: (store[key][-1] if store[key] else 0.0))
-            del store[oldest]
 
-    def _take(self, store: dict, key, now: float) -> list[float]:
+    def _take(self, store: dict, key, now: float) -> list[float] | None:
         bucket = store.get(key)
         if bucket is not None:
             self._prune(bucket, now)
@@ -426,6 +457,8 @@ class _ReplayGate:
                 return bucket
             del store[key]
         self._make_room(store, now)
+        if len(store) >= self.max_keys:
+            return None
         fresh: list[float] = []
         store[key] = fresh
         return fresh
@@ -440,14 +473,19 @@ class _ReplayGate:
 
     def allow(self, ip: str, client_id: str = "") -> tuple[bool, int]:
         now = float(self._clock())
-        self._forget_expired(now)
-        ip_key = ip or ""
+        self._sweep(now)
+        ip_key = _replay_address_key(ip)
         who = client_id or ""
         ip_bucket = self._take(self._ip_hits, ip_key, now)
+        if ip_bucket is None:
+            # The table is full of peers that are still inside the window.
+            return False, 1000
         if len(ip_bucket) >= self.ip_limit:
             # A refused address must not allocate a client bucket.
             return False, self._retry_ms(ip_bucket, now)
         client_bucket = self._take(self._client_hits, (ip_key, who), now)
+        if client_bucket is None:
+            return False, 1000
         if len(client_bucket) >= self.client_limit:
             return False, self._retry_ms(client_bucket, now)
         ip_bucket.append(now)
