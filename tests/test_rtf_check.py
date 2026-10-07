@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import socket
 import threading
 import time
@@ -149,15 +150,250 @@ def test_metrics_command_against_test_server(capsys):
         captured = capsys.readouterr()
         assert code == 0, captured.out + captured.err
         assert "PASS" in captured.out
+        assert "最大值" in captured.out
         assert "p50 0.400" in captured.out
         assert "p95 0.490" in captured.out
         assert "尚未驗證" in captured.out
         assert "等待辨識的音訊：0.000 秒" in captured.out
         assert app.state.token not in captured.out
         assert app.state.token not in captured.err
+        room_code = rtf_check.main(["metrics", "--base", base, "--room", "class"])
+        room_out = capsys.readouterr().out
+        assert room_code == 0
+        assert "判定房間：class" in room_out
+        missing_code = rtf_check.main(["metrics", "--base", base, "--room", "north"])
+        missing_out = capsys.readouterr().out
+        assert missing_code == 1
+        assert "FAIL" in missing_out
+        assert "north" in missing_out
     finally:
         server.should_exit = True
         thread.join(5)
         if thread.is_alive():
             server.force_exit = True
             thread.join(3)
+
+
+def test_verdict_uses_the_slowest_room_not_the_latest_update():
+    meter = RtfMeter()
+    meter.record(1.2, 1.0, ("west", "slow"))
+    meter.record(0.2, 1.0, ("east", "live"))
+    snap = meter.snapshot()
+    assert snap["rtf"]["session"]["rtf"]["p95"] == pytest.approx(0.2)
+    assert rtf_check.verdict_p95(snap) == pytest.approx(1.2)
+    text, code = rtf_check.render(snap, "兩房")
+    assert code == 1
+    assert "FAIL" in text
+    assert "1.200" in text
+    assert "最大值" in text
+    east, east_code = rtf_check.render(snap, "東", room="east")
+    assert east_code == 0
+    assert "PASS" in east
+    assert "0.200" in east
+    missing, missing_code = rtf_check.render(snap, "無", room="north")
+    assert missing_code == 1
+    assert "沒有房間 north" in missing
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def now(self) -> float:
+        return self.t
+
+    def sleep(self, delay: float) -> None:
+        if delay > 0:
+            self.t += delay
+
+
+def test_cut_wav_segments_follow_the_six_second_pace(tmp_path):
+    src = tmp_path / "talk.wav"
+    src.write_bytes(wave_bytes(18.0))
+    rows = rtf_check.cut_wav_segments(src, 6.0, tmp_path / "out")
+    assert len(rows) == 3
+    for path, duration in rows:
+        assert duration == pytest.approx(6.0)
+        assert path.is_file()
+    short = tmp_path / "seven.wav"
+    short.write_bytes(wave_bytes(7.0))
+    parts = rtf_check.cut_wav_segments(short, 6.0, tmp_path / "seven")
+    assert [round(item[1], 3) for item in parts] == [6.0, 1.0]
+    bogus = tmp_path / "clip.bin"
+    bogus.write_bytes(b"not-a-wave")
+    with pytest.raises(SystemExit):
+        rtf_check.cut_wav_segments(bogus, 6.0, tmp_path / "bad")
+
+
+def test_pace_releases_a_slice_every_segment_not_back_to_back():
+    clock = _Clock()
+    starts: list[float] = []
+
+    def transcribe(path, prompt):
+        del path, prompt
+        starts.append(clock.now())
+        clock.sleep(1.0)
+        return AsrResult(ok=True, text="不要印出SECRET")
+
+    slices = [(Path(f"slice-{index}.wav"), 6.0) for index in range(3)]
+    report = rtf_check.pace_transcriptions(
+        transcribe, slices, workers=1, pace_s=6.0, sleep=clock.sleep, now=clock.now
+    )
+    assert starts == pytest.approx([0.0, 6.0, 12.0])
+    assert report["max_backlog_s"] == 0
+    assert report["final_lag_s"] == pytest.approx(1.0)
+    assert report["cpu_p95"] is None
+    assert report["cpu_source"] == "UNKNOWN"
+    assert "SECRET" not in json.dumps(report)
+
+
+def test_pace_backlog_grows_when_recognition_is_slower_than_the_slice():
+    clock = _Clock()
+    starts: list[float] = []
+
+    def transcribe(path, prompt):
+        del path, prompt
+        starts.append(clock.now())
+        clock.sleep(10.0)
+        return AsrResult(ok=True, text="x")
+
+    slices = [(Path("slice.wav"), 6.0) for _ in range(3)]
+    report = rtf_check.pace_transcriptions(
+        transcribe, slices, workers=1, pace_s=6.0, sleep=clock.sleep, now=clock.now
+    )
+    assert starts == pytest.approx([0.0, 10.0, 20.0])
+    assert report["max_backlog_s"] == pytest.approx(6.0)
+    assert report["final_lag_s"] == pytest.approx(18.0)
+
+
+def test_pace_without_the_gap_is_not_real_pacing():
+    clock = _Clock()
+    starts: list[float] = []
+
+    def transcribe(path, prompt):
+        del path, prompt
+        starts.append(clock.now())
+        clock.sleep(1.0)
+        return AsrResult(ok=True, text="x")
+
+    slices = [(Path("slice.wav"), 6.0) for _ in range(3)]
+    rtf_check.pace_transcriptions(
+        transcribe, slices, workers=1, pace_s=6.0, sleep=lambda delay: None, now=clock.now
+    )
+    assert starts == pytest.approx([0.0, 1.0, 2.0])
+
+
+def test_recommend_matrix_picks_the_smallest_combo_and_ignores_unknown_cpu():
+    rows = [
+        {"threads": 4, "workers": 1, "rtf_p95": 1.2, "max_backlog_s": 0, "cpu_p95": None},
+        {"threads": 4, "workers": 2, "rtf_p95": 0.5, "max_backlog_s": 0, "cpu_p95": None},
+        {"threads": 6, "workers": 1, "rtf_p95": 0.4, "max_backlog_s": 12, "cpu_p95": None},
+        {"threads": 8, "workers": 1, "rtf_p95": 0.3, "max_backlog_s": 0, "cpu_p95": 90},
+        {"threads": 8, "workers": 2, "rtf_p95": 0.2, "max_backlog_s": 0, "cpu_p95": 10},
+    ]
+    advice = rtf_check.recommend_matrix(rows)
+    assert advice["threads"] == 4
+    assert advice["workers"] == 2
+    assert advice["cpu_gate"] == "UNKNOWN"
+    assert "尚未驗證" in advice["reason"]
+    none = rtf_check.recommend_matrix([
+        {"threads": 4, "workers": 1, "rtf_p95": 0.95, "max_backlog_s": 0, "cpu_p95": None},
+    ])
+    assert none["threads"] is None
+    assert none["workers"] is None
+
+
+def test_matrix_runs_on_a_fake_recognizer_without_printing_the_transcript(tmp_path):
+    wav = tmp_path / "talk.wav"
+    wav.write_bytes(wave_bytes(12.0))
+    clock = _Clock()
+
+    def build(threads, workers):
+        assert threads in {4, 8}
+        assert workers == 1
+
+        class Fake:
+            def transcribe(self, path, prompt):
+                del path, prompt
+                clock.sleep(1.0)
+                return AsrResult(ok=True, text="不要印出SECRET逐字稿")
+
+            def close(self):
+                return None
+
+        return Fake()
+
+    report = rtf_check.run_matrix(
+        wav,
+        threads=[8, 4],
+        workers=[1],
+        segment_s=6.0,
+        minutes=10,
+        build=build,
+        sleep=clock.sleep,
+        now=clock.now,
+    )
+    assert report["recommendation"]["threads"] == 4
+    assert report["recommendation"]["workers"] == 1
+    assert report["recommendation"]["cpu_gate"] == "UNKNOWN"
+    assert "SECRET" not in json.dumps(report)
+    assert {row["threads"] for row in report["rows"]} == {4, 8}
+    for row in report["rows"]:
+        assert row["cpu_source"] == "UNKNOWN"
+        assert row["cpu_p95"] is None
+        assert row["segments"] == 2
+        assert row["rtf_p95"] < 0.9
+        assert row["max_backlog_s"] < 12
+    printed = rtf_check._print_matrix(report)
+    assert "SECRET" not in printed
+    assert "BREEZE_ASR_THREADS=4" in printed
+
+
+def test_matrix_command_refuses_a_missing_model(monkeypatch, tmp_path):
+    monkeypatch.setenv("BREEZE_MODEL", str(tmp_path / "missing.bin"))
+    monkeypatch.setenv("BREEZE_ASR", "cli")
+    wav = tmp_path / "slice.wav"
+    wav.write_bytes(wave_bytes(6.0))
+    with pytest.raises(SystemExit) as exc:
+        rtf_check.main(["matrix", "--audio", str(wav), "--threads", "4", "--workers", "1", "--minutes", "0.1"])
+    assert "不會改走雲端" in str(exc.value)
+
+
+def test_run_warns_that_a_long_file_is_smoke_not_six_second_pace(monkeypatch, capsys, tmp_path):
+    wav = tmp_path / "long.wav"
+    wav.write_bytes(wave_bytes(31.0))
+
+    class Fake:
+        def transcribe(self, path, prompt):
+            del path, prompt
+            return AsrResult(ok=True, text="不要印出SECRET")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(rtf_check, "build_asr", lambda: Fake())
+    code = rtf_check.main(["run", "--n", "1", "--audio", str(wav)])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "PASS" in captured.out
+    assert "6 秒" in captured.err
+    assert "SECRET" not in captured.out and "SECRET" not in captured.err
+
+
+def test_two_workers_start_together_instead_of_waiting_out_each_slice():
+    slices = [(Path(f"{index}.wav"), 0.2) for index in range(4)]
+    starts: list[float] = []
+    gate = threading.Lock()
+
+    def transcribe(path, prompt):
+        del path, prompt
+        with gate:
+            starts.append(time.monotonic())
+        time.sleep(0.2)
+        return AsrResult(ok=True, text="ok")
+
+    report = rtf_check.pace_transcriptions(transcribe, slices, workers=2, pace_s=0.05)
+    assert len(report["pairs"]) == 4
+    assert starts[1] - starts[0] < 0.15
+    assert report["max_backlog_s"] > 0
+    assert report["cpu_source"] == "UNKNOWN"
