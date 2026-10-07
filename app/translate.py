@@ -4,11 +4,12 @@ import json
 import re
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-from app.glossary import prompt_terms
+from app.glossary import matched_terms, prompt_terms
 
 SYSTEM = (
     "Translate the Traditional Chinese lecture line into natural English. "
@@ -21,7 +22,9 @@ _OUTPUT_RULE = (
     " Translate only the `current` field."
     " Reply with plain English text only — never JSON, never Chinese, and never explanations."
 )
-_HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_HAN_RUN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+# A caption is one line. Longer than this is not published, even if the model ignores max_tokens.
+_REPLY_CHAR_CAP = 600
 # A preface about the translation, not a lecture sentence.
 # "Of course, we begin." must stay. "Here is the translation:" must not.
 _PREAMBLE = re.compile(
@@ -181,6 +184,7 @@ class Translator:
         body = json.dumps({
             "model": self.model,
             "messages": self.build_messages(zh, glossary, context),
+            "max_tokens": _max_tokens(zh),
         }).encode()
         req = urllib.request.Request(
             "https://api.openai.com/v1/chat/completions",
@@ -204,7 +208,7 @@ class Translator:
             if isinstance(completion_tokens, int):
                 self._add_tokens(completion_tokens)
             # A billed reply can still be unusable. Never publish the raw body as a caption.
-            accepted = _accept_translation(text)
+            accepted = _accept_translation(text, zh=zh, glossary=glossary)
             if accepted is None:
                 return TranslateResult(
                     "",
@@ -243,12 +247,53 @@ class Translator:
         return TranslateResult("", "bad_response", f"英譯服務回應 {exc.code}，中文仍保留")
 
 
-def _plain_english(text: str) -> bool:
-    """One caption line. Chinese, a preface, or a second paragraph is not a caption."""
+def _max_tokens(zh: str) -> int:
+    return min(512, max(64, 6 * len(zh or "")))
+
+
+def _reply_char_limit(zh: str) -> int:
+    return min(_REPLY_CHAR_CAP, max(400, 8 * len(zh or "")))
+
+
+def _hit_english(zh: str, glossary) -> list[str]:
+    """English of terms this sentence hit. Han outside those strings still fails."""
+    if not glossary:
+        return []
+    return [str(term.get("en") or "") for term in matched_terms(zh or "", glossary)]
+
+
+def _reply_has_control(text: str) -> bool:
+    """Reject bidi, other format chars, and controls. One newline can stay."""
+    for char in text:
+        if char == "\n":
+            continue
+        category = unicodedata.category(char)
+        if category in {"Cc", "Cf", "Zl", "Zp"}:
+            return True
+    return False
+
+
+def _han_runs_allowed(text: str, sources: list[str]) -> bool:
+    runs = _HAN_RUN.findall(text)
+    if not runs:
+        return True
+    if not sources:
+        return False
+    return all(any(run in source for source in sources) for run in runs)
+
+
+def _plain_english(text: str, han_sources: list[str] | None = None) -> bool:
+    """One caption line. Chinese, a preface, or a second paragraph is not a caption.
+
+    Han characters are allowed only when they appear, in order, inside the English
+    of a glossary term this sentence actually hit.
+    """
     body = text.strip()
-    if not body or _HAN.search(body):
+    if not body:
         return False
     normalized = body.replace("\r\n", "\n").replace("\r", "\n")
+    if _reply_has_control(normalized) or not _han_runs_allowed(normalized, han_sources or []):
+        return False
     if "\n\n" in normalized or _PREAMBLE.search(normalized):
         return False
     lines = [line.strip() for line in normalized.split("\n") if line.strip()]
@@ -261,15 +306,15 @@ def _plain_english(text: str) -> bool:
     return True
 
 
-def _accept_translation(content: str) -> str | None:
+def _accept_translation(content: str, *, zh: str = "", glossary=None) -> str | None:
     """Plain English, or the translation field of a JSON object. Anything else is refused."""
     text = (content or "").strip()
-    if not text:
+    if not text or len(text) > _reply_char_limit(zh):
         return None
     if text[0] in "{[":
         try:
             parsed = json.loads(text)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError, ValueError):
             return None
         if not isinstance(parsed, dict):
             return None
@@ -282,7 +327,9 @@ def _accept_translation(content: str) -> str | None:
         if extracted is None:
             return None
         text = extracted
-    if not _plain_english(text):
+        if len(text) > _reply_char_limit(zh):
+            return None
+    if not _plain_english(text, _hit_english(zh, glossary)):
         return None
     return text
 
