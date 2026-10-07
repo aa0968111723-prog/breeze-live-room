@@ -23,7 +23,7 @@ import threading
 import time
 import tracemalloc
 import urllib.error
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -55,6 +55,47 @@ def vms(real_s: float) -> float:
 
 def virtual_s(real_s: float) -> float:
     return real_s / SCALE
+
+
+@contextmanager
+def no_gc_pause():
+    """Collect, then disable automatic GC for one measured window.
+
+    A full collection is a stop-the-world pause. The 100-minute class freezes
+    and disables GC for the same reason. This shorter window does not freeze.
+    The enabled state from before the window is restored on the way out.
+    """
+    was_enabled = gc.isenabled()
+    gc.collect()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+@contextmanager
+def watch_full_gc():
+    """Record generation-2 collections that start inside the block.
+
+    gc.callbacks runs on 3.11 and 3.13 before each collection. An empty list
+    means no full GC. The callback is removed even when the block fails.
+    """
+    seen: list[int] = []
+
+    def _on_gc(phase, info):
+        if phase == "start" and int(info.get("generation", -1)) >= 2:
+            seen.append(int(info["generation"]))
+
+    gc.callbacks.append(_on_gc)
+    try:
+        yield seen
+    finally:
+        try:
+            gc.callbacks.remove(_on_gc)
+        except ValueError:
+            pass
 
 
 def vlimit(limit: float) -> float:
@@ -337,6 +378,11 @@ def _body_json(resp) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _cached_push_rows(rows: list[dict]) -> list[dict]:
+    """Seq and status only. The httpx Response and its body stay out of the cache."""
+    return [{"seq": int(row["seq"]), "status": int(row["status"])} for row in rows]
+
+
 async def post_segment(client, token, room, session, seq, payload: bytes, t0_ms: int, t1_ms: int, *, retry: bool = False):
     """Host-page opt-in: wait_translation=0 and x-breeze-async-translation: 1."""
     headers = {**auth(token), "x-breeze-async-translation": "1"}
@@ -460,12 +506,13 @@ class VirtualHost:
             if not active:
                 return
             start_ms = self.clock_ms
-            real = time.monotonic()
+            # perf_counter, not monotonic: Windows 3.11 monotonic steps by ~15.6 ms.
+            real = time.perf_counter()
             await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
             # Book every real pause, including those under one virtual second.
             # An immediate return (a free slot) never reaches this wait.
             # Round-to-zero is the scheduler, not a pause the clock can see.
-            spent_ms = int(round((time.monotonic() - real) / self.scale * 1000))
+            spent_ms = int(round((time.perf_counter() - real) / self.scale * 1000))
             if spent_ms > 0:
                 self.clock_ms += spent_ms
                 self.waiting.append((start_ms / 1000, self.clock_ms / 1000))
@@ -512,7 +559,8 @@ class VirtualHost:
 
     async def stop(self):
         """Wait for uploads already started, then POST /api/session/end. No flush=0."""
-        real = time.monotonic()
+        # Same clock as the upload wait. monotonic() on Windows 3.11 is one tick wide.
+        real = time.perf_counter()
         if self._tasks:
             await asyncio.wait(self._tasks)
         resp = await self.client.post(
@@ -524,8 +572,15 @@ class VirtualHost:
             },
             headers={**auth(self.token), "content-type": "application/json"},
         )
-        self.stop_elapsed_v = (time.monotonic() - real) / self.scale
+        self.stop_elapsed_v = (time.perf_counter() - real) / self.scale
         return resp
+
+    def release_upload_results(self) -> None:
+        """Drop push rows and finished tasks so their httpx responses can be freed."""
+        self.responses.clear()
+        self._all.clear()
+        self._tasks.clear()
+        self._retry_tasks.clear()
 
     @property
     def waiting_v_total(self) -> float:
@@ -572,6 +627,7 @@ class SimReport:
     waiting_v_total: float = 0.0
     segment_end_mono: dict[int, float] = field(default_factory=dict)
     zh_ready_mono: dict[int, float] = field(default_factory=dict)
+    # seq and status only. Push bodies and httpx Response objects stay out of _RUN_CACHE.
     responses: list[dict] = field(default_factory=list)
     final_metrics: dict = field(default_factory=dict)
     results_at: dict[int, int] = field(default_factory=dict)
@@ -867,7 +923,7 @@ async def _run_100min_async(*, trace: bool) -> SimReport:
                 waiting_v_total=host.waiting_v_total,
                 segment_end_mono=dict(host.segment_end_mono),
                 zh_ready_mono=_zh_ready_times(listeners),
-                responses=list(host.responses),
+                responses=_cached_push_rows(host.responses),
                 final_metrics=final,
                 results_at={int(item["seq"]): int(item["results"]) for item in snapshots},
                 emitted=sum(1 for key in pipe._emitted_segs if key[0] == room),  # the warm-up room is not the class
@@ -896,7 +952,34 @@ async def _run_100min_async(*, trace: bool) -> SimReport:
             tracemalloc.stop()
         if gc_was_enabled:
             gc.enable()
+        if host is not None:
+            host.release_upload_results()
+        # The report already copied the fields tests read. Drop the class,
+        # including upload tasks and their httpx responses, before collecting.
+        host = None
+        app = None
+        translator = None
+        asr = None
+        pipe = None
+        observed = None
+        orig_admit = None
+        storm_admit = None
+        collect_between_slices = None
+        on_start = None
+        on_each = None
+        listeners = []
+        client = None
+        warm = None
+        srt_resp = None
+        json_resp = None
+        final = None
+        state = None
+        snapshots = None
+        pending_snaps = None
         gc.unfreeze()
+        # Outside the paced class. Frees what the report did not keep and
+        # resets gen2 before the next test's measured window.
+        gc.collect()
     return report
 
 

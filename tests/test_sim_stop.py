@@ -15,6 +15,7 @@ from tests.sim import (
     SCALE,
     Listener,
     caption_rows,
+    no_gc_pause,
     ScriptedTranslator,
     TextAsr,
     VirtualHost,
@@ -24,6 +25,7 @@ from tests.sim import (
     serving,
     sim_settings,
     vlimit,
+    watch_full_gc,
 )
 from tests.test_round2 import auth, breaking_decoder
 
@@ -35,14 +37,22 @@ async def test_stop_latency_not_bound_by_translation():
     stop() is pressed right after the fifth slice is handed to upload (drain=False), so
     the measured time includes settling that last upload, as host.html does before
     /api/session/end. On main that upload waits for English (about 40 virtual s).
+    Automatic GC is off for run+stop: a full collection is a pause the browser
+    and the server, in separate processes, do not share. The 3.5s bound is unchanged.
     """
     translator = ScriptedTranslator(lambda zh: ("ok", 40.0))
     async with serving(asr=TextAsr(1.5), translator=translator) as (app, client, token):
         await open_room(client, token, "class")
         host = VirtualHost(client, token, "class", "s")
-        await host.run(5, drain=False)
-        resp = await host.stop()
+        with no_gc_pause():
+            await host.run(5, drain=False)
+            with watch_full_gc() as full_gc:
+                resp = await host.stop()
         assert resp.status_code == 200, resp.text
+        assert not full_gc, (
+            "a full GC ran during stop; stop_elapsed_v includes that pause, not ASR or flush "
+            f"(stop_elapsed_v={host.stop_elapsed_v})"
+        )
         assert host.stop_elapsed_v <= vlimit(3.5)
 
 
