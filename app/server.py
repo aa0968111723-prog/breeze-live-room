@@ -12,7 +12,8 @@ from urllib.parse import unquote_to_bytes
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
-from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import Headers
+from starlette.staticfiles import NotModifiedResponse, StaticFiles
 
 from app.aio import cancellation_pending, wait_bounded
 from app.asr import CliAsr, ResidentAsr
@@ -36,6 +37,31 @@ TMP = ROOT / "tmp"
 PROMPT = "以下是台灣國語的句子，請用繁體中文輸出。常見專有名詞：般若、菩提心、空性、因緣。這是提示偏置，不保證鎖詞。"
 
 _TRACKED: list[FastAPI] = []
+
+
+class RevalidatingStaticFiles(StaticFiles):
+    """Send Cache-Control: no-cache and keep ETag so browsers revalidate.
+
+    A cached room_client.js paired with a newer host.html or room.html throws
+    on import and the page script never starts.
+    """
+
+    def file_response(
+        self,
+        full_path: str | os.PathLike[str],
+        stat_result: os.stat_result,
+        scope: dict,
+        status_code: int = 200,
+    ) -> Response:
+        response = FileResponse(
+            full_path,
+            status_code=status_code,
+            stat_result=stat_result,
+            headers={"Cache-Control": "no-cache"},
+        )
+        if self.is_not_modified(response.headers, Headers(scope=scope)):
+            return NotModifiedResponse(response.headers)
+        return response
 
 
 def rss_bytes() -> int:
@@ -781,7 +807,8 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             await shutdown()
 
     app = FastAPI(title="breeze-live-room", lifespan=lifespan)
-    app.mount("/static", StaticFiles(directory=STATIC), name="static")
+    static_files = RevalidatingStaticFiles(directory=STATIC)
+    app.mount("/static", static_files, name="static")
     app.state.settings = settings
     app.state.token = token
     app.state.pipeline = pipeline
@@ -800,17 +827,25 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         key = _listen_key_of(room_id) if include_key else ""
         return listen_url(room_id, settings.port, settings.share_scheme, current_host(), key or None)
 
+    async def _page(path: Path, request: Request) -> Response:
+        stat_result = await asyncio.to_thread(path.stat)
+        return static_files.file_response(
+            path,
+            stat_result,
+            {"type": "http", "headers": request.scope["headers"]},
+        )
+
     @app.get("/")
-    async def host_page() -> FileResponse:
-        return FileResponse(STATIC / "host.html")
+    async def host_page(request: Request) -> Response:
+        return await _page(STATIC / "host.html", request)
 
     @app.get("/r/{room_id}")
-    async def room_page(room_id: str) -> FileResponse:
+    async def room_page(request: Request, room_id: str) -> Response:
         try:
             validate_room_id(room_id)
         except RoomIdError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return FileResponse(STATIC / "room.html")
+        return await _page(STATIC / "room.html", request)
 
     @app.get("/api/host-token")
     async def host_token(request: Request) -> Response:
