@@ -32,7 +32,7 @@ html.project .zh, body.project .zh { font-size: max(var(--size), min(calc(var(--
 body.project #history, body.project #hist-label { display: none; }
 #leave-project { display: none; }
 html.project #leave-project, body.project #leave-project { display: inline-block; }
-header { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: nowrap; flex-shrink: 0; gap: 8px; align-items: center; min-height: 44px; padding: calc(8px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) 8px calc(12px + env(safe-area-inset-left)); background: var(--bg); background: color-mix(in srgb, var(--bg) 92%, transparent); }
+header { position: sticky; top: 0; z-index: 4; display: flex; flex-wrap: nowrap; flex-shrink: 0; gap: 8px; align-items: center; min-height: 44px; padding: calc(8px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) 8px calc(12px + env(safe-area-inset-left)); background: var(--bg); background: color-mix(in srgb, var(--bg) 92%, transparent); }
 button, select { font-size: 16px; min-height: 44px; padding: 8px 12px; border-radius: 10px; border: 0; background: #8a5424; color: white; }
 html.dark button, html.dark select, html.project button, html.project select, body.dark button, body.dark select, body.project button, body.project select { background: #c9843f; color: #16130f; }
 button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px solid #c47a32; outline-offset: 2px; }
@@ -57,7 +57,8 @@ html:not(.project) .en, html:not(.project) .zh { overflow: hidden; display: flex
 html:not(.project) .en { max-height: 60%; }
 html:not(.project) .zh { max-height: 40%; }
 html:not(.project) #history { min-height: 0; }
-html:not(.project) #drawer { position: absolute; left: 0; right: 0; z-index: 3; max-height: min(168px, 46vh); overflow: auto; background: var(--bg); }
+html:not(.project) #drawer { position: absolute; left: 0; right: 0; top: calc(60px + env(safe-area-inset-top)); z-index: 3; max-height: min(136px, 46vh); overflow: auto; background: var(--bg); }
+html.project #drawer-close, body.project #drawer-close { display: none; }
 @media (max-height: 400px) {
   html:not(.project) #history, html:not(.project) #hist-label, html:not(.project) .stage-note { display: none; }
   html:not(.project) .en { padding-top: 4px; padding-bottom: 2px; }
@@ -110,6 +111,7 @@ li.gap { color: var(--muted); text-align: center; font-size: 14px; border-top-st
 <p id="offline" class="banner" hidden>手機沒網路。恢復網路後會自動接回。</p>
 <p id="expiry" class="sub" hidden>較早的字幕已超過保存時間，已從畫面上拿掉</p>
 <div id="drawer" hidden>
+<button id="drawer-close" type="button" aria-label="關閉設定">關閉</button>
 <label>顯示 <select id="mode"><option value="both">中英</option><option value="zh">中文</option><option value="en">只看譯文</option><option value="project">投影</option></select></label>
 <label>字級 <select id="size"><option value="28">小</option><option value="34" selected>中</option><option value="46">大</option><option value="64">特大</option></select></label>
 <label>主題 <select id="theme"><option value="system" selected>跟隨系統</option><option value="light">亮色</option><option value="dark">暗色</option></select></label>
@@ -344,11 +346,18 @@ function connect() {
 }
 let conn = connect();
 document.querySelector("#retry").onclick = () => { conn.restart(); };
+function setDrawer(open) {
+  const drawer = document.querySelector("#drawer");
+  if (!drawer) return;
+  drawer.hidden = !open;
+  const settings = document.querySelector("#settings");
+  if (settings) settings.setAttribute("aria-expanded", open ? "true" : "false");
+}
 document.querySelector("#settings").onclick = () => {
   const drawer = document.querySelector("#drawer");
-  drawer.hidden = !drawer.hidden;
-  document.querySelector("#settings").setAttribute("aria-expanded", drawer.hidden ? "false" : "true");
+  setDrawer(!!(drawer && drawer.hidden));
 };
+document.querySelector("#drawer-close").onclick = () => setDrawer(false);
 document.querySelector("#theme").onchange = (ev) => { remember({ ...prefs, theme: ev.target.value }); };
 const full = document.querySelector("#full");
 if (!fullscreenAvailable(document)) full.hidden = true;
@@ -369,6 +378,15 @@ document.querySelector("#wake").onchange = (ev) => {
   syncWake("visible");
 };
 document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") {
+    const drawer = document.querySelector("#drawer");
+    if (drawer && !drawer.hidden) {
+      setDrawer(false);
+      const settings = document.querySelector("#settings");
+      if (settings && typeof settings.focus === "function") settings.focus();
+      return;
+    }
+  }
   const next = leaveProjection(prefs, ev.key);
   if (!next) return;
   remember(next);

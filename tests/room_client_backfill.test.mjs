@@ -257,6 +257,7 @@ async function testDeferredHelloStaysLiveAndKeepsHistory() {
   assert.match(side.address, /replay=1/);
   assert.match(side.address, /cursor=0/);
   assert.match(side.address, /supplement=1/);
+  assert.doesNotMatch(main.address, /supplement=1/);
   side.onopen();
   side.onmessage({
     data: JSON.stringify({ id: "class:s:live", session_id: "s", seq: 9, version: 1, zh: "副線即時" }),
@@ -336,8 +337,64 @@ async function testStopClosesTheBackfillSocket() {
   await conn.done;
 }
 
+async function testExtraHelloTimeoutReschedules() {
+  const states = [];
+  const view = createCaptionView();
+  const sockets = [];
+  const conn = connectRoom({
+    room: "class",
+    url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class&cid=phone-a",
+    openSocket(address) {
+      const ws = fakeSocket(address);
+      sockets.push(ws);
+      return ws;
+    },
+    sleep: () => Promise.resolve(),
+    random: () => 0,
+    extraHelloMs: 30,
+    onState(detail) { states.push(detail.kind); },
+    onEvent(item) { view.apply(item); },
+    onBackfill(rows) { view.replace(rows); },
+    onReset() { view.reset(); },
+  });
+  await tick();
+  const main = sockets[0];
+  main.onopen();
+  main.onmessage(deferredHello());
+  await tick();
+  const side = sockets.at(-1);
+  assert.notEqual(side, main);
+  side.onopen();
+  assert.notEqual(side.closed, true);
+  const started = Date.now();
+  while (!side.closed) {
+    assert.ok(Date.now() - started < 5000, "supplement hello timeout did not fire");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.notEqual(main.closed, true, "the live socket stays up when the supplement times out");
+  const retry = sockets.at(-1);
+  assert.notEqual(retry, side, "a supplement with no hello must not stick replaceOnBackfill");
+  assert.match(retry.address, /supplement=1/);
+  assert.equal(view.items.get("class:s:1").zh, "歷史");
+  retry.onopen();
+  retry.onmessage({
+    data: JSON.stringify({
+      type: "hello",
+      epoch: 1,
+      latest_cursor: 8,
+      backfill: [{ id: "class:s:3", session_id: "s", seq: 3, version: 1, cursor: 3, zh: "補" }],
+    }),
+  });
+  assert.equal(retry.closed, true);
+  assert.equal(view.items.get("class:s:3").zh, "補");
+  assert.ok(states.includes("live"));
+  conn.stop();
+  await conn.done;
+}
+
 await testDeferredHelloStaysLiveAndKeepsHistory();
 await testSideDeferReschedulesWithoutClosingMain();
 await testMainBackfillClosesTheSideSocket();
 await testStopClosesTheBackfillSocket();
+await testExtraHelloTimeoutReschedules();
 console.log("room client backfill ok");

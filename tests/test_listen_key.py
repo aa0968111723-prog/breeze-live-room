@@ -1305,6 +1305,254 @@ async def test_unseated_supplement_still_takes_a_listener_seat():
         await stop(app)
 
 
+def _room_listeners(app, room_id="class"):
+    room = app.state.room_book.get(room_id)
+    assert room is not None
+    conns = list(room["listeners"])
+    seated = [conn for conn in conns if not conn.supplement]
+    supplements = [conn for conn in conns if conn.supplement]
+    return seated, supplements
+
+
+async def _metrics_listeners(client, token) -> int:
+    resp = await client.get("/api/metrics", headers=auth(token))
+    assert resp.status_code == 200, resp.text
+    return int(resp.json()["listeners"])
+
+
+@pytest.mark.anyio
+async def test_supplement_exemption_needs_replay_and_a_named_seat():
+    """supplement=1 alone is not an exemption.
+
+    It also needs replay=1 and a named seat. Two anonymous sockets must not
+    count as that seat for each other, and a supplement without replay still
+    takes the last listener slot.
+    """
+    app = app_for(
+        settings=Settings(allow_testclient=True, translate=False, max_listeners=1),
+        translator=Translator(enabled=False),
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await open_room(client, token, "class")
+            async with Socket(
+                app,
+                "/ws/listen?room_id=class&cursor=0",
+                client=("203.0.113.80", 1),
+            ) as anon:
+                hello = await anon.recv()
+                assert hello["type"] == "hello"
+                async with Socket(
+                    app,
+                    "/ws/listen?room_id=class&replay=1&supplement=1",
+                    client=("203.0.113.80", 2),
+                ) as other_anon:
+                    note = await other_anon.recv()
+                    assert note["type"] == "room_unavailable"
+                    assert note["reason"] == "full"
+                    closed = await other_anon.recv()
+                    assert closed["type"] == "websocket.close"
+                    assert closed["code"] == 1013
+            async with Socket(
+                app,
+                "/ws/listen?room_id=class&cursor=0&cid=phone-a",
+                client=("203.0.113.81", 1),
+            ) as seat:
+                sat = await seat.recv()
+                assert sat["type"] == "hello"
+                async with Socket(
+                    app,
+                    "/ws/listen?room_id=class&supplement=1&cid=phone-a",
+                    client=("203.0.113.81", 2),
+                ) as noreplay:
+                    note = await noreplay.recv()
+                    assert note["type"] == "room_unavailable"
+                    assert note["reason"] == "full"
+                    closed = await noreplay.recv()
+                    assert closed["code"] == 1013
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_supplement_closes_when_its_seat_leaves():
+    """A backfill socket rides the seat. The seat leaving closes it.
+
+    It must not stay in the fan-out as an uncounted live listener.
+    """
+    app = app_for(
+        settings=Settings(allow_testclient=True, translate=False, max_listeners=2),
+        translator=Translator(enabled=False),
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await open_room(client, token, "class")
+            async with Socket(
+                app,
+                "/ws/listen?room_id=class&cursor=0&cid=phone-a",
+                client=("203.0.113.40", 1),
+            ) as seat:
+                hello = await seat.recv()
+                assert hello["type"] == "hello"
+                supplement = Socket(
+                    app,
+                    "/ws/listen?room_id=class&replay=1&supplement=1&cid=phone-a",
+                    client=("203.0.113.40", 2),
+                )
+                await supplement.__aenter__()
+                try:
+                    extra = await supplement.recv()
+                    assert extra["type"] == "hello"
+                    assert extra.get("reason") != "full"
+                    assert await _metrics_listeners(client, token) == 1
+                    seated, supplements = _room_listeners(app)
+                    assert len(seated) == 1 and len(supplements) == 1
+                    await seat.close()
+                    closed = await supplement.recv()
+                    assert closed["type"] == "websocket.close"
+                    assert closed["code"] == 1000
+                    assert await _metrics_listeners(client, token) == 0
+                    seated, supplements = _room_listeners(app)
+                    assert seated == [] and supplements == []
+                    async with Socket(
+                        app,
+                        "/ws/listen?room_id=class&cursor=0&cid=phone-b",
+                        client=("203.0.113.41", 1),
+                    ) as nxt:
+                        nxt_hello = await nxt.recv()
+                        assert nxt_hello["type"] == "hello"
+                        assert nxt_hello.get("reason") != "full"
+                        delivered = app.state.pipeline.on_event({
+                            "type": "caption",
+                            "id": "class:s:1",
+                            "room_id": "class",
+                            "session_id": "s",
+                            "session_ord": 1,
+                            "seq": 1,
+                            "version": 1,
+                            "zh": "座位走了",
+                            "en": "seat left",
+                            "status": "ready",
+                        })
+                        assert delivered is not None
+                        live = await nxt.recv()
+                        assert live["zh"] == "座位走了"
+                        with pytest.raises(TimeoutError):
+                            await supplement.recv(timeout=0.4)
+                finally:
+                    await supplement.close()
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_supplement_rotation_does_not_accumulate_uncounted_listeners():
+    """Sitting, opening supplement=1, then leaving must not stack live sockets.
+
+    A deferred replay still accepts the socket. That socket has to die with the
+    seat, or eight cids can sit past max_listeners and keep receiving captions.
+    """
+    app = app_for(
+        settings=Settings(
+            allow_testclient=True,
+            translate=False,
+            max_listeners=3,
+            replay_per_minute=2,
+            replay_client_per_minute=1,
+        ),
+        translator=Translator(enabled=False),
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await open_room(client, token, "class")
+            async with Socket(
+                app,
+                "/ws/listen?room_id=class&cursor=0&cid=anchor-1",
+                client=("203.0.113.51", 1),
+            ) as anchor_a, Socket(
+                app,
+                "/ws/listen?room_id=class&cursor=0&cid=anchor-2",
+                client=("203.0.113.52", 1),
+            ) as anchor_b:
+                assert (await anchor_a.recv())["type"] == "hello"
+                assert (await anchor_b.recv())["type"] == "hello"
+                assert await _metrics_listeners(client, token) == 2
+                deferred = 0
+                nat = "203.0.113.50"
+                for index in range(8):
+                    seat = Socket(
+                        app,
+                        f"/ws/listen?room_id=class&cursor=0&cid=rot-{index}",
+                        client=(nat, 1000 + index),
+                    )
+                    supplement = Socket(
+                        app,
+                        f"/ws/listen?room_id=class&replay=1&supplement=1&cid=rot-{index}",
+                        client=(nat, 2000 + index),
+                    )
+                    await seat.__aenter__()
+                    try:
+                        sat = await seat.recv()
+                        assert sat["type"] == "hello" and sat.get("reason") != "full"
+                        await supplement.__aenter__()
+                        try:
+                            extra = await supplement.recv()
+                            assert extra["type"] == "hello"
+                            assert extra.get("reason") != "full"
+                            if extra.get("backfill_deferred") is True:
+                                deferred += 1
+                            assert await _metrics_listeners(client, token) == 3
+                            seated, supplements = _room_listeners(app)
+                            assert len(seated) == 3 and len(supplements) == 1
+                            await seat.close()
+                            closed = await supplement.recv()
+                            assert closed["type"] == "websocket.close"
+                            assert closed["code"] == 1000
+                        finally:
+                            await supplement.close()
+                    finally:
+                        await seat.close()
+                    assert await _metrics_listeners(client, token) == 2
+                    seated, supplements = _room_listeners(app)
+                    assert len(seated) == 2 and supplements == []
+                assert deferred >= 6
+                async with Socket(
+                    app,
+                    "/ws/listen?room_id=class&cursor=0&cid=late",
+                    client=("203.0.113.53", 1),
+                ) as late:
+                    late_hello = await late.recv()
+                    assert late_hello["type"] == "hello"
+                    assert late_hello.get("reason") != "full"
+                    assert await _metrics_listeners(client, token) == 3
+                    delivered = app.state.pipeline.on_event({
+                        "type": "caption",
+                        "id": "class:s:9",
+                        "room_id": "class",
+                        "session_id": "s",
+                        "session_ord": 1,
+                        "seq": 9,
+                        "version": 1,
+                        "zh": "只有座位",
+                        "en": "seats only",
+                        "status": "ready",
+                    })
+                    assert delivered is not None
+                    seen = await late.recv()
+                    assert seen["zh"] == "只有座位"
+                    for anchor in (anchor_a, anchor_b):
+                        row = await anchor.recv()
+                        assert row["zh"] == "只有座位"
+                seated, supplements = _room_listeners(app)
+                assert len(seated) == 2 and supplements == []
+                assert await _metrics_listeners(client, token) == 2
+    finally:
+        await stop(app)
+
+
 @pytest.mark.anyio
 async def test_host_export_keeps_previous_class_across_restart(tmp_path):
     path = tmp_path / "captions.sqlite3"

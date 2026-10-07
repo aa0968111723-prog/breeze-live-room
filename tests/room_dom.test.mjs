@@ -263,8 +263,9 @@ function pageElement(token, project) {
 }
 
 function evalLength(value, width, height) {
-  const text = String(value == null ? "" : value).trim();
+  let text = String(value == null ? "" : value).trim();
   if (!text) return null;
+  text = text.replace(/env\(\s*safe-area-inset-(?:top|right|bottom|left)\s*(?:,\s*[^)]*)?\)/g, "0px");
   if ((text.startsWith("min(") || text.startsWith("max(")) && text.endsWith(")")) {
     const nums = text.slice(4, -1).split(",").map((part) => evalLength(part, width, height)).filter((part) => part != null);
     if (!nums.length) return null;
@@ -273,6 +274,17 @@ function evalLength(value, width, height) {
   if (text.startsWith("clamp(") && text.endsWith(")")) {
     const parts = text.slice(6, -1).split(",").map((part) => evalLength(part, width, height));
     return Math.min(parts[2], Math.max(parts[0], parts[1]));
+  }
+  if (text.startsWith("calc(") && text.endsWith(")") && !text.slice(5, -1).includes("(")) {
+    const pieces = text.slice(5, -1).split("+").map((part) => part.trim()).filter(Boolean);
+    if (!pieces.length) return null;
+    let total = 0;
+    for (const piece of pieces) {
+      const n = evalLength(piece, width, height);
+      if (n == null) return null;
+      total += n;
+    }
+    return total;
   }
   if (text.endsWith("vw")) return (parseFloat(text) / 100) * width;
   if (text.endsWith("vh")) return (parseFloat(text) / 100) * height;
@@ -435,6 +447,9 @@ const font720 = fonts720[3];
 const sentence720 = sentenceBox(font720, 1280);
 const room720 = projectStageRoom(1280, 720);
 assert.ok(sentence720 <= room720, `720p 特大 sentence ${sentence720}px is outside the ${room720}px stage at ${font720}px`);
+// Chrome at 1280×720 clips this fixture once the glyph exceeds 68px
+// (69.12px already paints above the stage). The model alone let 69–70px through.
+assert.ok(font720 <= 68, `720p 特大 ${font720}px exceeds the measured 68px cap`);
 
 const stageSample = pageElement("64", true);
 assert.equal(computedProp(stageSample.stage, "align-content", 1280), "flex-end");
@@ -640,7 +655,12 @@ function normalNewest(viewport, token, english, chinese, drawerOpen) {
   const enGlyphTop = enGlyphBottom - enLine;
   const zhGlyphBottom = zhClips ? zhBottom - zhPad.bottom : zhTop + zhNatural;
   const zhGlyphTop = zhGlyphBottom - zhLine;
-  const drawerTop = header + sub;
+  // An absolute drawer with no top is placed at the flex start (measured 0)
+  // and covers the header. A declared top is the overlay's real edge.
+  const declaredTop = evalLength(computedProp(nodes.drawer, "top", width, height), width, height);
+  const drawerTop = drawerPos === "absolute" || drawerPos === "fixed"
+    ? (declaredTop == null ? 0 : declaredTop)
+    : header + sub;
   const drawerBottom = drawerTop + drawerH;
   const covers = (top, bottom) => drawerOpen && drawerPos === "absolute" && top < drawerBottom - 0.5 && bottom > drawerTop + 0.5;
   const shown = (top, bottom, boxTop, boxBottom) => top >= boxTop - 0.5 && bottom <= boxBottom + 0.5
@@ -652,6 +672,7 @@ function normalNewest(viewport, token, english, chinese, drawerOpen) {
     font,
     enGlyphTop,
     zhGlyphTop,
+    drawerTop,
     drawerBottom,
     contentH,
   };
@@ -673,6 +694,47 @@ for (const viewport of [
     assert.ok(lines.en, `en newest off screen ${where} top ${lines.enGlyphTop} drawer ${lines.drawerBottom}`);
     assert.ok(lines.zh, `zh newest off screen ${where} top ${lines.zhGlyphTop} drawer ${lines.drawerBottom}`);
   }
+}
+
+// Header content box is min-height 44px plus 8px padding on each side (60px),
+// then the notch inset. #state and ⚙ 設定 sit in that band. An absolute drawer
+// with no top used to start at 0 and cover both, and the only close control
+// was the covered button.
+function normalHeaderBottom() {
+  return 8 + 44 + 8;
+}
+const drawerScreens = [
+  { width: 320, height: 568 },
+  { width: 360, height: 640 },
+  { width: 390, height: 844 },
+  { width: 430, height: 932 },
+  { width: 568, height: 320 },
+  { width: 640, height: 360 },
+  { width: 844, height: 390 },
+  { width: 768, height: 1024 },
+  { width: 1280, height: 720 },
+];
+assert.match(style, /html:not\(\.project\) \.en \{ max-height: 60%; \}/);
+assert.match(style, /html:not\(\.project\) \.zh \{ max-height: 40%; \}/);
+assert.equal(drawerScreens.length, 9);
+assert.match(header, /id="settings"/);
+assert.match(header, /id="state"/);
+assert.match(html, /id="drawer-close"[^>]*aria-label="關閉設定"/);
+assert.match(body, /ev\.key === "Escape"[\s\S]*setDrawer\(false\)/);
+assert.match(body, /#drawer-close"\)\.onclick = \(\) => setDrawer\(false\)/);
+for (const viewport of drawerScreens) {
+  const nodes = pageElement("34", false);
+  const where = `${viewport.width}x${viewport.height}`;
+  const pos = computedProp(nodes.drawer, "position", viewport.width, viewport.height);
+  assert.equal(pos, "absolute", where);
+  const drawerTop = evalLength(computedProp(nodes.drawer, "top", viewport.width, viewport.height), viewport.width, viewport.height);
+  const headerBottom = normalHeaderBottom();
+  assert.ok(drawerTop != null && drawerTop >= headerBottom - 0.5, `open drawer covers 設定 ${where} top ${drawerTop} header ${headerBottom}`);
+  const headerZ = Number(computedProp(nodes.header, "z-index", viewport.width, viewport.height));
+  const drawerZ = Number(computedProp(nodes.drawer, "z-index", viewport.width, viewport.height));
+  assert.ok(headerZ > drawerZ, `設定 must paint above the drawer ${where} header ${headerZ} drawer ${drawerZ}`);
+  const lines = normalNewest(viewport, "34", LONG_EN, LONG_ZH, true);
+  assert.ok(Math.abs(lines.drawerTop - drawerTop) < 0.5, `normalNewest drawer top ${lines.drawerTop} != css ${drawerTop} ${where}`);
 }
 
 function projectionStateWidth(viewport) {

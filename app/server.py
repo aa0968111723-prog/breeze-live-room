@@ -231,6 +231,55 @@ def _seated_listeners(rooms) -> int:
     return total
 
 
+def _client_still_seated(room, client_id: str) -> bool:
+    if not client_id or client_id == "anon":
+        return False
+    for conn in room.get("listeners", ()):
+        if getattr(conn, "supplement", False):
+            continue
+        if getattr(conn, "client_id", "") == client_id:
+            return True
+    return False
+
+
+def _detach_supplements(room, client_id: str) -> list:
+    """Drop this cid's backfill sockets once no seat remains.
+
+    supplement=1 skips max_listeners only while that seat is still in the room.
+    A socket left behind kept receiving live captions and never counted.
+    """
+    if not client_id or client_id == "anon" or _client_still_seated(room, client_id):
+        return []
+    detached = []
+    for conn in list(room.get("listeners", ())):
+        if not getattr(conn, "supplement", False):
+            continue
+        if getattr(conn, "client_id", "") != client_id:
+            continue
+        room["listeners"].discard(conn)
+        conn.slot.alive = False
+        detached.append(conn)
+    return detached
+
+
+async def _close_detached(conns) -> None:
+    for conn in conns:
+        await conn.slot.close()
+        try:
+            await conn.ws.close(code=1000)
+        except Exception:
+            pass
+
+
+async def _release_listener(room, conn) -> None:
+    room["listeners"].discard(conn)
+    detached = []
+    if not getattr(conn, "supplement", False):
+        detached = _detach_supplements(room, getattr(conn, "client_id", ""))
+    await conn.slot.close()
+    await _close_detached(detached)
+
+
 # Audience replay is the newest screenful, never the whole class. Export stays
 # complete. The whole replay hello, not only the backfill field, stays within
 # 100 KiB so 180 replays a minute stay near 18 MB. A fatter body drops the oldest rows.
@@ -746,6 +795,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             asr = CliAsr(whisper, model, threads=settings.asr_threads, timeout_s=settings.asr_timeout_s, audio_context=settings.asr_audio_context, beam_size=settings.asr_beam_size, best_of=settings.asr_best_of)
     share_override = {"host": settings.share_host}
     tasks: list[asyncio.Task] = []
+    close_jobs: set[asyncio.Task] = set()
     replay_floors: dict[str, float] = {}
     replay_gate = _ReplayGate(settings.replay_per_minute, settings.replay_client_per_minute)
     share_cache: dict[str, object] = {"at": 0.0, "hosts": []}
@@ -860,6 +910,27 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         """
         return _trim_audience_rows(rows, AUDIENCE_BACKFILL_BYTES)
 
+    def _schedule_close(conns) -> None:
+        if not conns:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        job = loop.create_task(_close_detached(conns))
+        close_jobs.add(job)
+        job.add_done_callback(close_jobs.discard)
+
+    def _drop_unsendable(room, dead) -> None:
+        """A seat that can no longer take captions must not leave its supplement behind."""
+        detached = []
+        for conn in dead:
+            room["listeners"].discard(conn)
+            if getattr(conn, "supplement", False):
+                continue
+            detached.extend(_detach_supplements(room, getattr(conn, "client_id", "")))
+        _schedule_close(detached)
+
     def _fanout(snap: dict) -> None:
         room = book.get(str(snap.get("room_id") or ""))
         if room is None:
@@ -871,8 +942,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         for conn in list(room["listeners"]):
             if not conn.slot.offer(outgoing):
                 dead.append(conn)
-        for conn in dead:
-            room["listeners"].discard(conn)
+        _drop_unsendable(room, dead)
 
     def _announce_live(room_id: str) -> None:
         """Tell this room's listeners whether the host mic is on. No secrets."""
@@ -884,8 +954,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         for conn in list(room["listeners"]):
             if not conn.slot.offer(note):
                 dead.append(conn)
-        for conn in dead:
-            room["listeners"].discard(conn)
+        _drop_unsendable(room, dead)
 
     def on_event(event: dict):
         try:
@@ -1028,11 +1097,13 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             await sweep_once()
 
     async def shutdown() -> None:
-        for task in tasks:
+        pending = list(tasks) + list(close_jobs)
+        for task in pending:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         tasks.clear()
+        close_jobs.clear()
         await pipeline.aclose()
         if hasattr(asr, "close"):
             asr.close()
@@ -1586,7 +1657,17 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         conn.client_id = client_id
         conn.supplement = supplement_flag
         room["listeners"].add(conn)
+        # The seat can leave between the exemption check and this insert.
+        if conn.supplement and not _client_still_seated(room, conn.client_id):
+            room["listeners"].discard(conn)
+            try:
+                await ws.close(code=1000)
+            except Exception:
+                pass
+            return
         await ensure_hydrated(room_id)
+        if conn not in room["listeners"]:
+            return
         resumed = bus.since(room_id, cursor)
         history = bus.history(room_id) if cursor <= 0 else []
         events = list(resumed["events"]) if cursor > 0 else []
@@ -1624,7 +1705,9 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         try:
             await ws.send_json(hello)
         except Exception:
-            room["listeners"].discard(conn)
+            await _release_listener(room, conn)
+            return
+        if conn not in room["listeners"]:
             return
         conn.slot.start()
         ping_task = asyncio.create_task(_ping(conn, settings))
@@ -1650,8 +1733,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             pass
         finally:
             ping_task.cancel()
-            room["listeners"].discard(conn)
-            await conn.slot.close()
+            await _release_listener(room, conn)
 
     _TRACKED.append(app)
     return app

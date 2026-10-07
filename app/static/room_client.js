@@ -194,6 +194,7 @@ function stateManual(kind, attempt) {
 export function connectRoom({
   room, url, onState, onEvent, onGap, onDelete, onClear, onBackfill, onReset, onHost, onExpire,
   openSocket, sleep, now, staleMs, random, schedule, cancelSchedule, isForeground, network, watchEvery,
+  extraHelloMs,
 }) {
   const versions = new Map();
   let cursor = 0;
@@ -214,6 +215,10 @@ export function connectRoom({
   let loopRunning = false;
   let socket = null;
   let extraSocket = null;
+  let extraHelloTimer = null;
+  // A supplement that is accepted and then never sent hello must not pin the
+  // backfill flag. Server pings would otherwise keep that socket up forever.
+  const extraHelloLimit = Number(extraHelloMs) > 0 ? Number(extraHelloMs) : 15000;
   let backfillGen = 0;
   let pullSerial = 0;
   let backfillTimer = null;
@@ -343,10 +348,28 @@ export function connectRoom({
     backfillTimer = null;
   }
 
+  function clearExtraHelloTimer() {
+    if (extraHelloTimer == null) return;
+    clearTimeout(extraHelloTimer);
+    extraHelloTimer = null;
+  }
+
+  function armExtraHello(extra, gen) {
+    clearExtraHelloTimer();
+    const timer = setTimeout(() => {
+      if (extraHelloTimer === timer) extraHelloTimer = null;
+      if (stopped || gen !== backfillGen || extraSocket !== extra) return;
+      try { extra.close(); } catch { /* onclose schedules the next pull */ }
+    }, extraHelloLimit);
+    if (timer && typeof timer.unref === "function") timer.unref();
+    extraHelloTimer = timer;
+  }
+
   function closeExtra() {
     // The background replay socket holds a server connection until the heartbeat
     // times out unless we close it as soon as the replacement is applied.
     clearBackfillTimer();
+    clearExtraHelloTimer();
     if (!extraSocket) return;
     const extra = extraSocket;
     extraSocket = null;
@@ -375,9 +398,11 @@ export function connectRoom({
 
   function wireExtra(extra, gen) {
     extraSocket = extra;
+    armExtraHello(extra, gen);
     extra.onopen = () => {};
     extra.onerror = () => { try { extra.close(); } catch { /* onclose retries */ } };
     extra.onclose = () => {
+      clearExtraHelloTimer();
       if (extraSocket === extra) extraSocket = null;
       if (stopped || gen !== backfillGen || !replaceOnBackfill) return;
       scheduleBackfill(deferredRetryMs(1000, roll()));
@@ -396,6 +421,7 @@ export function connectRoom({
         deliver(msg);
         return;
       }
+      clearExtraHelloTimer();
       if (msg.backfill_deferred === true) {
         const hinted = Number(msg.retry_after_ms != null ? msg.retry_after_ms : msg.retry_after);
         const again = deferredRetryMs(Number.isFinite(hinted) ? hinted : 1000, roll());
@@ -831,6 +857,7 @@ export function connectRoom({
       stopped = true;
       backfillGen += 1;
       clearBackfillTimer();
+      clearExtraHelloTimer();
       if (extraSocket) {
         const extra = extraSocket;
         extraSocket = null;
