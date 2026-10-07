@@ -185,6 +185,7 @@ async function testRefusalMessageShowsWhenTheBrowserOnlyHas1006() {
   assert.equal(sockets2.length, 1);
   assert.equal(states2.at(-1).kind, "rejected");
   assert.ok(String(states2.at(-1).text).includes("無法開啟"));
+  assert.equal(states2.at(-1).subtitle, "無法開啟這個房間，請確認網址或重新掃描 QR 碼");
   conn2.stop();
   await conn2.done;
 }
@@ -209,7 +210,8 @@ async function testRejectedCloseStaysPut() {
   await tick();
   assert.equal(sockets.length, 1);
   assert.equal(states.at(-1).kind, "rejected");
-  assert.ok(String(states.at(-1).text).includes("無法開啟這個房間"));
+  assert.equal(states.at(-1).text, "無法開啟");
+  assert.equal(states.at(-1).subtitle, "無法開啟這個房間，請確認網址或重新掃描 QR 碼");
   conn.stop();
   await conn.done;
 }
@@ -283,7 +285,7 @@ async function testOfflinePausesThenOnlineReconnects() {
   assert.equal(sockets.length, 1);
   assert.equal(states.at(-1).kind, "device_offline");
   assert.equal(states.at(-1).text, "手機沒網路");
-  assert.ok(String(states.at(-1).subtitle).includes("恢復網路後會自動接回"));
+  assert.equal(states.at(-1).subtitle, "");
   network.emit("online");
   await tick();
   assert.equal(sockets.length, 2);
@@ -500,6 +502,40 @@ async function testEndedRestartKeepsCursor() {
   await conn.done;
 }
 
+async function testEndedTabReturnDoesNotReconnect() {
+  const sockets = [];
+  const states = [];
+  const conn = connectRoom({
+    room: "class",
+    url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
+    openSocket(address) {
+      const ws = fakeSocket(address);
+      sockets.push(ws);
+      return ws;
+    },
+    sleep: () => Promise.resolve(),
+    onState: (detail) => states.push(detail),
+    onEvent: () => {},
+  });
+  await tick();
+  sockets[0].onopen();
+  sockets[0].onmessage({ data: JSON.stringify({ type: "hello", latest_cursor: 3, history: [] }) });
+  sockets[0].onmessage({ data: JSON.stringify({ type: "room_unavailable", reason: "ended" }) });
+  await tick();
+  assert.equal(states.at(-1).kind, "ended");
+  assert.equal(sockets.length, 1);
+  conn.nudge();
+  await tick();
+  await tick();
+  assert.equal(sockets.length, 1);
+  assert.equal(states.at(-1).kind, "ended");
+  conn.restart();
+  await tick();
+  assert.equal(sockets.length, 2);
+  conn.stop();
+  await conn.done;
+}
+
 async function testNudgeAfterStopRestarts() {
   const sockets = [];
   const conn = connectRoom({
@@ -595,6 +631,7 @@ await testWatchdogClosesOnlyInForeground();
 await testWatchdogReconnectsWithoutOnclose();
 await testVisibleNudgeReconnectsAStaleSocketWithoutOnclose();
 await testEndedRestartKeepsCursor();
+await testEndedTabReturnDoesNotReconnect();
 await testNudgeAfterStopRestarts();
 await testHiddenUnreachableWaitsSixtySeconds();
 await testReconnectJitterBoundsAfterHello();

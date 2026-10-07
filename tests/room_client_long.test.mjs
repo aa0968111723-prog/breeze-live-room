@@ -2,7 +2,7 @@
 // J5: 1000 captions × 2 versions stay ordered.
 
 import assert from "node:assert/strict";
-import { connectRoom, liveTail, orderedCaptions, reconnectDelayMs } from "../app/static/room_client.js";
+import { connectRoom, liveTail, orderedCaptions } from "../app/static/room_client.js";
 
 function tick() {
   return new Promise((resolve) => setImmediate(resolve));
@@ -46,12 +46,10 @@ async function testKeepsRetryingPastEight() {
   assert.equal(joined.includes("服務離線"), false, joined);
   assert.ok(states.some((detail) => detail && detail.kind === "unreachable"), joined);
   assert.ok(states.some((detail) => detail && String(detail.text).includes("暫時連不上")), joined);
-  assert.ok(states.some((detail) => detail && String(detail.subtitle).includes("再試一次")), joined);
-  waits.forEach((ms, index) => {
-    assert.equal(ms, reconnectDelayMs(index + 1, 0, false));
-    const full = reconnectDelayMs(index + 1, 1, false);
-    assert.ok(ms >= reconnectDelayMs(index + 1, 0, false) && ms <= full);
-  });
+  assert.ok(states.some((detail) => detail && String(detail.subtitle).includes("下次自動重試")), joined);
+  assert.ok(states.some((detail) => detail && String(detail.subtitle).includes("30 秒")), joined);
+  assert.equal(states.some((detail) => detail && String(detail.subtitle) === "再試一次"), false);
+  assert.deepEqual(waits, [500, 1000, 2000, 4000, 8000, 30000, 30000, 30000, 30000, 30000]);
   assert.equal(waits[0], 500);
   assert.equal(waits[5], 30000);
 }

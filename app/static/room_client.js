@@ -152,19 +152,30 @@ function stateText(kind, attempt) {
     case "room_full": return "已滿";
     case "ended": return "已結束";
     case "link_invalid": return "連結已失效，請重新掃描";
-    case "rejected": return "無法開啟這個房間，請確認網址或重新掃描 QR 碼";
+    case "rejected": return "無法開啟";
     default: return "連線中";
   }
 }
 
-function stateSubtitle(kind) {
+function retrySubtitle(more, now) {
+  const at = Number(more && more.nextRetryAt) || 0;
+  const current = Number(now) || 0;
+  if (at > current) {
+    const sec = Math.max(1, Math.ceil((at - current) / 1000));
+    return "下次自動重試：" + sec + " 秒";
+  }
+  return "下次自動重試";
+}
+
+function stateSubtitle(kind, more, now) {
   switch (kind) {
     case "waiting_room": return "房間還沒開始，開始後會自動顯示字幕";
-    case "device_offline": return "恢復網路後會自動接回";
-    case "unreachable": return "再試一次";
+    case "device_offline": return "";
+    case "unreachable": return retrySubtitle(more, now);
     case "room_full": return "稍後自動再試";
     case "ended": return "最近字幕仍可往回看";
     case "link_invalid": return "請重新掃描主持人畫面上的 QR 碼";
+    case "rejected": return "無法開啟這個房間，請確認網址或重新掃描 QR 碼";
     default: return "";
   }
 }
@@ -232,7 +243,7 @@ export function connectRoom({
     const detail = {
       kind,
       text: more.text != null ? more.text : stateText(kind, attempt),
-      subtitle: more.subtitle != null ? more.subtitle : stateSubtitle(kind),
+      subtitle: more.subtitle != null ? more.subtitle : stateSubtitle(kind, more, clock()),
       attempt,
       nextRetryAt: more.nextRetryAt || 0,
       manual: more.manual != null ? more.manual : stateManual(kind, attempt),
@@ -676,6 +687,8 @@ export function connectRoom({
     done,
     get cursor() { return cursor; },
     nudge() {
+      // The room has ended. Coming back to the tab must not start polling again.
+      if (hold === "ended") return;
       if (stopped || !loopRunning || hold) {
         restart();
         return;
