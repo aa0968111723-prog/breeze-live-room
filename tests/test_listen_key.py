@@ -1060,6 +1060,247 @@ async def test_full_replay_table_still_delivers_live_captions():
                 retry_ms = int(deferred["retry_after_ms"])
                 assert 1000 < retry_ms <= 61000
                 assert "backfill" not in deferred
+                assert any(item.get("zh") == "即時" for item in deferred.get("history") or [])
+                made_late = await push(client, token, "class", "s", 2, "延後後".encode(), t0_ms=1000, t1_ms=2000)
+                assert made_late.status_code == 200, made_late.text
+                late_seen = None
+                closed = False
+                for _ in range(8):
+                    msg = await late.recv()
+                    if isinstance(msg, dict) and msg.get("type") == "websocket.close":
+                        closed = True
+                        break
+                    if isinstance(msg, dict) and msg.get("zh") == "延後後":
+                        late_seen = msg
+                        break
+                assert late_seen is not None, "deferred listener dropped the live caption"
+                assert closed is False, "backfill_deferred must not close the live socket"
+                try:
+                    extra = await late.recv(timeout=0.2)
+                except Exception:
+                    extra = None
+                assert not (isinstance(extra, dict) and extra.get("type") == "websocket.close")
+    finally:
+        await stop(app)
+
+
+def test_expired_addresses_scan_the_client_table_once():
+    """A thousand addresses expiring together walk the client table one time.
+
+    The visit counter is the number of client keys compared, not a wall clock.
+    One pass equals the key count. A pass per address would be addresses times keys.
+    """
+    now = {"t": 0.0}
+    addresses = 1000
+    per_address = 3
+    gate = _ReplayGate(
+        8,
+        per_address,
+        window_s=60.0,
+        clock=lambda: now["t"],
+        max_keys=addresses + 10,
+        max_client_keys=addresses * per_address + 10,
+    )
+    for index in range(addresses):
+        ip = f"10.{index // 65536}.{(index // 256) % 256}.{index % 256}"
+        for cid in range(per_address):
+            ok, retry = gate.allow(ip, f"c{cid}")
+            assert ok is True and retry == 0
+    client_keys = len(gate._client_hits)
+    assert client_keys == addresses * per_address
+    assert gate._expire_passes == 0
+    assert gate._expire_visits == 0
+    now["t"] = 61.0
+    ok, retry = gate.allow("192.0.2.10", "fresh")
+    assert ok is True and retry == 0
+    assert gate._expire_passes == 1
+    assert gate._expire_visits == client_keys
+    assert gate._expire_visits < addresses * client_keys
+    assert len(gate._ip_hits) == 1
+    assert len(gate._client_hits) == 1
+    assert ("192.0.2.10", "fresh") in gate._client_hits
+
+
+def test_full_client_table_uses_overflow_without_resetting_peers():
+    """The client-key cap shares the overflow bucket and leaves in-window hits alone."""
+    now = {"t": 0.0}
+    gate = _ReplayGate(4, 4, window_s=60.0, clock=lambda: now["t"], max_keys=10, max_client_keys=3)
+    assert gate.allow("10.0.0.1", "a") == (True, 0)
+    assert gate.allow("10.0.0.2", "b") == (True, 0)
+    assert gate.allow("10.0.0.3", "c") == (True, 0)
+    kept = list(gate._ip_hits["10.0.0.1"])
+    client_kept = list(gate._client_hits[("10.0.0.1", "a")])
+    ok, retry = gate.allow("10.0.0.4", "d")
+    assert ok is True and retry == 0
+    assert retry != 1000
+    assert "10.0.0.4" not in gate._ip_hits
+    assert ("10.0.0.4", "d") not in gate._client_hits
+    assert gate._ip_hits["10.0.0.1"] == kept
+    assert gate._client_hits[("10.0.0.1", "a")] == client_kept
+    assert gate.allow("10.0.0.1", "a") == (True, 0)
+    assert gate._ip_hits["10.0.0.1"] == [0.0, 0.0]
+
+
+def test_overflow_bucket_clears_on_the_next_window_without_dropping_the_seated_peer():
+    """Overflow hits expire with the window. A peer refreshed inside it keeps the slot."""
+    now = {"t": 0.0}
+    gate = _ReplayGate(2, 2, window_s=60.0, clock=lambda: now["t"], max_keys=1, overflow_limit=2)
+    assert gate.allow("10.8.0.1", "a") == (True, 0)
+    assert gate.allow("10.8.0.2", "b") == (True, 0)
+    assert gate.allow("10.8.0.3", "c") == (True, 0)
+    assert gate.allow("10.8.0.4", "d")[0] is False
+    assert list(gate._ip_hits) == ["10.8.0.1"]
+    now["t"] = 50.0
+    assert gate.allow("10.8.0.1", "a") == (True, 0)
+    assert gate._ip_hits["10.8.0.1"] == [0.0, 50.0]
+    assert gate.allow("10.8.0.5", "e")[0] is False
+    now["t"] = 61.0
+    opened, retry = gate.allow("10.8.0.9", "z")
+    assert opened is True and retry == 0
+    assert "10.8.0.1" in gate._ip_hits
+    assert 50.0 in gate._ip_hits["10.8.0.1"]
+    assert "10.8.0.9" not in gate._ip_hits
+
+
+def test_overflow_default_admits_48_then_waits():
+    """The shared bucket defaults to 48. The 49th new address waits for the window."""
+    now = {"t": 0.0}
+    gate = _ReplayGate(1, 1, window_s=60.0, clock=lambda: now["t"], max_keys=1)
+    assert gate.allow("10.7.0.1", "seat") == (True, 0)
+    allowed = 0
+    for index in range(1, 61):
+        ok, _retry = gate.allow(f"10.7.1.{index}", "x")
+        if not ok:
+            break
+        allowed += 1
+    assert allowed == 48
+    denied, retry = gate.allow("10.7.2.1", "x")
+    assert denied is False
+    assert retry != 1000
+    assert gate._ip_hits["10.7.0.1"] == [0.0]
+
+
+@pytest.mark.anyio
+async def test_backfill_supplement_does_not_take_the_last_listener_seat():
+    """One seat left stays available for the next person while this page catches up.
+
+    The extra replay socket shares the seated client id and does not count.
+    A second extra, or a supplement for someone who is not seated, still counts
+    and is refused with room_full once the seated listeners fill the room.
+    """
+    app = app_for(
+        settings=Settings(allow_testclient=True, translate=False, max_listeners=2),
+        translator=Translator(enabled=False),
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await open_room(client, token, "class")
+
+            async with Socket(
+                app,
+                "/ws/listen?room_id=class&cursor=0&cid=phone-a",
+                client=("203.0.113.10", 1),
+            ) as seated:
+                hello = await seated.recv()
+                assert hello["type"] == "hello"
+                assert (await client.get("/api/metrics", headers=auth(token))).json()["listeners"] == 1
+
+                async with Socket(
+                    app,
+                    "/ws/listen?room_id=class&replay=1&supplement=1&cid=phone-a",
+                    client=("203.0.113.10", 2),
+                ) as supplement:
+                    extra = await supplement.recv()
+                    assert extra["type"] == "hello"
+                    assert extra.get("reason") != "full"
+                    assert (await client.get("/api/metrics", headers=auth(token))).json()["listeners"] == 1
+
+                    async with Socket(
+                        app,
+                        "/ws/listen?room_id=class&cursor=0&cid=phone-b",
+                        client=("203.0.113.11", 1),
+                    ) as nxt:
+                        nxt_hello = await nxt.recv()
+                        assert nxt_hello["type"] == "hello"
+                        assert nxt_hello.get("reason") != "full"
+                        assert (await client.get("/api/metrics", headers=auth(token))).json()["listeners"] == 2
+
+                        async with Socket(
+                            app,
+                            "/ws/listen?room_id=class&cursor=0&cid=phone-c",
+                            client=("203.0.113.12", 1),
+                        ) as full:
+                            note = await full.recv()
+                            assert note["type"] == "room_unavailable"
+                            assert note["reason"] == "full"
+                            closed = await full.recv()
+                            assert closed["type"] == "websocket.close"
+                            assert closed["code"] == 1013
+
+                        async with Socket(
+                            app,
+                            "/ws/listen?room_id=class&replay=1&supplement=1&cid=phone-d",
+                            client=("203.0.113.13", 1),
+                        ) as bypass:
+                            refused = await bypass.recv()
+                            assert refused["type"] == "room_unavailable"
+                            assert refused["reason"] == "full"
+                            closed = await bypass.recv()
+                            assert closed["code"] == 1013
+
+                        async with Socket(
+                            app,
+                            "/ws/listen?room_id=class&replay=1&supplement=1",
+                            client=("203.0.113.14", 1),
+                        ) as anon:
+                            refused = await anon.recv()
+                            assert refused["type"] == "room_unavailable"
+                            assert refused["reason"] == "full"
+
+                        async with Socket(
+                            app,
+                            "/ws/listen?room_id=class&replay=1&supplement=1&cid=phone-a",
+                            client=("203.0.113.10", 3),
+                        ) as second:
+                            refused = await second.recv()
+                            assert refused["type"] == "room_unavailable"
+                            assert refused["reason"] == "full"
+                            closed = await second.recv()
+                            assert closed["code"] == 1013
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_unseated_supplement_still_takes_a_listener_seat():
+    """supplement=1 is not a free pass. Without a seated peer it occupies the seat."""
+    app = app_for(
+        settings=Settings(allow_testclient=True, translate=False, max_listeners=1),
+        translator=Translator(enabled=False),
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await open_room(client, token, "class")
+            async with Socket(
+                app,
+                "/ws/listen?room_id=class&replay=1&supplement=1&cid=lonely",
+                client=("203.0.113.20", 1),
+            ) as lonely:
+                hello = await lonely.recv()
+                assert hello["type"] == "hello"
+                assert (await client.get("/api/metrics", headers=auth(token))).json()["listeners"] == 1
+                async with Socket(
+                    app,
+                    "/ws/listen?room_id=class&cursor=0&cid=other",
+                    client=("203.0.113.21", 1),
+                ) as other:
+                    note = await other.recv()
+                    assert note["type"] == "room_unavailable"
+                    assert note["reason"] == "full"
+                    closed = await other.recv()
+                    assert closed["code"] == 1013
     finally:
         await stop(app)
 

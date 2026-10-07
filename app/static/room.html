@@ -19,7 +19,7 @@ html.zh-only .en, body.zh-only .en, html.en-only .zh, body.en-only .zh { display
 html.zh-only .zh, body.zh-only .zh, html.en-only .en, body.en-only .en { font-size: var(--size); color: var(--fg); font-weight: 700; }
 html.project body, body.project { --project-scale: 1.8; --project-vw: 7vw; --project-vh: 10vh; height: 100dvh; max-height: 100dvh; overflow: hidden; }
 html.project.size-28, body.project.size-28 { --project-vw: 5.5vw; --project-vh: 9vh; }
-html.project.size-46, body.project.size-46 { --project-vw: 7.5vw; --project-vh: 9vh; }
+html.project.size-46, body.project.size-46 { --project-vw: 7.5vw; --project-vh: 8.57vh; }
 html.project.size-64, body.project.size-64 { --project-vw: 9vw; --project-vh: 9.444vh; }
 body.project .stage { flex: 1 1 auto; flex-direction: row; flex-wrap: wrap; align-items: flex-end; align-content: flex-end; justify-content: flex-start; min-height: 0; overflow: hidden; }
 body.project .stage-note { flex: 0 0 auto; background: var(--bg); }
@@ -53,6 +53,17 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
 .stage.idle .en, .stage.idle .zh, .stage.stale .en, .stage.stale .zh { color: var(--muted); font-weight: 650; }
 html:not(.project) body { height: 100dvh; max-height: 100dvh; overflow: hidden; }
 html:not(.project) .stage { min-height: 0; overflow: hidden; justify-content: flex-end; }
+html:not(.project) .en, html:not(.project) .zh { overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; min-width: 0; }
+html:not(.project) .en { max-height: 60%; }
+html:not(.project) .zh { max-height: 40%; }
+html:not(.project) #history { min-height: 0; }
+html:not(.project) #drawer { position: absolute; left: 0; right: 0; z-index: 3; max-height: min(168px, 46vh); overflow: auto; background: var(--bg); }
+@media (max-height: 400px) {
+  html:not(.project) #history, html:not(.project) #hist-label, html:not(.project) .stage-note { display: none; }
+  html:not(.project) .en { padding-top: 4px; padding-bottom: 2px; }
+  html:not(.project) .zh { padding-bottom: 6px; }
+  html:not(.project) #drawer { max-height: 48px; }
+}
 .en { font-size: var(--size); font-weight: 700; padding: 12px 20px 8px; line-height: 1.35; overflow-wrap: anywhere; min-width: 0; }
 .zh { font-size: calc(var(--size) * .62); color: var(--muted); padding: 0 20px 20px; line-height: 1.45; overflow-wrap: anywhere; min-width: 0; }
 ul { list-style: none; margin: 0; padding: 0 16px calc(24px + env(safe-area-inset-bottom)); max-height: 28vh; overflow: auto; }

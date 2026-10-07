@@ -278,13 +278,19 @@ export function connectRoom({
   }
 
   function address() {
+    return listenAddress(false);
+  }
+
+  function listenAddress(supplement) {
     const base = url();
     const join = base.includes("?") ? "&" : "?";
     // Ask for the saved captions, but do not drop the cursor we already have
-    // until that payload is applied.
-    const query = replaceOnBackfill
+    // until that payload is applied. Only the background socket is a supplement:
+    // the live reconnect still takes a listener seat.
+    let query = replaceOnBackfill
       ? "cursor=0&replay=1"
       : "cursor=" + encodeURIComponent(String(cursor));
+    if (supplement && replaceOnBackfill) query += "&supplement=1";
     return base + join + query;
   }
 
@@ -337,6 +343,17 @@ export function connectRoom({
     backfillTimer = null;
   }
 
+  function closeExtra() {
+    // The background replay socket holds a server connection until the heartbeat
+    // times out unless we close it as soon as the replacement is applied.
+    clearBackfillTimer();
+    if (!extraSocket) return;
+    const extra = extraSocket;
+    extraSocket = null;
+    extra.onclose = null;
+    try { extra.close(); } catch { /* already closed */ }
+  }
+
   function acceptReplace(data) {
     const epoch = data.epoch == null ? null : Number(data.epoch);
     const hasBackfill = Array.isArray(data.backfill);
@@ -345,6 +362,7 @@ export function connectRoom({
     if (epoch != null && Number.isFinite(epoch)) seenEpoch = epoch;
     replaceOnBackfill = false;
     backfillGen += 1;
+    closeExtra();
     if (onReset) onReset(data);
     if (hasBackfill && onBackfill) onBackfill(data.backfill);
     else for (const item of data.backfill || []) deliver(item);
@@ -414,7 +432,7 @@ export function connectRoom({
       }
       if (stopped || gen !== backfillGen || serial !== pullSerial || !replaceOnBackfill) return;
       let extra = null;
-      try { extra = opener(address()); } catch { extra = null; }
+      try { extra = opener(listenAddress(true)); } catch { extra = null; }
       if (!extra) {
         if (!stopped && gen === backfillGen && serial === pullSerial && replaceOnBackfill) {
           scheduleBackfill(deferredRetryMs(1000, roll()));

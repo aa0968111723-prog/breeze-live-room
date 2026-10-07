@@ -2,7 +2,7 @@
 // user's text size, and dark/projection buttons clear the contrast floor.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import vm from "node:vm";
@@ -65,7 +65,7 @@ assert.match(html, /--project-scale:\s*1\.8/);
 assert.match(html, /--project-vw:\s*7vw/);
 assert.match(html, /--project-vh:\s*10vh/);
 assert.match(html, /html\.project\.size-28, body\.project\.size-28 \{ --project-vw: 5\.5vw; --project-vh: 9vh; \}/);
-assert.match(html, /html\.project\.size-46, body\.project\.size-46 \{ --project-vw: 7\.5vw; --project-vh: 9vh; \}/);
+assert.match(html, /html\.project\.size-46, body\.project\.size-46 \{ --project-vw: 7\.5vw; --project-vh: 8\.57vh; \}/);
 assert.match(html, /html\.project\.size-64, body\.project\.size-64 \{ --project-vw: 9vw; --project-vh: 9\.444vh; \}/);
 const projectFont = "font-size: max(var(--size), min(calc(var(--size) * var(--project-scale)), var(--project-vw), var(--project-vh))); overflow-wrap: anywhere; min-width: 0;";
 assert.ok(html.includes("html.project .en, body.project .en { " + projectFont));
@@ -204,13 +204,20 @@ function parseRules(sheet) {
   return rules;
 }
 
-function mediaMatches(header, width) {
+function mediaMatches(header, width, height) {
   if (!header) return true;
   if (/prefers-reduced-motion|prefers-color-scheme/.test(header)) return false;
   const max = header.match(/max-width:\s*([\d.]+)px/);
   const min = header.match(/min-width:\s*([\d.]+)px/);
+  const maxH = header.match(/max-height:\s*([\d.]+)px/);
+  const minH = header.match(/min-height:\s*([\d.]+)px/);
   if (max && width > parseFloat(max[1])) return false;
   if (min && width < parseFloat(min[1])) return false;
+  if (maxH || minH) {
+    if (height == null) return false;
+    if (maxH && height > parseFloat(maxH[1])) return false;
+    if (minH && height < parseFloat(minH[1])) return false;
+  }
   return true;
 }
 
@@ -224,17 +231,17 @@ function rankBetter(next, prev) {
   return false;
 }
 
-function computedProp(el, prop, width) {
+function computedProp(el, prop, width, height) {
   let winner = null;
   for (const rule of cssRules) {
     if (rule.prop !== prop) continue;
-    if (!mediaMatches(rule.media, width)) continue;
+    if (!mediaMatches(rule.media, width, height)) continue;
     if (!matchesSelector(el, rule.selector)) continue;
     const rank = [rule.important ? 1 : 0, ...rule.specificity, rule.order];
     if (!winner || rankBetter(rank, winner.rank)) winner = { value: rule.value, rank };
   }
   if (winner) return winner.value;
-  if (prop.startsWith("--") && el.parent) return computedProp(el.parent, prop, width);
+  if (prop.startsWith("--") && el.parent) return computedProp(el.parent, prop, width, height);
   return null;
 }
 
@@ -249,12 +256,20 @@ function pageElement(token, project) {
   const state = element({ tag: "span", id: "state", parent: header });
   const note = element({ tag: "p", id: "stage-note", classes: new Set(["stage-note"]), parent: body });
   const item = element({ tag: "li", parent: body });
-  return { root, body, stage, en, zh, header, state, note, item };
+  const drawer = element({ tag: "div", id: "drawer", parent: body });
+  const label = element({ tag: "p", id: "hist-label", parent: body });
+  const history = element({ tag: "ul", id: "history", parent: body });
+  return { root, body, stage, en, zh, header, state, note, item, drawer, label, history };
 }
 
 function evalLength(value, width, height) {
   const text = String(value == null ? "" : value).trim();
   if (!text) return null;
+  if ((text.startsWith("min(") || text.startsWith("max(")) && text.endsWith(")")) {
+    const nums = text.slice(4, -1).split(",").map((part) => evalLength(part, width, height)).filter((part) => part != null);
+    if (!nums.length) return null;
+    return text.startsWith("min(") ? Math.min(...nums) : Math.max(...nums);
+  }
   if (text.startsWith("clamp(") && text.endsWith(")")) {
     const parts = text.slice(6, -1).split(",").map((part) => evalLength(part, width, height));
     return Math.min(parts[2], Math.max(parts[0], parts[1]));
@@ -396,9 +411,30 @@ for (const [width, height] of fontViewports) {
     assert.ok(fonts[i - 1] < fonts[i], `${width}x${height} ${fonts.join(",")}`);
   }
 }
-// 69px is the wrap that pushes a 72-character English line above the 720p stage.
-const font720 = projectFontPx(declaredSize("64", 1280), 1280, 720, "64");
-assert.ok(font720 <= 68, `720p 特大 ${font720}px clips the newest sentence`);
+const fonts720 = ["28", "34", "46", "64"].map((token) => projectFontPx(declaredSize(token, 1280), 1280, 720, token));
+const gap720 = (fonts720[3] - fonts720[2]) / fonts720[2];
+assert.ok(gap720 >= 0.1, `720p 大→特大 ${(gap720 * 100).toFixed(1)}% of ${fonts720.join(",")}`);
+
+// The fixture sentence is 72 capital A's beside 36 full-width characters.
+// Room is the 720p stage after the header, the stage note, and stage padding.
+// A wider capital (0.7em, not the optimistic 0.5) is what makes 10vh wrap off the stage.
+function projectStageRoom(width, height) {
+  const nodes = pageElement("64", true);
+  const header = headerHeight(width);
+  const note = evalLength(computedProp(nodes.note, "min-height", width, height), width, height) || 0;
+  return height - header - note - (8 + 12);
+}
+function sentenceBox(font, width) {
+  const content = captionContentWidth(width);
+  const stacked = width - 16 < (18 * REM + 40) * 2;
+  const enH = blockHeight(font, ENGLISH.length, content, 0.7, 1.35, 20);
+  const zhH = blockHeight(font, [...CHINESE].length, content, 1, 1.45, 20);
+  return stacked ? enH + zhH : Math.max(enH, zhH);
+}
+const font720 = fonts720[3];
+const sentence720 = sentenceBox(font720, 1280);
+const room720 = projectStageRoom(1280, 720);
+assert.ok(sentence720 <= room720, `720p 特大 sentence ${sentence720}px is outside the ${room720}px stage at ${font720}px`);
 
 const stageSample = pageElement("64", true);
 assert.equal(computedProp(stageSample.stage, "align-content", 1280), "flex-end");
@@ -447,8 +483,12 @@ function newestPair(viewport, token, english, chinese, drawerOpen) {
   const zhBottom = stacked ? zhTop + zhBox : top + block;
   const enLine = font * 1.35;
   const zhLine = font * 1.45;
-  const enHidden = computedProp(nodes.en, "visibility", width) === "hidden" || computedProp(nodes.en, "display", width) === "none";
-  const zhHidden = computedProp(nodes.zh, "visibility", width) === "hidden" || computedProp(nodes.zh, "display", width) === "none";
+  const faded = (node) => {
+    const opacity = computedProp(node, "opacity", width);
+    return opacity != null && Number(opacity) === 0;
+  };
+  const enHidden = computedProp(nodes.en, "visibility", width) === "hidden" || computedProp(nodes.en, "display", width) === "none" || faded(nodes.en);
+  const zhHidden = computedProp(nodes.zh, "visibility", width) === "hidden" || computedProp(nodes.zh, "display", width) === "none" || faded(nodes.zh);
   const inside = (lineTop, line, hidden) => !hidden && lineTop >= -0.5 && lineTop + line <= inner + 0.5;
   return {
     en: inside(enBottom - enLine, enLine, enHidden),
@@ -489,7 +529,8 @@ function englishHiddenBy(sheet) {
   while ((found = pattern.exec(sheet))) {
     const visibility = found[2].match(/(?:^|;)\s*visibility\s*:\s*([^;]+)/);
     const display = found[2].match(/(?:^|;)\s*display\s*:\s*([^;]+)/);
-    const hides = (visibility && /hidden/.test(visibility[1])) || (display && /^\s*none\b/.test(display[1]));
+    const opacity = found[2].match(/(?:^|;)\s*opacity\s*:\s*([^;]+)/);
+    const hides = (visibility && /hidden/.test(visibility[1])) || (display && /^\s*none\b/.test(display[1])) || (opacity && Number(opacity[1]) === 0);
     if (!hides) continue;
     for (const raw of found[1].split(",")) {
       const selector = raw.trim().replace(/:last-of-type|:last-child/g, "");
@@ -523,6 +564,115 @@ assert.equal(computedProp(normal.item, "overflow-wrap", 320), "anywhere");
       ? (inner - block) / 2 + block - line
       : block - line;
   assert.ok(lineTop >= -0.5 && lineTop + line <= inner + 0.5, `normal newest ${lineTop} inner ${inner}`);
+}
+
+function paddingEdges(el, width, height) {
+  const shorthand = computedProp(el, "padding", width, height) || "";
+  const parts = shorthand.split(/\s+/).filter(Boolean);
+  const len = (part) => evalLength(part, width, height) || 0;
+  let top = 0;
+  let bottom = 0;
+  if (parts.length === 1) top = bottom = len(parts[0]);
+  else if (parts.length === 2) { top = len(parts[0]); bottom = top; }
+  else if (parts.length >= 3) { top = len(parts[0]); bottom = len(parts[2]); }
+  const longTop = computedProp(el, "padding-top", width, height);
+  const longBottom = computedProp(el, "padding-bottom", width, height);
+  if (longTop) top = len(longTop);
+  if (longBottom) bottom = len(longBottom);
+  return { top, bottom };
+}
+
+function flowHeight(el, width, height, fallback) {
+  const display = computedProp(el, "display", width, height);
+  if (display === "none") return 0;
+  return fallback;
+}
+
+// Normal mode keeps the page locked, but each language crops from its own
+// bottom so the newest English line is not the thing that disappears. A short
+// landscape screen drops the history list and caps the drawer so the two
+// newest lines sit clear of that overlay.
+function normalNewest(viewport, token, english, chinese, drawerOpen) {
+  const width = viewport.width;
+  const height = viewport.height;
+  const nodes = pageElement(token, false);
+  const font = declaredSize(token, width);
+  const enLine = font * 1.35;
+  const zhLine = font * 0.62 * 1.45;
+  const header = 16 + 44;
+  const sub = flowHeight(nodes.note, width, height, 0) === 0 && height <= 400 ? 8 : 8;
+  const note = flowHeight(nodes.note, width, height, evalLength(computedProp(nodes.note, "min-height", width, height), width, height) || 24);
+  const label = flowHeight(nodes.label, width, height, 20);
+  const history = flowHeight(nodes.history, width, height, 0.28 * height);
+  const drawerPos = computedProp(nodes.drawer, "position", width, height);
+  const drawerMax = evalLength(computedProp(nodes.drawer, "max-height", width, height), width, height);
+  const naturalDrawer = openDrawerHeight(width);
+  const drawerH = drawerOpen ? Math.min(naturalDrawer, drawerMax == null ? naturalDrawer : drawerMax) : 0;
+  // A static drawer sits in the column and shrinks the stage. Absolute overlays instead.
+  const flowDrawer = drawerOpen && drawerPos !== "absolute" && drawerPos !== "fixed" ? drawerH : 0;
+  let stage = Math.max(0, height - header - sub - flowDrawer - note - label - history);
+  const stageTop = header + sub + flowDrawer + note;
+  const padTop = 8;
+  const padBottom = 12;
+  const contentTop = stageTop + padTop;
+  const contentBottom = stageTop + stage - padBottom;
+  const contentH = Math.max(0, contentBottom - contentTop);
+  const enCap = percentCap(computedProp(nodes.en, "max-height", width, height), contentH);
+  const zhCap = percentCap(computedProp(nodes.zh, "max-height", width, height), contentH);
+  const enNatural = blockHeight(font, english.length, captionContentWidth(width), 0.5, 1.35, 0);
+  const zhNatural = blockHeight(font * 0.62, [...chinese].length, captionContentWidth(width), 1, 1.45, 0);
+  const enBox = enCap != null ? Math.min(enNatural, enCap) : enNatural;
+  const zhBox = zhCap != null ? Math.min(zhNatural, zhCap) : zhNatural;
+  const enPad = paddingEdges(nodes.en, width, height);
+  const zhPad = paddingEdges(nodes.zh, width, height);
+  const blockBottom = contentBottom;
+  const enBottom = blockBottom - zhBox;
+  const enTop = enBottom - enBox;
+  const zhTop = enBottom;
+  const zhBottom = blockBottom;
+  const enClips = computedProp(nodes.en, "overflow", width, height) === "hidden"
+    && computedProp(nodes.en, "justify-content", width, height) === "flex-end";
+  const zhClips = computedProp(nodes.zh, "overflow", width, height) === "hidden"
+    && computedProp(nodes.zh, "justify-content", width, height) === "flex-end";
+  // Newest line is the last line. flex-end keeps it inside a capped box; otherwise
+  // it sits at the end of the natural block and a max-height clips it off.
+  const enGlyphBottom = enClips ? enBottom - enPad.bottom : enTop + enNatural;
+  const enGlyphTop = enGlyphBottom - enLine;
+  const zhGlyphBottom = zhClips ? zhBottom - zhPad.bottom : zhTop + zhNatural;
+  const zhGlyphTop = zhGlyphBottom - zhLine;
+  const drawerTop = header + sub;
+  const drawerBottom = drawerTop + drawerH;
+  const covers = (top, bottom) => drawerOpen && drawerPos === "absolute" && top < drawerBottom - 0.5 && bottom > drawerTop + 0.5;
+  const shown = (top, bottom, boxTop, boxBottom) => top >= boxTop - 0.5 && bottom <= boxBottom + 0.5
+    && top >= -0.5 && bottom <= height + 0.5 && bottom > top
+    && !covers(top, bottom);
+  return {
+    en: shown(enGlyphTop, enGlyphBottom, enTop, enBottom) && enGlyphTop >= contentTop - 0.5,
+    zh: shown(zhGlyphTop, zhGlyphBottom, zhTop, zhBottom) && zhGlyphBottom <= contentBottom + 0.5,
+    font,
+    enGlyphTop,
+    zhGlyphTop,
+    drawerBottom,
+    contentH,
+  };
+}
+
+for (const viewport of [
+  { width: 320, height: 568, drawer: false },
+  { width: 360, height: 740, drawer: false },
+  { width: 390, height: 844, drawer: false },
+  { width: 430, height: 932, drawer: false },
+  { width: 568, height: 320, drawer: false },
+  { width: 640, height: 360, drawer: false },
+  { width: 568, height: 320, drawer: true },
+  { width: 640, height: 360, drawer: true },
+]) {
+  for (const size of ["28", "34", "46", "64"]) {
+    const lines = normalNewest(viewport, size, LONG_EN, LONG_ZH, viewport.drawer);
+    const where = `normal ${viewport.width}x${viewport.height} drawer ${viewport.drawer} size-${size} font ${lines.font}`;
+    assert.ok(lines.en, `en newest off screen ${where} top ${lines.enGlyphTop} drawer ${lines.drawerBottom}`);
+    assert.ok(lines.zh, `zh newest off screen ${where} top ${lines.zhGlyphTop} drawer ${lines.drawerBottom}`);
+  }
 }
 
 function projectionStateWidth(viewport) {
@@ -712,7 +862,8 @@ assert.equal(computedDisplay(wakeHelp, style), "none");
 async function bootAudienceModule(label, blockStorage) {
   const sourceMatch = html.match(/<script type="module">([\s\S]*?)<\/script>/);
   assert.ok(sourceMatch, "module script");
-  const rewritten = sourceMatch[1].replaceAll('"/static/', '"file:///workspace/breeze-gap2/app/static/');
+  const staticRoot = new URL("../app/static/", import.meta.url).href;
+  const rewritten = sourceMatch[1].replaceAll('"/static/', '"' + staticRoot);
   const dir = mkdtempSync(`${tmpdir()}/room-boot-`);
   const file = `${dir}/${label}.mjs`;
   writeFileSync(file, rewritten);
@@ -825,6 +976,8 @@ async function bootAudienceModule(label, blockStorage) {
     await import(pathToFileURL(file).href);
   } catch (err) {
     error = err;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
   await new Promise((resolve) => previous.setTimeout(resolve, 0));
   globalThis.setInterval = previous.setInterval;

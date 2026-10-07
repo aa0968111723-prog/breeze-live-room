@@ -217,6 +217,18 @@ class Conn:
         self.ws = ws
         self.slot = ListenerSlot(ws.send_json, maxsize=maxsize)
         self.slot.last_pong = time.monotonic()
+        self.client_id = ""
+        self.supplement = False
+
+
+def _seated_listeners(rooms) -> int:
+    """Listener cap. A backfill supplement riding an existing seat does not count."""
+    total = 0
+    for room in rooms:
+        for conn in room.get("listeners", ()):
+            if not getattr(conn, "supplement", False):
+                total += 1
+    return total
 
 
 # Audience replay is the newest screenful, never the whole class. Export stays
@@ -362,13 +374,15 @@ def _cap_replay_hello(hello: dict, budget: int = AUDIENCE_BACKFILL_BYTES) -> dic
 
 
 # Replay buckets are keyed by the TCP peer, not by whatever id the client sends.
-# IPv6 peers in one /64 share a bucket. Client ids only subdivide an address;
-# they do not add keys to the capped table. A full table drops expired keys,
+# IPv6 peers in one /64 share a bucket. Client ids subdivide an address and have
+# their own cap, wider than the address table. A full table drops expired keys,
 # then shares one overflow bucket. It does not zero a peer still inside the
-# window, and it does not refuse every new address. The expired-key scan runs
+# window, and it does not refuse every new address. Dropping expired addresses
+# walks the client table once, not once per address. The expired-key scan runs
 # at most once a second. Admitting a new key at the cap still drops expired
 # keys immediately.
 _REPLAY_KEY_CAP = 4096
+_REPLAY_CLIENT_KEY_CAP = _REPLAY_KEY_CAP * 8
 _REPLAY_OVERFLOW_PER_WINDOW = 48
 
 
@@ -420,6 +434,7 @@ class _ReplayGate:
         clock=None,
         max_keys: int = _REPLAY_KEY_CAP,
         overflow_limit: int = _REPLAY_OVERFLOW_PER_WINDOW,
+        max_client_keys: int | None = None,
     ):
         self.ip_limit = max(1, int(ip_limit))
         self.limit = self.ip_limit
@@ -427,12 +442,17 @@ class _ReplayGate:
         self.client_limit = max(1, min(self.ip_limit, requested))
         self.window_s = float(window_s)
         self.max_keys = max(1, int(max_keys))
+        self.max_client_keys = max(1, int(_REPLAY_CLIENT_KEY_CAP if max_client_keys is None else max_client_keys))
         self.overflow_limit = max(1, int(overflow_limit))
         self._clock = clock or time.monotonic
         self._swept_at: float | None = None
         self._ip_hits: dict[str, list[float]] = {}
         self._client_hits: dict[tuple[str, str], list[float]] = {}
         self._overflow: list[float] = []
+        # How many times an address expiry walked the client table, and how many
+        # client keys that walk compared. Tests use this to pin a linear scan.
+        self._expire_passes = 0
+        self._expire_visits = 0
 
     def _prune(self, bucket: list[float], now: float) -> None:
         cutoff = now - self.window_s
@@ -442,11 +462,17 @@ class _ReplayGate:
     def _drop_expired(self, store: dict, now: float) -> None:
         cutoff = now - self.window_s
         dead = [key for key, bucket in store.items() if not bucket or bucket[-1] <= cutoff]
+        if store is self._ip_hits and dead:
+            # One pass over the client table for every expired address. A pass
+            # per address was quadratic in (addresses × client keys).
+            gone = set(dead)
+            self._expire_passes += 1
+            for client_key in list(self._client_hits):
+                self._expire_visits += 1
+                if client_key[0] in gone:
+                    del self._client_hits[client_key]
         for key in dead:
             del store[key]
-            if store is self._ip_hits:
-                for client_key in [item for item in self._client_hits if item[0] == key]:
-                    del self._client_hits[client_key]
 
     def _forget_expired(self, now: float) -> None:
         self._drop_expired(self._ip_hits, now)
@@ -459,22 +485,22 @@ class _ReplayGate:
         self._forget_expired(now)
         self._swept_at = now
 
-    def _make_room(self, store: dict, now: float) -> None:
-        if len(store) < self.max_keys:
+    def _make_room(self, store: dict, now: float, cap: int) -> None:
+        if len(store) < cap:
             return
         # Expired keys only. A peer still inside the window keeps its hits.
         self._drop_expired(store, now)
 
-    def _take(self, store: dict, key, now: float, *, capped: bool) -> list[float] | None:
+    def _take(self, store: dict, key, now: float, *, cap: int | None) -> list[float] | None:
         bucket = store.get(key)
         if bucket is not None:
             self._prune(bucket, now)
             if bucket:
                 return bucket
             del store[key]
-        if capped:
-            self._make_room(store, now)
-            if len(store) >= self.max_keys:
+        if cap is not None:
+            self._make_room(store, now, cap)
+            if len(store) >= cap:
                 return None
         fresh: list[float] = []
         store[key] = fresh
@@ -501,7 +527,7 @@ class _ReplayGate:
         self._sweep(now)
         ip_key = _replay_address_key(ip)
         who = client_id or ""
-        ip_bucket = self._take(self._ip_hits, ip_key, now, capped=True)
+        ip_bucket = self._take(self._ip_hits, ip_key, now, cap=self.max_keys)
         if ip_bucket is None:
             # The address table is full of peers still inside the window.
             # Share the overflow bucket instead of refusing the whole room.
@@ -509,8 +535,12 @@ class _ReplayGate:
         if len(ip_bucket) >= self.ip_limit:
             # A refused address must not allocate a client bucket.
             return False, self._retry_ms(ip_bucket, now)
-        client_bucket = self._take(self._client_hits, (ip_key, who), now, capped=False)
+        client_bucket = self._take(self._client_hits, (ip_key, who), now, cap=self.max_client_keys)
         if client_bucket is None:
+            # Client-key cap. Overflow, and do not keep an empty address bucket
+            # or touch a peer that is still inside the window.
+            if not ip_bucket:
+                self._ip_hits.pop(ip_key, None)
             return self._take_overflow(now)
         if len(client_bucket) >= self.client_limit:
             return False, self._retry_ms(client_bucket, now)
@@ -1107,7 +1137,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             "resident_error": getattr(asr, "last_error", "") or resident_error,
             "host_token": None,
             "queue": pipeline.stats(),
-            "listeners": sum(len(item["listeners"]) for item in book.rooms.values()),
+            "listeners": _seated_listeners(book.rooms.values()),
             "storage": store.enabled,
             "storage_recovered": bool(getattr(store, "recovered", False)),
         }
@@ -1296,7 +1326,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         require_host(request, token, settings)
         return {
             **pipeline.stats(),
-            "listeners": sum(len(item["listeners"]) for item in book.rooms.values()),
+            "listeners": _seated_listeners(book.rooms.values()),
             "rooms": book._active_count(),
             "rss_bytes": rss_bytes(),
             "tokens_used": translator.tokens_used,
@@ -1492,7 +1522,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         await ws.close(code=code)
 
     @app.websocket("/ws/listen")
-    async def listen(ws: WebSocket, room_id: str = "class", cursor: int = 0, replay: int = 0, k: str = "", cid: str = "") -> None:
+    async def listen(ws: WebSocket, room_id: str = "class", cursor: int = 0, replay: int = 0, k: str = "", cid: str = "", supplement: int = 0) -> None:
         try:
             room_id = validate_room_id(room_id)
         except RoomIdError:
@@ -1524,7 +1554,26 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             await ws.send_json(note)
             await ws.close(code=4404)
             return
-        if len(room["listeners"]) >= settings.max_listeners:
+        client_id = _audience_client_id(cid)
+        replay_flag = int(replay or 0) == 1
+        already_seated = False
+        already_supplement = False
+        if client_id and client_id != "anon":
+            for item in room["listeners"]:
+                if getattr(item, "client_id", "") != client_id:
+                    continue
+                if getattr(item, "supplement", False):
+                    already_supplement = True
+                else:
+                    already_seated = True
+        # The page keeps its live socket and opens one extra socket for the
+        # replay it was asked to wait for. That extra socket must not take the
+        # seat the next listener is waiting on, and a second extra does not
+        # get the same exemption.
+        supplement_flag = bool(
+            int(supplement or 0) == 1 and replay_flag and already_seated and not already_supplement
+        )
+        if not supplement_flag and _seated_listeners((room,)) >= settings.max_listeners:
             await ws.send_json({
                 "type": "room_unavailable",
                 "room_id": room_id,
@@ -1534,6 +1583,8 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             await ws.close(code=1013)
             return
         conn = Conn(ws, settings.listener_queue)
+        conn.client_id = client_id
+        conn.supplement = supplement_flag
         room["listeners"].add(conn)
         await ensure_hydrated(room_id)
         resumed = bus.since(room_id, cursor)
