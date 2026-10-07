@@ -111,6 +111,19 @@ def test_empty_alias_is_rejected_with_a_reason():
     assert any("空" in item["reason"] for item in rejected)
 
 
+def test_overlapping_terms_normalize_until_stable():
+    glossary = [
+        {"zh": "禪學社", "aliases": ["柴學社"], "en": "Zen Club", "lock": True, "category": "", "note": ""},
+        {"zh": "社長", "aliases": ["舍長"], "en": "president", "lock": True, "category": "", "note": ""},
+    ]
+    accepted, rejected = validate_terms(glossary)
+    assert rejected == []
+    once = normalize("柴學舍長", accepted)
+    assert once == "禪學社長"
+    assert normalize(once, accepted) == once
+    assert normalize(normalize("柴學舍長", accepted), accepted) == once
+
+
 def test_bad_aliases_are_rejected_with_reasons():
     accepted, rejected = validate_terms([
         {"zh": "開示", "en": "Dharma talk", "aliases": ["開", "開始", "法師"]},

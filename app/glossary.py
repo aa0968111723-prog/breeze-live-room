@@ -229,9 +229,27 @@ def validate_terms(raw) -> tuple[list[dict], list[dict]]:
 
 
 def normalize(text: str, glossary) -> str:
-    """Left-to-right longest match. One pass; replacement text is not scanned again."""
-    rewritten, _flags = _apply(text, glossary)
-    return rewritten
+    """Longest match, repeated until another pass would not change the line.
+
+    One pass can turn an alias into text that matches a different alias. Repeat so
+    normalize(normalize(x)) stays equal to normalize(x). A cycle is left unrewritten.
+    """
+    current = text or ""
+    if not current:
+        return current
+    seen = {current}
+    for _ in range(8):
+        rewritten, _flags = _apply(current, glossary)
+        if rewritten == current:
+            return current
+        if rewritten in seen:
+            return text or ""
+        seen.add(rewritten)
+        current = rewritten
+    rewritten, _flags = _apply(current, glossary)
+    if rewritten != current:
+        return text or ""
+    return current
 
 
 def guarded_flags(text: str, glossary) -> list[dict]:
