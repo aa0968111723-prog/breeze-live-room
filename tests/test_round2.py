@@ -447,7 +447,8 @@ async def test_decode_asr_and_missing_upload_do_not_stall_the_next_segment():
                 data={"room_id": "class", "session_id": "s3", "seq": "1"},
                 headers=auth(token),
             )
-            assert empty.status_code == 400
+            # Urlencoded is not multipart. The slice is not accepted; the next seq still lands.
+            assert empty.status_code == 415
             after_empty = await push(client, token, "class", "s3", 2, "補上".encode())
             assert after_empty.status_code == 200
             skipped = await client.post(
@@ -466,8 +467,7 @@ async def test_decode_asr_and_missing_upload_do_not_stall_the_next_segment():
 
         assert seqs("s")[0][0:2] == (1, "error")
         assert seqs("s")[1][2] == "後一句"
-        assert seqs("s3")[0][1] == "error"
-        assert seqs("s3")[1][2] == "補上"
+        assert seqs("s3") == [(1, "missing", ""), (2, "ready", "補上")]
         assert seqs("s4")[0][1] == "missing"
         assert seqs("s4")[1] == (2, "ready", "繼續")
         assert asr.seen.count("後一句") == 1
