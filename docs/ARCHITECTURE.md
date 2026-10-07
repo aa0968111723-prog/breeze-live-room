@@ -18,7 +18,7 @@
 
 ## 上傳與管線
 
-`/api/push` 先查權杖、Content-Length、佇列與在途位元組，然後才解析 multipart。同一 `(room_id, session_id, seq)` 在 await 之前只有一個 flight。相同內容的重送併入該 flight；不同內容拒絕。預設一個 ASR worker。
+`/api/push` 先查權杖與 Content-Length，再讀完並解析 request body（multipart），然後才佔佇列名額。非 multipart 不讀 body，回 415。讀 body 時不受佇列上限限制；只有主持權杖能上傳，單次最多約 2 MB 加 64 KB，讀取超過 20 秒回 408。同一 `(room_id, session_id, seq)` 在 await 之前只有一個 flight。相同內容的重送併入該 flight；不同內容拒絕。預設一個 ASR worker。
 
 順序是：解碼（有時長上限）→ 辨識 → 先廣播中文 `zh_ready` → 另一條佇列英譯。英譯失敗只更新同一 segment。序號有洞時，gap 等待後標 `missing`，會話結束也會補洞。暫存目錄在 finally 刪除。
 

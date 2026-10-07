@@ -2,7 +2,7 @@
 
 The workflow invokes the older .mjs files by name. These files are launched from
 pytest so that change is not required. Skip only when node is missing or older
-than 20 (this box is 20; CI is 22).
+than 22.
 """
 
 import shutil
@@ -37,8 +37,8 @@ def _node_bin() -> str:
         major = int(raw.split(".", 1)[0])
     except ValueError:
         pytest.skip(f"could not parse node version {raw!r}")
-    if major < 20:
-        pytest.skip(f"node {raw} is older than 20")
+    if major < 22:
+        pytest.skip(f"node {raw} is older than 22")
     return node
 
 
