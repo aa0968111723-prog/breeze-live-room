@@ -322,7 +322,11 @@ async def test_t_leg2_legacy_post_ignores_session_and_rejects_a_stale_version():
             token = await token_of(app, client)
             saved = await _put(
                 client, token, "class",
-                [_term("禪學社", ["柴學社"], en="Zen Club")],
+                [{
+                    **_term("禪學社", ["柴學社"], en="Zen Club", lock=False),
+                    "note": "主持人備註",
+                    "category": "社團",
+                }],
                 0,
             )
             assert saved.status_code == 200, saved.text
@@ -332,14 +336,28 @@ async def test_t_leg2_legacy_post_ignores_session_and_rejects_a_stale_version():
             kept = (await _get(client, token, "class")).json()
             assert kept["version"] == 1
             assert kept["terms"][0]["zh"] == "禪學社"
-            assert kept["terms"][0]["note"] == ""
-            replaced = await _post(client, token, "class", "般若=prajna", session_id="another-session")
+            assert kept["terms"][0]["aliases"] == ["柴學社"]
+            assert kept["terms"][0]["lock"] is False
+            assert kept["terms"][0]["note"] == "主持人備註"
+            assert kept["terms"][0]["category"] == "社團"
+            # The textarea omits aliases. PUT lock, note, category, and aliases stay.
+            replaced = await _post(
+                client, token, "class", "禪學社=Zen Club\n般若=prajna", session_id="another-session",
+            )
             assert replaced.status_code == 200, replaced.text
-            assert replaced.json() == {"ok": True, "count": 1}
+            assert replaced.json() == {"ok": True, "count": 2}
             current = (await _get(client, token, "class")).json()
             assert current["version"] == 2
-            assert current["terms"][0]["zh"] == "般若"
-            assert current["terms"][0]["lock"] is True
+            by_zh = {item["zh"]: item for item in current["terms"]}
+            assert set(by_zh) == {"禪學社", "般若"}
+            assert by_zh["禪學社"]["en"] == "Zen Club"
+            assert by_zh["禪學社"]["aliases"] == ["柴學社"]
+            assert by_zh["禪學社"]["lock"] is False
+            assert by_zh["禪學社"]["note"] == "主持人備註"
+            assert by_zh["禪學社"]["category"] == "社團"
+            assert by_zh["般若"]["aliases"] == []
+            assert by_zh["般若"]["note"] == ""
+            assert by_zh["般若"]["lock"] is True
             side = (await _get(client, token, "other-room")).json()
             assert side["terms"] == []
     finally:
@@ -611,3 +629,55 @@ async def test_legacy_post_rejects_a_bad_line_without_saving_the_rest():
         await stop(app)
 
 
+@pytest.mark.anyio
+async def test_legacy_post_keeps_put_fields_when_the_line_repeats_the_term():
+    app = app_for(settings=_settings(), translator=Translator(enabled=False))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            saved = await _put(
+                client, token, "class",
+                [{
+                    **_term("禪學社", ["柴學社"], en="Zen Club", lock=False),
+                    "note": "主持人備註",
+                    "category": "社團",
+                }],
+                0,
+            )
+            assert saved.status_code == 200, saved.text
+            edited = await _post(client, token, "class", "禪學社=Zen Society", if_version=1)
+            assert edited.status_code == 200, edited.text
+            view = (await _get(client, token, "class")).json()
+            term = view["terms"][0]
+            assert term["en"] == "Zen Society"
+            assert term["aliases"] == ["柴學社"]
+            assert term["lock"] is False
+            assert term["note"] == "主持人備註"
+            assert term["category"] == "社團"
+            typed = await _post(client, token, "class", "禪學社|新別名=Zen Society", if_version=view["version"])
+            assert typed.status_code == 200, typed.text
+            renamed = (await _get(client, token, "class")).json()["terms"][0]
+            assert renamed["aliases"] == ["新別名"]
+            assert renamed["note"] == "主持人備註"
+            assert renamed["lock"] is False
+            # Restoring the stored alias 柴學社 would collide with a new canonical term.
+            clash_saved = await _put(
+                client, token, "side",
+                [_term("禪學社", ["柴學社"], en="Zen Club", lock=True)],
+                0,
+            )
+            assert clash_saved.status_code == 200, clash_saved.text
+            side_version = (await _get(client, token, "side")).json()["version"]
+            clash = await _post(
+                client, token, "side",
+                "禪學社=Zen Club\n柴學社=other",
+                if_version=side_version,
+            )
+            assert clash.status_code == 400, clash.text
+            assert any("柴學社" in item["reason"] for item in clash.json()["rejected"])
+            after = (await _get(client, token, "side")).json()
+            assert after["version"] == side_version
+            assert after["terms"][0]["aliases"] == ["柴學社"]
+            assert after["terms"][0]["zh"] == "禪學社"
+    finally:
+        await stop(app)

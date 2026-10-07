@@ -22,7 +22,7 @@ from app.asr import CliAsr, ResidentAsr
 from app.audio import AudioError, convert_to_wav, ffmpeg_bin, wav_duration_seconds
 from app.auth import audience_origin_allowed, new_host_token, require_host, require_local_host, same_secret
 from app.dispatch import ListenerSlot, RoomBus, for_listener
-from app.glossary import GLOSSARY_MAX_BODY, SCHEMA_VERSION, legacy_terms, validate_terms
+from app.glossary import GLOSSARY_MAX_BODY, SCHEMA_VERSION, legacy_terms, preserve_rich_fields, validate_terms
 from app.pipeline import Pipeline, PipelineError, Segment
 from app.rooms import RoomBook, RoomIdError, validate_room_id, validate_session_id
 from app.settings import Settings, fill_process_environ
@@ -36,6 +36,14 @@ class GlossaryConflict(Exception):
 
     def __init__(self, version: int) -> None:
         self.version = int(version)
+
+
+class GlossaryRejected(Exception):
+    """Legacy fields kept from PUT made the merged list invalid. Nothing was written."""
+
+    def __init__(self, accepted: list, rejected: list) -> None:
+        self.accepted = accepted
+        self.rejected = rejected
 
 
 def _glossary_conflict(version: int) -> JSONResponse:
@@ -989,16 +997,31 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             payload["rejected"] = rejected
         return payload
 
-    async def _save_room_glossary(room_id: str, terms: list, expected_version: int | None = None) -> dict:
+    async def _save_room_glossary(
+        room_id: str,
+        terms: list,
+        expected_version: int | None = None,
+        preserve_rich: bool = False,
+    ) -> dict:
         """Persist first. Memory changes only after the database accepts this version.
 
         `expected_version=None` means the legacy client, which does not send if_version:
         the version read under the lock is the one written against.
+        `preserve_rich` keeps PUT lock, note, category, and omitted aliases for a
+        canonical term that is still in the new text.
         """
         async with _glossary_lock(room_id):
             current = pipeline.room_glossary_version(room_id)
             if expected_version is not None and int(expected_version) != current:
                 raise GlossaryConflict(current)
+            if preserve_rich:
+                merged = preserve_rich_fields(pipeline.room_glossary_view(room_id)["terms"], terms)
+                accepted, rejected = validate_terms(merged)
+                if rejected or not accepted:
+                    if not rejected:
+                        rejected = [{"line": 0, "reason": "沒有有效的術語，不會清空這個房間的詞表"}]
+                    raise GlossaryRejected(accepted, rejected)
+                terms = accepted
             new_version = current + 1
             updated_at = time.time()
             if store.enabled:
@@ -1145,7 +1168,12 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 content={"ok": False, "count": 0, "accepted": accepted, "rejected": rejected},
             )
         try:
-            await _save_room_glossary(room_id, accepted, expected_version=expected)
+            await _save_room_glossary(room_id, accepted, expected_version=expected, preserve_rich=True)
+        except GlossaryRejected as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "count": 0, "accepted": exc.accepted, "rejected": exc.rejected},
+            )
         except GlossaryConflict as exc:
             return JSONResponse(
                 status_code=409,

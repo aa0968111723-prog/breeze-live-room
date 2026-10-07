@@ -99,6 +99,41 @@ def is_locked(term: dict) -> bool:
     return True
 
 
+def preserve_rich_fields(existing, incoming: list[dict]) -> list[dict]:
+    """Keep lock, note, category, and aliases a legacy line cannot express.
+
+    The canonical term is `zh`. A term still present in the new text keeps the fields
+    the host set with PUT. Aliases typed on the legacy line replace the stored ones.
+    An omitted alias list does not wipe them. Terms absent from the new text are dropped.
+    """
+    prior: dict[str, dict] = {}
+    for term in existing or []:
+        if isinstance(term, dict) and isinstance(term.get("zh"), str) and term["zh"]:
+            prior.setdefault(term["zh"], term)
+    merged = []
+    for term in incoming:
+        zh = term.get("zh")
+        old = prior.get(zh) if isinstance(zh, str) else None
+        kept = {
+            "zh": zh,
+            "en": term.get("en") or "",
+            "aliases": list(term.get("aliases") or []),
+            "lock": term.get("lock", True),
+            "category": term.get("category") or "",
+            "note": term.get("note") or "",
+        }
+        if old is None:
+            merged.append(kept)
+            continue
+        if not kept["aliases"]:
+            kept["aliases"] = list(old.get("aliases") or [])
+        kept["lock"] = is_locked(old)
+        kept["note"] = old.get("note") or ""
+        kept["category"] = old.get("category") or ""
+        merged.append(kept)
+    return merged
+
+
 def legacy_terms(rows: list[dict]) -> list[dict]:
     """Old `zh=en` rows become locked terms. Aliases are kept when the line had them."""
     terms = []

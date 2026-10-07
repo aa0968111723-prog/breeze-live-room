@@ -79,7 +79,7 @@ label { display: block; margin-top: 8px; }
 import { createCaptureController } from "/static/recorder_machine.js";
 import { connectRoom, createCaptionView, mergeCaptionUpdate } from "/static/room_client.js";
 import { applyCaption } from "/static/host_caption.js";
-import { glossarySaveLine } from "/static/host_glossary.js";
+import { glossaryPostBody, glossarySaveLine, glossaryTransportLine } from "/static/host_glossary.js";
 const roomEl = document.querySelector("#room");
 const log = document.querySelector("#log");
 const status = document.querySelector("#status");
@@ -191,11 +191,9 @@ async function recoverAuth() {
     if (!data || typeof data.token !== "string" || !data.token) throw new Error("無法重新取得主持權限");
     token = data.token;
     const room = (ctl.session && ctl.session.roomId) || (roomEl.value || "class").trim() || "class";
-    const sessionId = (ctl.session && ctl.session.id) || "pending";
     const headers = { authorization: "Bearer " + token, "content-type": "application/json" };
     const opened = await fetch("/api/rooms/open", { method: "POST", headers, body: JSON.stringify({ room_id: room }) });
     if (opened.ok) rememberRoom(await opened.json());
-    await reportGlossary(room, sessionId, headers);
     listenCaptions(room, true);
   })();
   try {
@@ -212,14 +210,48 @@ async function postGlossary(room, sessionId, headers) {
   const text = glossaryText();
   // An empty box is the page default. Do not replace a glossary already saved for this room.
   if (!String(text || "").trim()) return null;
-  const payload = JSON.stringify({ room_id: room, session_id: sessionId, text });
+  const url = "/api/rooms/" + encodeURIComponent(room) + "/glossary";
+  const current = headers
+    ? await fetch(url, { headers, cache: "no-store" })
+    : await hostFetch(url, { cache: "no-store" });
+  let version = null;
+  if (current.ok) {
+    try {
+      const data = await current.json();
+      if (Number.isInteger(data && data.version)) version = data.version;
+    } catch (err) {
+      version = null;
+    }
+  }
+  // Never POST without the version this page just read. A stale page gets 409.
+  if (!Number.isInteger(version)) {
+    let body = null;
+    try {
+      body = await current.json();
+    } catch (err) {
+      body = null;
+    }
+    return {
+      status: current.ok ? 409 : current.status,
+      async json() {
+        return body || { ok: false, rejected: [{ line: 0, reason: "讀不到目前的術語表版本，請重新整理頁面後再儲存" }] };
+      },
+    };
+  }
+  const payload = JSON.stringify(glossaryPostBody(room, sessionId, text, version));
   if (headers) {
     return fetch("/api/glossary", { method: "POST", headers, body: payload });
   }
   return hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: payload });
 }
 async function reportGlossary(room, sessionId, headers) {
-  const resp = await postGlossary(room, sessionId, headers);
+  let resp;
+  try {
+    resp = await postGlossary(room, sessionId, headers);
+  } catch (err) {
+    line(glossaryTransportLine(err));
+    return;
+  }
   if (!resp) return;
   let body = null;
   try {
@@ -447,13 +479,9 @@ go.onclick = async () => {
     const opened = await hostFetch("/api/rooms/open", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: room }) });
     if (opened.ok) rememberRoom(await opened.json());
     listenCaptions(room, true);
-    await reportGlossary(room, "pending");
     await ctl.start();
     const activeRoom = ctl.session ? ctl.session.roomId : room;
     await hostFetch("/api/session/active", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: activeRoom, active: true }) });
-    if (ctl.session) {
-      await reportGlossary(ctl.session.roomId, ctl.session.id);
-    }
     line("開始聽了。每一段都是完整錄音。");
   } catch (err) {
     status.className = "warn";
@@ -505,7 +533,11 @@ document.querySelector("#save-terms").onclick = async () => {
     line("術語是空的，沒有覆蓋這個房間已儲存的詞表。");
     return;
   }
-  await reportGlossary(ctl.session.roomId, ctl.session.id);
+  try {
+    await reportGlossary(ctl.session.roomId, ctl.session.id);
+  } catch (err) {
+    line(glossaryTransportLine(err));
+  }
 };
 document.querySelector("#skip").onclick = async () => {
   if (!token || !ctl.session) {

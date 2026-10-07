@@ -11,6 +11,24 @@ export function glossarySaveLine(status, body) {
     const lineNo = Number(item.line);
     details.push(lineNo > 0 ? "第 " + lineNo + " 行：" + reason : reason);
   }
-  if (!details.length) return "術語沒有寫入這個房間。";
-  return "術語沒有寫入這個房間。\n" + details.join("\n");
+  const lines = ["術語沒有寫入這個房間。"];
+  if (Number(status) === 409) lines.push("術語表已更新，請重新整理頁面後再儲存。");
+  lines.push(...details);
+  if (lines.length === 1) return lines[0];
+  return lines.join("\n");
+}
+
+export function glossaryTransportLine(err) {
+  const detail = err && typeof err.message === "string" && err.message ? "（" + err.message + "）" : "";
+  return "術語沒有寫入這個房間。" + detail;
+}
+
+export function glossaryPostBody(room, sessionId, text, version) {
+  const body = {
+    room_id: room,
+    session_id: sessionId,
+    text: String(text ?? ""),
+  };
+  if (Number.isInteger(version)) body.if_version = version;
+  return body;
 }
