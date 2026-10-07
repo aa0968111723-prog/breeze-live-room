@@ -196,10 +196,9 @@ class Translator:
             with open_url(req, timeout=timeout) as resp:
                 payload = resp.read().decode()
             data = json.loads(payload)
-            content = data["choices"][0]["message"]["content"]
-            if not isinstance(content, str):
+            choice = data["choices"][0]
+            if not isinstance(choice, dict):
                 return TranslateResult("", "bad_response", "英譯回應無法讀取，中文仍保留")
-            text = content.strip()
             usage = data.get("usage") or {}
             prompt_tokens = usage.get("prompt_tokens")
             completion_tokens = usage.get("completion_tokens")
@@ -207,8 +206,24 @@ class Translator:
                 self._add_tokens(prompt_tokens)
             if isinstance(completion_tokens, int):
                 self._add_tokens(completion_tokens)
+            finish = choice.get("finish_reason")
+            # A content filter is a failed translation even when the body is empty,
+            # a half sentence, or a full sentence. Do not publish any of it.
+            if finish == "content_filter":
+                return TranslateResult(
+                    "",
+                    "bad_response",
+                    "英譯被內容過濾擋下，中文仍保留",
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+            message = choice.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, str):
+                return TranslateResult("", "bad_response", "英譯回應無法讀取，中文仍保留")
+            text = content.strip()
             # max_tokens cut the reply off. A half sentence is not a caption.
-            if data["choices"][0].get("finish_reason") == "length":
+            if finish == "length":
                 return TranslateResult(
                     "",
                     "bad_response",
