@@ -8,6 +8,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from app.textutil import scrub_caption
+
 log = logging.getLogger("breeze.store")
 
 
@@ -226,6 +228,7 @@ class CaptionStore:
         self._submit(self._guard, self.save, dict(event))
 
     def save(self, event: dict) -> None:
+        event = scrub_caption(event)
         if not self.enabled or not event.get("id"):
             return
         if self._on_writer():

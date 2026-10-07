@@ -263,12 +263,20 @@ def _hit_english(zh: str, glossary) -> list[str]:
 
 
 def _reply_has_control(text: str) -> bool:
-    """Reject bidi, other format chars, and controls. One newline can stay."""
+    """Reject every C* category, line separators, and text that is not UTF-8.
+
+    One newline can stay. Cs (a lone surrogate), Co, and Cn are included, matching
+    the glossary check. A surrogate encodes in JSON escapes and then breaks the room.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
     for char in text:
         if char == "\n":
             continue
         category = unicodedata.category(char)
-        if category in {"Cc", "Cf", "Zl", "Zp"}:
+        if category.startswith("C") or category in {"Zl", "Zp"}:
             return True
     return False
 

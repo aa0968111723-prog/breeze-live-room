@@ -28,7 +28,7 @@ from app.rooms import RoomBook, RoomIdError, validate_room_id, validate_session_
 from app.settings import Settings, fill_process_environ
 from app.share import list_share_hosts, listen_url
 from app.store import CaptionStore
-from app.textutil import export_text, strict_legacy_rows
+from app.textutil import export_text, scrub_caption, strict_legacy_rows, utf8_text
 from app.translate import Translator
 
 class GlossaryConflict(Exception):
@@ -388,9 +388,10 @@ def _public_result(done: Segment) -> JSONResponse:
         code = 422
     else:
         code = 200
-    body = done.public()
+    body = scrub_caption(done.public())
     body["ok"] = code == 200
-    body["detail"] = done.error
+    detail = utf8_text(done.error) if isinstance(done.error, str) else ""
+    body["detail"] = detail or body.get("error") or ""
     return JSONResponse(status_code=code, content=body)
 
 

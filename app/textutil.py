@@ -25,6 +25,70 @@ def should_join(prev: str, nxt: str, gap_ms: int) -> bool:
     return True
 
 
+def utf8_text(value: str) -> str:
+    """Drop characters that cannot be encoded as UTF-8. Valid text is unchanged."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        pass
+    else:
+        return value
+    kept = []
+    for char in value:
+        try:
+            char.encode("utf-8")
+        except UnicodeEncodeError:
+            continue
+        kept.append(char)
+    return "".join(kept)
+
+
+def _utf8_ok(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _scrub_value(value):
+    if isinstance(value, str):
+        return utf8_text(value)
+    if isinstance(value, list):
+        return [_scrub_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _scrub_value(item) if isinstance(item, (str, list, dict)) else item
+            for key, item in value.items()
+        }
+    return value
+
+
+def scrub_caption(event: dict) -> dict:
+    """Keep a caption publishable. Bad English is a failed translation; Chinese stays.
+
+    A lone surrogate cannot be written to SQLite or sent on a WebSocket. Dropping it
+    here stops one model reply from closing every new listener.
+    """
+    if not isinstance(event, dict):
+        return {}
+    en = event.get("en")
+    en_bad = isinstance(en, str) and not _utf8_ok(en)
+    out = _scrub_value(event)
+    if not isinstance(out, dict) or not en_bad:
+        return out if isinstance(out, dict) else {}
+    out["en"] = ""
+    if str(out.get("type") or "") in {"captions_cleared", "caption_deleted"}:
+        return out
+    if str(out.get("status") or "") in {"", "ready", "ok"}:
+        out["status"] = "translate_failed"
+    if str(out.get("translate_status") or "") in {"", "ok"}:
+        out["translate_status"] = "bad_response"
+    if not str(out.get("error") or "").strip():
+        out["error"] = "英譯不是純英文，中文仍保留"
+    return out
+
+
 def _split_glossary(text: str) -> tuple[str, str] | None:
     # A line that already has "=" keeps the old split, including a later fullwidth equals.
     if "=" in text:

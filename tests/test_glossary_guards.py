@@ -3,12 +3,13 @@
 T-STOP1/2/3, T-INJ1, T-ONE1, T-SIMP1, T-DUP1, T-SUB1, T-LEG1/2 live here.
 """
 
+import asyncio
 import json
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.dispatch import for_listener
+from app.dispatch import RoomBus, for_listener
 from app.glossary import (
     guarded_flags,
     missing_locked,
@@ -18,8 +19,9 @@ from app.glossary import (
     validate_terms,
 )
 from app.settings import Settings
+from app.store import CaptionStore
 from app.translate import Translator
-from tests.test_round2 import app_for, auth, push, stop, token_of
+from tests.test_round2 import Socket, app_for, auth, open_room, push, stop, token_of
 
 
 def _term(zh, aliases=(), en="X", lock=True):
@@ -251,7 +253,15 @@ def test_han_inside_a_hit_term_is_allowed_and_other_han_is_not():
 
 
 def test_reply_rejects_bidi_controls_and_overlong_text():
-    for content in ("Pay \u202eemoc.live\u202c now", "Hel\x00lo", "Hello\u2028there", "A" * 1000):
+    for content in (
+        "Pay \u202eemoc.live\u202c now",
+        "Hel\x00lo",
+        "Hello\u2028there",
+        "A" * 1000,
+        "Hello \ue000 there",
+        "Hello \u0378 there",
+        "Hello \ud800 there",
+    ):
         result, _seen = _translate(content)
         assert result.status == "bad_response", content
         assert result.text == ""
@@ -408,3 +418,112 @@ async def test_put_rejects_simplified_canonical_and_alias_substring():
             assert (await _get(client, token, "class")).json()["terms"] == []
     finally:
         await stop(app)
+
+
+def test_json_escaped_surrogate_reply_is_rejected():
+    """The model sends ASCII. json.loads is what turns \\ud800 into a lone surrogate."""
+    content = '{"en":"Hello \\ud800 world"}'
+    result, _seen = _translate(content)
+    assert result.status == "bad_response"
+    assert result.text == ""
+    assert "\ud800" not in result.detail
+    assert "Hello" not in (result.text or "")
+
+
+def test_store_and_broadcast_drop_a_lone_surrogate(tmp_path):
+    event = {
+        "type": "caption",
+        "id": "class:s:1",
+        "room_id": "class",
+        "session_id": "s",
+        "seq": 1,
+        "version": 2,
+        "zh": "今\ud800天開示",
+        "zh_raw": "今天開示",
+        "en": "Hello \ud800 world",
+        "status": "ready",
+        "translate_status": "ok",
+        "error": "",
+        "t0_ms": 0,
+        "t1_ms": 1000,
+    }
+    published = RoomBus().publish(dict(event))
+    assert published is not None
+    encoded = json.dumps(published, ensure_ascii=False).encode("utf-8")
+    assert published["zh"] == "今天開示"
+    assert published["en"] == ""
+    assert published["status"] == "translate_failed"
+    assert published["translate_status"] == "bad_response"
+    assert "\ud800" not in encoded.decode("utf-8")
+    frame = for_listener(dict(event))
+    json.dumps(frame, ensure_ascii=False).encode("utf-8")
+    assert frame["zh"] == "今天開示"
+    assert frame["en"] == ""
+    store = CaptionStore(tmp_path / "captions.sqlite3")
+    try:
+        store.save(dict(event))
+        store.flush()
+        assert store.errors == 0
+        rows = store.room_rows("class")
+        assert rows and rows[0]["zh"] == "今天開示"
+        assert rows[0]["en"] == ""
+        json.dumps(rows, ensure_ascii=False).encode("utf-8")
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_surrogate_reply_keeps_chinese_and_new_listeners_can_replay(tmp_path):
+    content = '{"en":"Hello \\ud800 world"}'
+    raw = json.dumps({
+        "choices": [{"finish_reason": "stop", "message": {"content": content}}],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 4},
+    }).encode()
+
+    def opener(req, timeout=40):
+        del req, timeout
+        return _Body(raw)
+
+    translator = Translator(enabled=True, key="k", opener=opener)
+    app = app_for(settings=_settings(tmp_path / "captions.sqlite3"), translator=translator)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await open_room(client, token, "class")
+            pushed = await push(client, token, "class", "s", 1, "今天開示".encode(), t0_ms=0, t1_ms=1000)
+            assert pushed.status_code == 200, pushed.text
+            body = pushed.json()
+            assert body["zh"] == "今天開示"
+            assert body["en"] == ""
+            assert body["status"] == "translate_failed"
+            assert body["translate_status"] == "bad_response"
+            assert "\ud800" not in pushed.text
+            await asyncio.to_thread(app.state.store.flush)
+            assert app.state.store.errors == 0
+            rows = await asyncio.to_thread(app.state.store.room_rows, "class")
+            assert any(row.get("zh") == "今天開示" and not row.get("en") for row in rows)
+
+            async def hello(path):
+                async with Socket(app, path) as sock:
+                    msg = await sock.recv()
+                    assert msg["type"] == "hello", msg
+                    encoded = json.dumps(msg, ensure_ascii=False).encode("utf-8")
+                    assert "\ud800" not in encoded.decode("utf-8")
+                    return msg
+
+            fresh = await hello("/ws/listen?room_id=class&cursor=0")
+            replay = await hello("/ws/listen?room_id=class&cursor=0&replay=1")
+            resumed = await hello("/ws/listen?room_id=class&cursor=1")
+            blobs = []
+            for msg in (fresh, replay, resumed):
+                blobs.extend(msg.get("history") or [])
+                blobs.extend(msg.get("events") or [])
+                blobs.extend(msg.get("backfill") or [])
+            assert any(item.get("zh") == "今天開示" and not item.get("en") for item in blobs)
+            assert fresh.get("history")
+            assert any(item.get("zh") == "今天開示" for item in (replay.get("backfill") or replay.get("history") or []))
+            assert resumed["type"] == "hello"
+    finally:
+        await stop(app)
+
+
