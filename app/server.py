@@ -362,15 +362,23 @@ def _cap_replay_hello(hello: dict, budget: int = AUDIENCE_BACKFILL_BYTES) -> dic
 
 
 # Replay buckets are keyed by the TCP peer, not by whatever id the client sends.
-# IPv6 peers in one /64 share a bucket. A full table drops expired keys and then
-# refuses a new peer; it does not zero a peer that is still inside the window.
-# The expired-key scan runs at most once a second. Admitting a new key at the
-# cap still drops expired keys immediately.
+# IPv6 peers in one /64 share a bucket. Client ids only subdivide an address;
+# they do not add keys to the capped table. A full table drops expired keys,
+# then shares one overflow bucket. It does not zero a peer still inside the
+# window, and it does not refuse every new address. The expired-key scan runs
+# at most once a second. Admitting a new key at the cap still drops expired
+# keys immediately.
 _REPLAY_KEY_CAP = 4096
+_REPLAY_OVERFLOW_PER_WINDOW = 48
 
 
 def _replay_address_key(ip: str) -> str:
-    """One bucket per IPv4 address, or per IPv6 /64. Unparseable text stays as-is."""
+    """One bucket per IPv4 address, or per IPv6 /64. Unparseable text stays as-is.
+
+    app/run.py binds 0.0.0.0 only, so this /64 grouping does nothing until the
+    process also listens on IPv6. One SLAAC /64 would then share the address
+    cap the way a classroom NAT already does.
+    """
     text = (ip or "").strip()
     if not text:
         return ""
@@ -393,13 +401,14 @@ def _replay_address_key(ip: str) -> str:
 
 
 class _ReplayGate:
-    """Caps replay/backfill hellos. Live captions are not counted.
+    """Caps replay/backfill hellos. Live captions never consult this gate.
 
     One bucket is the TCP peer address (a classroom behind NAT shares it).
-    The other is that address plus the audience client id, and it can only
-    tighten the address cap. A missing or forged client id shares one bucket
-    per address. A refused hello is explicit: the caller sends
-    backfill_deferred instead of an empty screen.
+    A client id only subdivides that address. It is not an address key, so
+    rotating ids cannot fill the table. When the address table is full of
+    peers still inside the window, further addresses share one overflow
+    bucket instead of being refused. A rate-limited hello is explicit:
+    the caller sends backfill_deferred instead of an empty screen.
     """
 
     def __init__(
@@ -410,6 +419,7 @@ class _ReplayGate:
         *,
         clock=None,
         max_keys: int = _REPLAY_KEY_CAP,
+        overflow_limit: int = _REPLAY_OVERFLOW_PER_WINDOW,
     ):
         self.ip_limit = max(1, int(ip_limit))
         self.limit = self.ip_limit
@@ -417,10 +427,12 @@ class _ReplayGate:
         self.client_limit = max(1, min(self.ip_limit, requested))
         self.window_s = float(window_s)
         self.max_keys = max(1, int(max_keys))
+        self.overflow_limit = max(1, int(overflow_limit))
         self._clock = clock or time.monotonic
         self._swept_at: float | None = None
         self._ip_hits: dict[str, list[float]] = {}
         self._client_hits: dict[tuple[str, str], list[float]] = {}
+        self._overflow: list[float] = []
 
     def _prune(self, bucket: list[float], now: float) -> None:
         cutoff = now - self.window_s
@@ -432,10 +444,14 @@ class _ReplayGate:
         dead = [key for key, bucket in store.items() if not bucket or bucket[-1] <= cutoff]
         for key in dead:
             del store[key]
+            if store is self._ip_hits:
+                for client_key in [item for item in self._client_hits if item[0] == key]:
+                    del self._client_hits[client_key]
 
     def _forget_expired(self, now: float) -> None:
         self._drop_expired(self._ip_hits, now)
         self._drop_expired(self._client_hits, now)
+        self._prune(self._overflow, now)
 
     def _sweep(self, now: float) -> None:
         if self._swept_at is not None and now - self._swept_at < 1.0:
@@ -449,16 +465,17 @@ class _ReplayGate:
         # Expired keys only. A peer still inside the window keeps its hits.
         self._drop_expired(store, now)
 
-    def _take(self, store: dict, key, now: float) -> list[float] | None:
+    def _take(self, store: dict, key, now: float, *, capped: bool) -> list[float] | None:
         bucket = store.get(key)
         if bucket is not None:
             self._prune(bucket, now)
             if bucket:
                 return bucket
             del store[key]
-        self._make_room(store, now)
-        if len(store) >= self.max_keys:
-            return None
+        if capped:
+            self._make_room(store, now)
+            if len(store) >= self.max_keys:
+                return None
         fresh: list[float] = []
         store[key] = fresh
         return fresh
@@ -471,21 +488,30 @@ class _ReplayGate:
             wait = 0.25
         return int(wait * 1000) + 1
 
+    def _take_overflow(self, now: float) -> tuple[bool, int]:
+        """One shared bucket for addresses that do not fit in the table."""
+        self._prune(self._overflow, now)
+        if len(self._overflow) >= self.overflow_limit:
+            return False, self._retry_ms(self._overflow, now)
+        self._overflow.append(now)
+        return True, 0
+
     def allow(self, ip: str, client_id: str = "") -> tuple[bool, int]:
         now = float(self._clock())
         self._sweep(now)
         ip_key = _replay_address_key(ip)
         who = client_id or ""
-        ip_bucket = self._take(self._ip_hits, ip_key, now)
+        ip_bucket = self._take(self._ip_hits, ip_key, now, capped=True)
         if ip_bucket is None:
-            # The table is full of peers that are still inside the window.
-            return False, 1000
+            # The address table is full of peers still inside the window.
+            # Share the overflow bucket instead of refusing the whole room.
+            return self._take_overflow(now)
         if len(ip_bucket) >= self.ip_limit:
             # A refused address must not allocate a client bucket.
             return False, self._retry_ms(ip_bucket, now)
-        client_bucket = self._take(self._client_hits, (ip_key, who), now)
+        client_bucket = self._take(self._client_hits, (ip_key, who), now, capped=False)
         if client_bucket is None:
-            return False, 1000
+            return self._take_overflow(now)
         if len(client_bucket) >= self.client_limit:
             return False, self._retry_ms(client_bucket, now)
         ip_bucket.append(now)
@@ -1020,6 +1046,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
     app.state.shutdown = shutdown
     app.state.sweep_once = sweep_once
     app.state.resident_error = resident_error
+    app.state.replay_gate = replay_gate
 
     def share_for(room_id: str, *, include_key: bool = False) -> str | None:
         key = _listen_key_of(room_id) if include_key else ""

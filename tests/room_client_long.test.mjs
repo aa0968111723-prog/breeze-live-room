@@ -48,6 +48,10 @@ async function testKeepsRetryingPastEight() {
   assert.ok(states.some((detail) => detail && String(detail.text).includes("暫時連不上")), joined);
   assert.ok(states.some((detail) => detail && String(detail.subtitle).includes("下次自動重試")), joined);
   assert.ok(states.some((detail) => detail && String(detail.subtitle).includes("30 秒")), joined);
+  assert.ok(
+    states.some((detail) => detail && detail.kind === "unreachable" && detail.subtitle === "正在重試…"),
+    states.map((detail) => detail && detail.subtitle).join(" | "),
+  );
   assert.equal(retryCountdown(45000, 0), "下次自動重試：45 秒");
   assert.equal(retryCountdown(45000, 15000), "下次自動重試：30 秒");
   assert.equal(retryCountdown(45000, 44000), "下次自動重試：1 秒");

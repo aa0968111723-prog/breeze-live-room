@@ -168,7 +168,9 @@ export function retryCountdown(nextRetryAt, now) {
 }
 
 function retrySubtitle(more, now) {
-  return retryCountdown(more && more.nextRetryAt, now);
+  // The attempt has already started. "Next retry" is only for the wait before it.
+  if (!more || !more.nextRetryAt) return "正在重試…";
+  return retryCountdown(more.nextRetryAt, now);
 }
 
 function stateSubtitle(kind, more, now) {
@@ -211,6 +213,10 @@ export function connectRoom({
   let stopped = false;
   let loopRunning = false;
   let socket = null;
+  let extraSocket = null;
+  let backfillGen = 0;
+  let pullSerial = 0;
+  let backfillTimer = null;
   let timer = null;
   let cancelWait = null;
   let waitFinish = null;
@@ -323,6 +329,101 @@ export function connectRoom({
       return;
     }
     if (isCaption(data) && remember(data)) onEvent(data);
+  }
+
+  function clearBackfillTimer() {
+    if (backfillTimer == null) return;
+    clearTimeout(backfillTimer);
+    backfillTimer = null;
+  }
+
+  function acceptReplace(data) {
+    const epoch = data.epoch == null ? null : Number(data.epoch);
+    const hasBackfill = Array.isArray(data.backfill);
+    versions.clear();
+    cursor = 0;
+    if (epoch != null && Number.isFinite(epoch)) seenEpoch = epoch;
+    replaceOnBackfill = false;
+    backfillGen += 1;
+    if (onReset) onReset(data);
+    if (hasBackfill && onBackfill) onBackfill(data.backfill);
+    else for (const item of data.backfill || []) deliver(item);
+    cursor = noteCursor(cursor, data.latest_cursor);
+    emit("live");
+    if (data.gap && onGap) onGap(data);
+    for (const item of data.history || []) deliver(item);
+    for (const item of data.events || []) deliver(item);
+  }
+
+  function wireExtra(extra, gen) {
+    extraSocket = extra;
+    extra.onopen = () => {};
+    extra.onerror = () => { try { extra.close(); } catch { /* onclose retries */ } };
+    extra.onclose = () => {
+      if (extraSocket === extra) extraSocket = null;
+      if (stopped || gen !== backfillGen || !replaceOnBackfill) return;
+      scheduleBackfill(deferredRetryMs(1000, roll()));
+    };
+    extra.onmessage = (ev) => {
+      if (stopped || gen !== backfillGen) return;
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      if (!msg || typeof msg !== "object") return;
+      if (msg.type === "ping") {
+        try { extra.send(JSON.stringify({ type: "pong" })); } catch { /* closed */ }
+        return;
+      }
+      if (msg.type !== "hello") {
+        cursor = noteCursor(cursor, msg.latest_cursor);
+        deliver(msg);
+        return;
+      }
+      if (msg.backfill_deferred === true) {
+        const hinted = Number(msg.retry_after_ms != null ? msg.retry_after_ms : msg.retry_after);
+        const again = deferredRetryMs(Number.isFinite(hinted) ? hinted : 1000, roll());
+        extra.onclose = null;
+        if (extraSocket === extra) extraSocket = null;
+        try { extra.close(); } catch { /* already closed */ }
+        scheduleBackfill(again);
+        return;
+      }
+      acceptReplace(msg);
+      queueMicrotask(() => {
+        if (extraSocket === extra) extraSocket = null;
+        extra.onclose = null;
+        try { extra.close(); } catch { /* already closed */ }
+      });
+    };
+  }
+
+  function scheduleBackfill(wait) {
+    const gen = backfillGen;
+    const serial = ++pullSerial;
+    const pull = async () => {
+      if (sleep) {
+        try { await sleep(wait); } catch { return; }
+      } else {
+        await new Promise((resolve) => {
+          const id = setTimeout(() => {
+            if (backfillTimer === id) backfillTimer = null;
+            resolve();
+          }, wait);
+          backfillTimer = id;
+          if (id && typeof id.unref === "function") id.unref();
+        });
+      }
+      if (stopped || gen !== backfillGen || serial !== pullSerial || !replaceOnBackfill) return;
+      let extra = null;
+      try { extra = opener(address()); } catch { extra = null; }
+      if (!extra) {
+        if (!stopped && gen === backfillGen && serial === pullSerial && replaceOnBackfill) {
+          scheduleBackfill(deferredRetryMs(1000, roll()));
+        }
+        return;
+      }
+      wireExtra(extra, gen);
+    };
+    pull();
   }
 
   function waitMs(ms) {
@@ -609,7 +710,18 @@ export function connectRoom({
               if (needsReplace) {
                 const deferred = data.backfill_deferred === true;
                 const hasBackfill = Array.isArray(data.backfill);
-                // No payload yet: keep the current screen and ask again.
+                // Rate limit delays replay only. This socket stays up for live captions.
+                if (deferred && ws === socket) {
+                  replaceOnBackfill = true;
+                  const hinted = Number(data.retry_after_ms != null ? data.retry_after_ms : data.retry_after);
+                  const wait = deferredRetryMs(Number.isFinite(hinted) ? hinted : 1000, roll());
+                  emit("live");
+                  for (const item of data.history || []) deliver(item);
+                  for (const item of data.events || []) deliver(item);
+                  scheduleBackfill(wait);
+                  return;
+                }
+                // No payload yet, and this was not a deferred live hello: ask again.
                 if (deferred || (!hasBackfill && !replaying)) {
                   replaceOnBackfill = true;
                   deferredThisAttempt = true;
@@ -618,18 +730,7 @@ export function connectRoom({
                   try { ws.close(); } catch { /* reconnect below */ }
                   return;
                 }
-                versions.clear();
-                cursor = 0;
-                if (epoch != null && Number.isFinite(epoch)) seenEpoch = epoch;
-                replaceOnBackfill = false;
-                if (onReset) onReset(data);
-                if (hasBackfill && onBackfill) onBackfill(data.backfill);
-                else for (const item of data.backfill || []) deliver(item);
-                cursor = noteCursor(cursor, data.latest_cursor);
-                emit("live");
-                if (data.gap && onGap) onGap(data);
-                for (const item of data.history || []) deliver(item);
-                for (const item of data.events || []) deliver(item);
+                acceptReplace(data);
                 return;
               }
               if (epoch != null && Number.isFinite(epoch)) seenEpoch = epoch;
@@ -710,6 +811,14 @@ export function connectRoom({
     restart,
     stop() {
       stopped = true;
+      backfillGen += 1;
+      clearBackfillTimer();
+      if (extraSocket) {
+        const extra = extraSocket;
+        extraSocket = null;
+        detach(extra);
+        try { extra.close(); } catch { /* already closed */ }
+      }
       hold = null;
       disarmWatch();
       unbindNetwork();

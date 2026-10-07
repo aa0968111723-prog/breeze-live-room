@@ -172,6 +172,12 @@ async function testSameEpochGapDeferredRetriesUntilBackfill() {
   assert.deepEqual(resets, []);
   assert.equal(view.items.get("class:s:9").zh, "還在");
   assert.equal(conn.cursor, 10);
+  assert.notEqual(stalled.closed, true);
+  stalled.onmessage({
+    data: JSON.stringify({ id: "class:s:live", session_id: "s", seq: 50, version: 1, zh: "即時" }),
+  });
+  assert.equal(view.items.get("class:s:live").zh, "即時");
+  assert.equal(conn.cursor, 10);
   const replay = sockets.at(-1);
   assert.notEqual(replay, stalled);
   assert.match(replay.address, /replay=1/);

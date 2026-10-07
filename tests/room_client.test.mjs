@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { connectRoom, createCaptionView, liveTail, mergeCaptionUpdate } from "../app/static/room_client.js";
+import { EXPIRY_NOTE, expiryNotice } from "../app/static/room_view.js";
 
 function tick() {
   return new Promise((resolve) => setTimeout(resolve, 0));
@@ -446,6 +447,8 @@ async function testExpiredCaptionIsRemovedAndCanBeShownAgain() {
   const events = [];
   const removed = [];
   const expired = [];
+  const notices = [];
+  const screen = new Map();
   const sockets = [];
   const conn = connectRoom({
     room: "class",
@@ -457,9 +460,18 @@ async function testExpiredCaptionIsRemovedAndCanBeShownAgain() {
     },
     sleep: () => Promise.resolve(),
     onState: () => {},
-    onEvent: (item) => events.push(item),
-    onDelete: (item) => removed.push(item),
-    onExpire: (item) => expired.push(item),
+    onEvent: (item) => {
+      events.push(item);
+      if (item && item.id) screen.set(item.id, item);
+    },
+    onDelete: (item) => {
+      removed.push(item);
+      if (item && item.id) screen.delete(item.id);
+    },
+    onExpire: (item) => {
+      expired.push(item);
+      notices.push(expiryNotice(item && item.ids, screen));
+    },
   });
   await tick();
   sockets[0].onopen();
@@ -478,6 +490,7 @@ async function testExpiredCaptionIsRemovedAndCanBeShownAgain() {
   });
   assert.equal(expired.length, 1);
   assert.deepEqual(expired[0].ids, ["class:s:1"]);
+  assert.equal(notices[0], EXPIRY_NOTE);
   assert.equal(removed.length, 1);
   assert.equal(removed[0].id, "class:s:1");
   assert.equal(events.filter((item) => item.type === "captions_expired").length, 0);

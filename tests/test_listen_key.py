@@ -17,7 +17,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.dispatch import for_listener
-from app.server import _ReplayGate, _cap_replay_hello, _json_bytes, _trim_audience_rows
+from app.server import _ReplayGate, _cap_replay_hello, _json_bytes, _replay_address_key, _trim_audience_rows
 from app.settings import Settings
 from app.translate import Translator
 from tests.test_round2 import Socket, app_for, auth, open_room, push, stop, token_of
@@ -899,7 +899,9 @@ def test_replay_gate_address_cap_bounds_rotating_cids_and_keys():
     assert bounded.allow("10.1.0.2", "b")[0] is True
     now["t"] = 30.0
     kept = list(bounded._ip_hits["10.1.0.1"])
-    assert bounded.allow("10.1.0.3", "c")[0] is False
+    overflowed, overflow_retry = bounded.allow("10.1.0.3", "c")
+    assert overflowed is True
+    assert overflow_retry == 0
     assert bounded._ip_hits["10.1.0.1"] == kept
     assert ("10.1.0.3", "c") not in bounded._client_hits
     assert set(bounded._ip_hits) == {"10.1.0.1", "10.1.0.2"}
@@ -951,6 +953,115 @@ def test_replay_gate_address_cap_bounds_rotating_cids_and_keys():
     assert again.allow("10.2.0.1", "a")[0] is True
     assert len(again._ip_hits["10.2.0.1"]) == 1
     assert len(again._client_hits[("10.2.0.1", "a")]) == 1
+
+    # Client ids must not consume address slots. A full address table shares
+    # one overflow bucket; retry_after is the real wait, not a fixed 1000 or 60000.
+    now["t"] = 0.0
+    wide = _ReplayGate(180, 8, window_s=60.0, clock=lambda: now["t"], max_keys=4)
+    for ip_index in range(3):
+        for cid_index in range(8):
+            assert wide.allow(f"10.4.0.{ip_index}", f"c{cid_index}")[0] is True
+    assert len(wide._ip_hits) == 3
+    assert len(wide._client_hits) == 24
+    assert len(wide._client_hits) > wide.max_keys
+    assert wide.allow("10.4.0.9", "c")[0] is True
+    assert "10.4.0.9" in wide._ip_hits
+    shared, shared_retry = wide.allow("10.4.0.10", "c")
+    assert shared is True and shared_retry == 0
+    assert "10.4.0.10" not in wide._ip_hits
+    assert len(wide._ip_hits) == wide.max_keys
+
+    now["t"] = 0.0
+    timed = _ReplayGate(1, 1, window_s=60.0, clock=lambda: now["t"], max_keys=1, overflow_limit=1)
+    assert timed.allow("10.5.0.1", "a")[0] is True
+    assert timed.allow("10.5.0.2", "b")[0] is True
+    now["t"] = 20.0
+    refused, retry_ms = timed.allow("10.5.0.3", "c")
+    assert refused is False
+    assert 39000 <= retry_ms <= 41000
+    assert retry_ms != 1000
+    assert retry_ms != 60000
+    assert list(timed._ip_hits) == ["10.5.0.1"]
+    assert timed._ip_hits["10.5.0.1"] == [0.0]
+
+    now["t"] = 0.0
+    expired = _ReplayGate(1, 1, window_s=0.2, clock=lambda: now["t"], max_keys=1)
+    assert expired.allow("10.6.0.1", "a")[0] is True
+    now["t"] = 0.3
+    assert expired.allow("10.6.0.2", "b")[0] is True
+    assert "10.6.0.1" not in expired._ip_hits
+    assert "10.6.0.2" in expired._ip_hits
+    assert ("10.6.0.1", "a") not in expired._client_hits
+
+    assert _replay_address_key("fe80::1%eth0") == "fe80::/64"
+    assert _replay_address_key("[fe80::1%eth0]") == "fe80::/64"
+    assert _replay_address_key("fe80::2%25wlan0") == "fe80::/64"
+    assert _replay_address_key("2001:db8::1%a%b") == "2001:db8::/64"
+
+
+@pytest.mark.anyio
+async def test_full_replay_table_still_delivers_live_captions():
+    """Filling every client slot, then the address table, must not drop live captions.
+
+    23 addresses × the per-address cap used to fill the 4096 client-key table and
+    the page then closed the socket. Replay for a new address may wait, at most
+    one window. A cursor=0 listener still receives the next caption.
+    """
+    app = app_for(
+        settings=Settings(allow_testclient=True, translate=False, max_listeners=4),
+        translator=Translator(enabled=False),
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await open_room(client, token, "class")
+            gate = app.state.replay_gate
+            for index in range(23):
+                ip = f"198.51.100.{index + 1}"
+                for cid in range(gate.ip_limit):
+                    ok, retry = gate.allow(ip, f"cid-{cid}")
+                    assert ok is True and retry == 0
+            assert len(gate._ip_hits) == 23
+            assert len(gate._client_hits) == 23 * gate.ip_limit
+            assert len(gate._client_hits) > gate.max_keys
+
+            async with Socket(app, "/ws/listen?room_id=class&cursor=0", client=("203.0.113.77", 9100)) as live:
+                hello = await live.recv()
+                assert hello["type"] == "hello"
+                assert hello.get("backfill_deferred") is not True
+                made = await push(client, token, "class", "s", 1, "即時".encode(), t0_ms=0, t1_ms=1000)
+                assert made.status_code == 200, made.text
+                seen = None
+                for _ in range(8):
+                    msg = await live.recv()
+                    if isinstance(msg, dict) and msg.get("zh") == "即時":
+                        seen = msg
+                        break
+                assert seen is not None, "live caption missing while the replay table is full"
+
+            filled = len(gate._ip_hits)
+            for index in range(gate.max_keys - filled):
+                ok, retry = gate.allow(f"10.{index // 65025}.{(index // 255) % 255}.{index % 255}", "a")
+                assert ok is True and retry == 0
+            assert len(gate._ip_hits) == gate.max_keys
+            for index in range(gate.overflow_limit):
+                ok, retry = gate.allow("203.0.113.250", f"ov-{index}")
+                assert ok is True and retry == 0
+            assert len(gate._ip_hits) == gate.max_keys
+            assert "203.0.113.250" not in gate._ip_hits
+            async with Socket(
+                app,
+                "/ws/listen?room_id=class&replay=1&cid=late",
+                client=("203.0.113.251", 9101),
+            ) as late:
+                deferred = await late.recv()
+                assert deferred["type"] == "hello"
+                assert deferred.get("backfill_deferred") is True
+                retry_ms = int(deferred["retry_after_ms"])
+                assert 1000 < retry_ms <= 61000
+                assert "backfill" not in deferred
+    finally:
+        await stop(app)
 
 
 @pytest.mark.anyio
