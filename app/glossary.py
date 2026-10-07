@@ -33,6 +33,47 @@ FOLD = str.maketrans(
 ALIAS_STOP = frozenset({"開始", "法式", "師傅", "社科", "只觀", "工案", "開事", "一座", "產修"})
 
 
+# Match keys are pure, and lectures repeat the same characters.
+_FOLD_CACHE: dict[str, str] = {}
+
+
+def _fold_char(ch: str) -> str:
+    """One source character becomes one match character, so indexes stay aligned.
+
+    NFKC and casefold are applied only when they stay one character. A compatibility
+    form that expands (for example a ligature) keeps the traditional fold instead.
+    """
+    cached = _FOLD_CACHE.get(ch)
+    if cached is not None:
+        return cached
+    mapped = _fold_one(ch)
+    _FOLD_CACHE[ch] = mapped
+    return mapped
+
+
+def _fold_one(ch: str) -> str:
+    nfkc = unicodedata.normalize("NFKC", ch)
+    if len(nfkc) == 1:
+        folded = nfkc.casefold()
+        if len(folded) == 1:
+            mapped = folded.translate(FOLD)
+            if len(mapped) == 1:
+                return mapped
+    mapped = ch.translate(FOLD)
+    return mapped if len(mapped) == 1 else ch
+
+
+def _match_key(text: str) -> str:
+    return "".join(_fold_char(ch) for ch in text)
+
+
+_STOP_KEYS = frozenset(_match_key(word) for word in ALIAS_STOP)
+
+
+def _is_stop_alias(alias: str) -> bool:
+    return alias in ALIAS_STOP or _match_key(alias) in _STOP_KEYS
+
+
 def is_locked(term: dict) -> bool:
     if "lock" in term and term["lock"] is not None:
         parsed = _parse_lock(term["lock"])
@@ -80,36 +121,41 @@ def validate_terms(raw) -> tuple[list[dict], list[dict]]:
         if term is not None and not term.get("_bad"):
             canons.append(term["zh"])
     canon_set = set(canons)
+    canon_keys = {_match_key(zh) for zh in canons}
     seen_zh: dict[str, int] = {}
-    alias_owners: dict[str, list[tuple[int, str]]] = {}
+    seen_keys: dict[str, int] = {}
+    # Owners are keyed by the match fold, so 学社 and 學社 are the same alias.
+    alias_owners: dict[str, list[tuple[int, str, str]]] = {}
     bad_lines: set[int] = set()
     for index, term in parsed:
         if term is None or term.get("_bad"):
             bad_lines.add(index)
             continue
         zh = term["zh"]
-        if zh in seen_zh:
+        zh_key = _match_key(zh)
+        if zh in seen_zh or zh_key in seen_keys:
             rejected.append({"line": index, "reason": f"標準詞「{_clip(zh)}」重複"})
             bad_lines.add(index)
             continue
         seen_zh[zh] = index
+        seen_keys[zh_key] = index
         for alias in term["aliases"]:
             if len(alias) < MIN_ALIAS:
                 rejected.append({"line": index, "reason": f"別名「{_clip(alias)}」少於 2 字"})
                 bad_lines.add(index)
-            if alias in ALIAS_STOP:
+            if _is_stop_alias(alias):
                 rejected.append({"line": index, "reason": f"別名「{_clip(alias)}」是常用詞，不能當別名"})
                 bad_lines.add(index)
-            if alias in canon_set:
+            if alias in canon_set or _match_key(alias) in canon_keys:
                 rejected.append({"line": index, "reason": f"別名「{_clip(alias)}」與標準詞相同"})
                 bad_lines.add(index)
-            alias_owners.setdefault(alias, []).append((index, zh))
-    for alias, owners in alias_owners.items():
-        targets = {zh for _, zh in owners}
+            alias_owners.setdefault(_match_key(alias), []).append((index, zh, alias))
+    for _key, owners in alias_owners.items():
+        targets = {zh for _, zh, _alias in owners}
         if len(targets) < 2:
             continue
         named = "、".join(f"「{_clip(zh)}」" for zh in sorted(targets))
-        for index, _zh in owners:
+        for index, _zh, alias in owners:
             rejected.append({"line": index, "reason": f"別名「{_clip(alias)}」同時指向{named}"})
             bad_lines.add(index)
     accepted = []
@@ -126,7 +172,10 @@ def normalize(text: str, glossary) -> str:
     if not table or not text:
         return text or ""
     longest = max(len(key) for key in table)
-    folded = text.translate(FOLD)
+    folded = _match_key(text)
+    # A fold that changed the length would shift every later index. Leave the line alone.
+    if len(folded) != len(text):
+        return text
     out: list[str] = []
     index = 0
     while index < len(text):
@@ -210,12 +259,12 @@ def _dictionary(glossary) -> dict[str, str]:
     table: dict[str, str] = {}
     rows = _term_rows(glossary)
     for term in rows:
-        table[term["zh"].translate(FOLD)] = term["zh"]
+        table[_match_key(term["zh"])] = term["zh"]
     for term in rows:
         for alias in term["aliases"]:
-            if len(alias) < MIN_ALIAS or alias in ALIAS_STOP:
+            if len(alias) < MIN_ALIAS or _is_stop_alias(alias):
                 continue
-            table.setdefault(alias.translate(FOLD), term["zh"])
+            table.setdefault(_match_key(alias), term["zh"])
     return table
 
 
@@ -297,7 +346,9 @@ def _parse_term(item) -> tuple[dict | None, list[str]]:
         category = ""
     else:
         category = category.strip()
-        if len(category) > MAX_CATEGORY:
+        if _has_control(category):
+            problems.append("分類含有控制字元或換行")
+        elif len(category) > MAX_CATEGORY:
             problems.append(f"分類超過 {MAX_CATEGORY} 字")
     if not isinstance(note, str):
         problems.append("備註必須是文字")
