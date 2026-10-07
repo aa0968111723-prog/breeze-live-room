@@ -122,7 +122,9 @@ async def test_module_imports_carry_a_content_version():
         expected = stored_text(STATIC / "host.html")
         assert host.text == stamp_static_imports(expected, STATIC)
         host_versions = import_versions(host.text, STATIC)
-        assert set(host_versions) == {"recorder_machine.js", "room_client.js", "host_caption.js"}
+        assert set(host_versions) == {
+            "recorder_machine.js", "room_client.js", "host_caption.js", "host_glossary.js",
+        }
 
         room = await assert_revalidates(client, "/r/class")
         assert room.headers["content-type"].startswith("text/html")
@@ -176,7 +178,9 @@ async def test_changed_module_changes_its_import_version(monkeypatch, tmp_path):
         first = await client.get("/")
         assert first.status_code == 200
         before = import_versions(first.text, copied)
-        assert set(before) == {"recorder_machine.js", "room_client.js", "host_caption.js"}
+        assert set(before) == {
+            "recorder_machine.js", "room_client.js", "host_caption.js", "host_glossary.js",
+        }
         nested = await client.get("/static/room_client.js?v=" + before["room_client.js"])
         assert nested.status_code == 200
         assert nested.headers["cache-control"] == "no-cache"
