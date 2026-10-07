@@ -318,6 +318,7 @@ class Pipeline:
         prefix = room_id + ":"
         for ident in [ident for ident in self._braced_dropped if ident.startswith(prefix)]:
             self._braced_dropped.pop(ident, None)
+        self._rtf.drop_room(room_id)
 
     def note_retained_order(self, room_id: str, rows: list[dict]) -> None:
         """Reseed session ordinals after a close that kept the room's captions.
@@ -1208,7 +1209,8 @@ class Pipeline:
                             timeout=self.settings.asr_timeout_s,
                         )
                     except asyncio.TimeoutError:
-                        record_s = time.monotonic() - asr_started
+                        # A timeout is not a speed sample. ~120s of asr_ms would own p95.
+                        self._rtf.note_timeout((segment.room_id, segment.session_id))
                         self.fail_received(segment, "辨識逾時", status="timeout")
                         return segment
                     record_s = time.monotonic() - asr_started

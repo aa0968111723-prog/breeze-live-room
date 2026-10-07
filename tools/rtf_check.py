@@ -215,6 +215,19 @@ def render(snapshot: dict, source: str) -> tuple[str, int]:
         lines.append(f"等待辨識的音訊：{float(backlog):.3f} 秒")
     lines.extend(_scope_lines("近期", window))
     lines.extend(_scope_lines("本場以來", session))
+    timeouts = snapshot.get("asr_timeouts")
+    if timeouts is not None:
+        lines.append(f"辨識逾時（不計入 RTF）：{int(timeouts)}")
+    rows = rtf.get("sessions") if isinstance(rtf.get("sessions"), list) else []
+    if len(rows) > 1:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_p95 = (row.get("rtf") or {}).get("p95")
+            lines.append(
+                f"房間 {row.get('room_id')}/{row.get('session_id')}："
+                f"{int(row.get('count') or 0)} 段，RTF p95 {_fmt_rtf(row_p95)}"
+            )
     if p95 is None:
         lines.append(f"結果：FAIL（沒有 RTF 樣本，門檻 p95 < {P95_LIMIT}）")
         code = 1

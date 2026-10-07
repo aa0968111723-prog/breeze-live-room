@@ -11,6 +11,7 @@ import pytest
 import uvicorn
 
 from app.asr import AsrResult
+from app.rtf import RtfMeter
 from app.server import create_app
 from app.settings import Settings
 from app.translate import Translator
@@ -37,6 +38,22 @@ def test_render_pass_fail_and_unverified_note():
     empty, empty_code = rtf_check.render(rtf_check.snapshot_from_pairs([]), "假樣本")
     assert empty_code == 1
     assert "沒有 RTF 樣本" in empty
+    for report in (slow, fast, empty):
+        assert "辨識逾時（不計入 RTF）：0" in report
+        assert "尚未驗證" in report
+
+
+def test_render_lists_each_room_without_counting_timeouts_as_samples():
+    meter = RtfMeter()
+    meter.record(0.2, 1.0, ("east", "live"))
+    meter.record(0.4, 1.0, ("west", "live"))
+    meter.note_timeout(("west", "live"))
+    text, code = rtf_check.render(meter.snapshot(), "兩房")
+    assert code == 0
+    assert "辨識逾時（不計入 RTF）：1" in text
+    assert "房間 east/live：1 段，RTF p95 0.200" in text
+    assert "房間 west/live：1 段，RTF p95 0.400" in text
+    assert "尚未驗證" in text
 
 
 def test_run_with_fake_asr_prints_pass_and_hides_transcript(monkeypatch, capsys, tmp_path):

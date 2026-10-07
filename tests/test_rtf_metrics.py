@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
+import shutil
 import struct
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -12,7 +16,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.asr import AsrResult
 from app.audio import riff_duration_seconds
-from app.rtf import SESSION_LIMIT, RtfMeter, percentile
+from app.rtf import SESSION_LIMIT, SESSION_ROOM_CAP, RtfMeter, percentile
 from app.server import create_app
 from app.settings import Settings
 from app.translate import Translator
@@ -105,12 +109,12 @@ async def token_of(app, client) -> str:
     return resp.json()["token"]
 
 
-async def push(client, token, seq, payload, session="s"):
+async def push(client, token, seq, payload, session="s", room="class"):
     return await client.post(
         "/api/push",
-        params={"room_id": "class", "session_id": session, "seq": str(seq)},
+        params={"room_id": room, "session_id": session, "seq": str(seq)},
         data={
-            "room_id": "class",
+            "room_id": room,
             "session_id": session,
             "seq": str(seq),
             "wait_translation": "0",
@@ -188,9 +192,19 @@ def test_host_metrics_line_keeps_existing_labels_and_adds_rtf():
     line = text.split("metrics.textContent = ", 1)[1].split(";", 1)[0]
     for label in ("待處理 ", "最久等待 ", "上次辨識 ", "拒絕 ", "缺段 ", "聽眾 ", "記憶體 "):
         assert label in line
-    assert "辨識即時率 p50 " in line and "p95 " in line
-    assert line.index("上次辨識 ") < line.index("辨識即時率 p50 ")
+    assert "辨識即時率" not in line
+    assert "辨識速度" not in line
     assert 'data.last_process_ms ?? "—"' in line
+    phase = text.index('id="phase"')
+    speed = text.index('id="rtf-speed"')
+    captions = text.index('id="caption-en"')
+    assert phase < speed < captions
+    assert "辨識速度：開始聽之後才有數字" in text
+    assert "最近 200 段" in text
+    assert "（低於 0.9 才跟得上）" in text
+    assert "狀態：" in text
+    for word in ("跟得上", "接近上限", "跟不上，字幕會延遲"):
+        assert word in text
 
 
 @pytest.mark.anyio
@@ -215,6 +229,7 @@ async def test_metrics_rtf_uses_wave_duration_and_known_asr_speed(tmp_path):
             assert before["rtf"]["window"]["count"] == 0
             assert before["rtf"]["session"]["count"] == 0
             assert before["backlog_audio_s"] == 0
+            assert before["asr_timeouts"] == 0
 
             resp = await push(client, token, 1, blob)
             assert resp.status_code == 200, resp.text
@@ -240,6 +255,7 @@ async def test_metrics_rtf_uses_wave_duration_and_known_asr_speed(tmp_path):
             assert session["rtf"]["p95"] == pytest.approx(asr_ms / 1000)
             assert session["rtf"]["max"] == pytest.approx(asr_ms / 1000)
             assert window["rtf"]["p95"] == session["rtf"]["p95"]
+            assert body["asr_timeouts"] == 0
             # last_process_ms is still the whole slice, not replaced by the RTF sample.
             assert body["last_process_ms"] + 50 >= asr_ms
             assert asr.calls == 1
@@ -358,7 +374,277 @@ async def test_silence_skip_does_not_record_rtf():
             assert body["rtf"]["session"]["count"] == 0
             assert body["rtf"]["window"]["count"] == 0
             assert body["backlog_audio_s"] == 0
+            assert body["asr_timeouts"] == 0
             assert body["last_process_ms"] is None
             assert asr.calls == 0
+    finally:
+        await app.state.shutdown()
+
+
+def _rows(snapshot: dict) -> dict[tuple[str, str], dict]:
+    return {(row["room_id"], row["session_id"]): row for row in snapshot["rtf"]["sessions"]}
+
+
+def test_timeout_does_not_enter_rtf_percentiles():
+    meter = RtfMeter()
+    meter.record_ms(200, 1000, ("room", "class"))
+    meter.note_timeout(("room", "class"))
+    meter.note_timeout(("room", "class"))
+    snap = meter.snapshot()
+    assert snap["asr_timeouts"] == 2
+    assert snap["rtf"]["session"]["count"] == 1
+    assert snap["rtf"]["window"]["count"] == 1
+    assert snap["rtf"]["session"]["asr_ms"]["max"] == 200
+    assert snap["rtf"]["session"]["rtf"]["p95"] == pytest.approx(0.2)
+    assert _rows(snap)[("room", "class")]["asr_timeouts"] == 2
+    # A new session drops that room's samples only. The timeout total stays.
+    meter.note_timeout(("room", "next"))
+    after = meter.snapshot()
+    assert after["asr_timeouts"] == 3
+    assert after["rtf"]["session"]["count"] == 0
+    assert after["rtf"]["session"]["rtf"]["p95"] is None
+    assert after["rtf"]["window"]["count"] == 1
+    meter.drop_room("room")
+    dropped = meter.snapshot()
+    assert dropped["asr_timeouts"] == 3
+    assert dropped["rtf"]["sessions"] == []
+    assert dropped["rtf"]["window"]["count"] == 1
+
+
+def test_alternating_rooms_do_not_wipe_session_rtf():
+    meter = RtfMeter()
+    for _ in range(40):
+        meter.record_ms(100, 1000, ("east", "live"))
+        meter.record_ms(900, 1000, ("west", "live"))
+    rows = _rows(meter.snapshot())
+    assert rows[("east", "live")]["count"] == 40
+    assert rows[("west", "live")]["count"] == 40
+    assert rows[("east", "live")]["rtf"]["p95"] == pytest.approx(0.1)
+    assert rows[("west", "live")]["rtf"]["p95"] == pytest.approx(0.9)
+    assert rows[("east", "live")]["asr_ms"]["max"] == 100
+    assert rows[("west", "live")]["asr_ms"]["max"] == 900
+    # Default snapshot follows the latest update, which still has every east sample.
+    assert meter.snapshot()["rtf"]["session"]["count"] == 40
+    assert meter.snapshot(("west", "live"))["rtf"]["session"]["count"] == 40
+    meter.record_ms(50, 1000, ("east", "next"))
+    rows = _rows(meter.snapshot())
+    assert ("east", "live") not in rows
+    assert rows[("east", "next")]["count"] == 1
+    assert rows[("east", "next")]["asr_ms"]["max"] == 50
+    assert rows[("west", "live")]["count"] == 40
+    assert rows[("west", "live")]["rtf"]["p95"] == pytest.approx(0.9)
+    assert meter.snapshot()["rtf"]["window"]["count"] == 81
+
+
+def test_session_buckets_stay_bounded():
+    meter = RtfMeter()
+    total = SESSION_ROOM_CAP + 5
+    for index in range(total):
+        meter.record_ms(index + 1, 1000, (f"room{index}", "s"))
+    rows = meter.snapshot()["rtf"]["sessions"]
+    assert len(rows) == SESSION_ROOM_CAP
+    ids = {row["room_id"] for row in rows}
+    assert "room0" not in ids
+    assert f"room{total - 1}" in ids
+    assert meter.snapshot()["rtf"]["window"]["count"] == total
+    assert meter.snapshot()["rtf"]["session"]["count"] == 1
+
+
+def test_stop_path_does_not_block_on_the_rtf_meter():
+    text = Path("app/pipeline.py").read_text(encoding="utf-8")
+    end = text.split("async def end_session", 1)[1].split("\n    def fail_received", 1)[0]
+    assert "_rtf" not in end
+    before = text.split('self.fail_received(segment, "辨識逾時", status="timeout")', 1)[0]
+    handler = before.rsplit("except asyncio.TimeoutError:", 1)[1]
+    assert "note_timeout" in handler
+    assert "record_s" not in handler
+    finally_body = text.split("self._rtf.clear_waiting(segment.key)", 1)[1].split("self.last_process_s", 1)[0]
+    assert "snapshot" not in finally_body
+    assert "sleep" not in finally_body
+    assert ".record(" in finally_body
+    meter = Path("app/rtf.py").read_text(encoding="utf-8")
+    for banned in ("time.sleep", "asyncio.", "subprocess", "threading", "Lock(", "socket.", "open("):
+        assert banned not in meter, banned
+
+
+def _contrast(foreground: str, background: str) -> float:
+    def channel(value: int) -> float:
+        scaled = value / 255
+        if scaled <= 0.04045:
+            return scaled / 12.92
+        return ((scaled + 0.055) / 1.055) ** 2.4
+
+    def luminance(color: str) -> float:
+        color = color.lstrip("#")
+        red, green, blue = (int(color[index:index + 2], 16) for index in (0, 2, 4))
+        return 0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
+
+    lighter = max(luminance(foreground), luminance(background))
+    darker = min(luminance(foreground), luminance(background))
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def test_host_speed_line_contrast_and_status_words():
+    text = Path("app/static/host.html").read_text(encoding="utf-8")
+    for selector in ("#rtf-speed.speed-empty", "#rtf-speed.speed-ok", "#rtf-speed.speed-warn", "#rtf-speed.speed-bad"):
+        block = re.search(re.escape(selector) + r"\s*\{([^}]+)\}", text)
+        assert block, selector
+        body = block.group(1)
+        colors = {}
+        for name in ("color", "background"):
+            found = re.search(rf"(?:^|;)\s*{name}\s*:\s*(#[0-9a-fA-F]{{6}})", body)
+            assert found, (selector, name, body)
+            colors[name] = found.group(1)
+        ratio = _contrast(colors["color"], colors["background"])
+        assert ratio >= 4.5, (selector, colors, ratio)
+    view = text.split("function recognitionSpeedView", 1)[1].split("function paintRecognitionSpeed", 1)[0]
+    for word in ("跟得上", "接近上限", "跟不上，字幕會延遲"):
+        assert word in view
+    assert 'p95 >= 0.9' in view and 'p95 >= 0.7' in view
+
+
+def _extract_function(source: str, name: str) -> str:
+    marker = f"function {name}"
+    start = source.index(marker)
+    open_brace = source.index("{", start)
+    depth = 0
+    for index in range(open_brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:index + 1]
+    raise AssertionError(name)
+
+
+def test_host_speed_line_wording_for_each_band():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    source = Path("app/static/host.html").read_text(encoding="utf-8")
+    function = _extract_function(source, "recognitionSpeedView")
+
+    def sample(p50, p95, count=4, limit=200):
+        return {"rtf": {"window": {"count": count, "limit": limit, "rtf": {"p50": p50, "p95": p95}}}}
+
+    def line(p50, p95, word, limit=200):
+        return f"辨識速度：一般 {p50:.2f}、最慢 {p95:.2f}（低於 0.9 才跟得上）。最近 {limit} 段。狀態：{word}"
+
+    cases = [
+        {"data": None, "text": "辨識速度：開始聽之後才有數字", "tone": "speed-empty"},
+        {"data": {}, "text": "辨識速度：開始聽之後才有數字", "tone": "speed-empty"},
+        {"data": sample(None, None, count=0), "text": "辨識速度：開始聽之後才有數字", "tone": "speed-empty"},
+        {"data": sample(0.42, 0.50), "text": line(0.42, 0.50, "跟得上"), "tone": "speed-ok", "absent": ["接近上限", "跟不上"]},
+        {"data": sample(0.69, 0.69), "text": line(0.69, 0.69, "跟得上"), "tone": "speed-ok", "absent": ["接近上限", "跟不上"]},
+        {"data": sample(0.70, 0.70), "text": line(0.70, 0.70, "接近上限"), "tone": "speed-warn", "absent": ["跟不上"]},
+        {"data": sample(0.80, 0.89), "text": line(0.80, 0.89, "接近上限"), "tone": "speed-warn", "absent": ["跟不上"]},
+        {"data": sample(0.90, 0.90), "text": line(0.90, 0.90, "跟不上，字幕會延遲"), "tone": "speed-bad"},
+        {"data": sample(1.20, 1.40), "text": line(1.20, 1.40, "跟不上，字幕會延遲"), "tone": "speed-bad"},
+    ]
+    script = function + """
+const cases = JSON.parse(process.argv[1]);
+let failed = 0;
+for (const item of cases) {
+  const view = recognitionSpeedView(item.data);
+  const problems = [];
+  if (view.text !== item.text) problems.push("text " + JSON.stringify(view.text));
+  if (view.tone !== item.tone) problems.push("tone " + view.tone);
+  if (!String(view.title).includes("最近 200 段")) problems.push("title");
+  for (const word of item.absent || []) {
+    if (view.text.includes(word)) problems.push("unexpected " + word);
+  }
+  if (problems.length) {
+    console.log(JSON.stringify(item.text), problems.join("; "));
+    failed++;
+  }
+}
+if (failed) process.exit(1);
+"""
+    proc = subprocess.run(
+        [node, "-e", script, json.dumps(cases)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+class TimeoutAsr:
+    def __init__(self):
+        self.calls = 0
+
+    def transcribe(self, wav: Path, prompt: str) -> AsrResult:
+        del wav, prompt
+        self.calls += 1
+        time.sleep(0.25)
+        return AsrResult(ok=True, text="太慢")
+
+
+@pytest.mark.anyio
+async def test_asr_timeout_is_not_an_rtf_sample():
+    asr = TimeoutAsr()
+    app = app_for(asr, asr_timeout_s=0.05, asr_workers=1)
+    blob = wave_bytes(1.0)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            timed = await push(client, token, 1, blob)
+            assert timed.status_code == 408, timed.text
+            assert timed.json()["status"] == "timeout"
+            body = (await client.get("/api/metrics", headers=auth(token))).json()
+            assert EXISTING <= set(body)
+            assert body["asr_timeouts"] == 1
+            assert body["rtf"]["session"]["count"] == 0
+            assert body["rtf"]["window"]["count"] == 0
+            assert body["rtf"]["session"]["rtf"]["p95"] is None
+            assert body["rtf"]["window"]["rtf"]["p95"] is None
+            assert body["backlog_audio_s"] == 0
+            assert body["rejected"] == 0
+            asr.transcribe = lambda wav, prompt: AsrResult(ok=True, text="中文")
+            done = await push(client, token, 2, blob)
+            assert done.status_code == 200, done.text
+            assert done.json()["zh"] == "中文"
+            after = (await client.get("/api/metrics", headers=auth(token))).json()
+            assert after["asr_timeouts"] == 1
+            assert after["rtf"]["session"]["count"] == 1
+            assert after["rtf"]["window"]["count"] == 1
+            assert after["rtf"]["session"]["audio_ms"]["max"] == 1000
+            assert after["rtf"]["session"]["rtf"]["p95"] is not None
+            assert after["rtf"]["sessions"][0]["asr_timeouts"] == 1
+    finally:
+        await app.state.shutdown()
+
+
+@pytest.mark.anyio
+async def test_alternating_rooms_keep_their_own_rtf_session():
+    asr = TimedAsr(0)
+    app = app_for(asr)
+    blob = wave_bytes(1.0)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            east = await push(client, token, 1, blob, session="live", room="east")
+            west = await push(client, token, 1, blob, session="live", room="west")
+            again = await push(client, token, 2, blob, session="live", room="east")
+            assert [item.status_code for item in (east, west, again)] == [200, 200, 200]
+            body = (await client.get("/api/metrics", headers=auth(token))).json()
+            rows = _rows(body)
+            assert rows[("east", "live")]["count"] == 2
+            assert rows[("west", "live")]["count"] == 1
+            assert body["rtf"]["session"]["count"] == 2
+            assert body["rtf"]["window"]["count"] == 3
+            assert body["asr_timeouts"] == 0
+            nxt = await push(client, token, 1, blob, session="next", room="east")
+            assert nxt.status_code == 200, nxt.text
+            after = (await client.get("/api/metrics", headers=auth(token))).json()
+            rows = _rows(after)
+            assert ("east", "live") not in rows
+            assert rows[("east", "next")]["count"] == 1
+            assert rows[("west", "live")]["count"] == 1
+            assert after["rtf"]["session"]["count"] == 1
+            assert after["rtf"]["window"]["count"] == 4
+            assert asr.calls == 4
     finally:
         await app.state.shutdown()
