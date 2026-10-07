@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
+from email.utils import formatdate
+from mimetypes import guess_type
 from pathlib import Path
 from urllib.parse import unquote_to_bytes
 
@@ -37,13 +41,119 @@ TMP = ROOT / "tmp"
 PROMPT = "以下是台灣國語的句子，請用繁體中文輸出。常見專有名詞：般若、菩提心、空性、因緣。這是提示偏置，不保證鎖詞。"
 
 _TRACKED: list[FastAPI] = []
+# First 8 hex digits of the file's sha256. Long enough to bust a cache, short enough for a URL.
+_ASSET_HASH_LEN = 8
+_STAMP_SUFFIXES = {".html", ".htm", ".js", ".mjs"}
+# from "...js", import "...js", and import("...js"). Query strings are replaced, not stacked.
+_MODULE_IMPORT_RE = re.compile(
+    r"""(?P<lead>\bfrom\s+|\bimport(?:\s*\(\s*|\s+))(?P<quote>["'])"""
+    r"""(?P<url>/static/(?P<name>[^"'\\?#]+?\.js))(?:\?[^"'\\]*)?(?P=quote)"""
+)
+
+
+def app_version() -> str:
+    try:
+        raw = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        return "0"
+    token = raw.split()[0] if raw else "0"
+    if not token or any(ch in token for ch in " \"'#?&"):
+        return "0"
+    return token
+
+
+def static_asset_token(path: Path) -> str:
+    """Token embedded in import URLs. VERSION alone does not move when a script changes."""
+
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()[:_ASSET_HASH_LEN]
+    return f"{app_version()}-{digest}"
+
+
+def _static_import_target(name: str, static_dir: Path) -> Path | None:
+    if not name or name.startswith(("/", "\\")) or "\\" in name or ".." in Path(name).parts:
+        return None
+    root = static_dir.resolve()
+    target = (root / name).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return None
+    if not target.is_file():
+        return None
+    return target
+
+
+def _rewrite_static_imports(text: str, static_dir: Path) -> tuple[str, list[Path]]:
+    targets: list[Path] = []
+
+    def repl(match: re.Match[str]) -> str:
+        target = _static_import_target(match.group("name"), static_dir)
+        if target is None:
+            return match.group(0)
+        try:
+            token = static_asset_token(target)
+        except OSError:
+            return match.group(0)
+        targets.append(target)
+        lead = match.group("lead")
+        quote = match.group("quote")
+        url = match.group("url")
+        return f"{lead}{quote}{url}?v={token}{quote}"
+
+    return _MODULE_IMPORT_RE.sub(repl, text), targets
+
+
+def stamp_static_imports(text: str, static_dir: Path) -> str:
+    """Add ?v=<version>-<content hash> to /static/*.js module imports."""
+
+    return _rewrite_static_imports(text, static_dir)[0]
+
+
+def _body_etag(body: bytes) -> str:
+    return f'"{hashlib.sha256(body).hexdigest()}"'
+
+
+def _stamped_static(path: Path, static_dir: Path, stat_result: os.stat_result) -> tuple[bytes, str] | None:
+    if path.suffix.lower() not in _STAMP_SUFFIXES:
+        return None
+    try:
+        original = path.read_bytes()
+        text = original.decode("utf-8")
+    except (OSError, UnicodeError):
+        return None
+    stamped, targets = _rewrite_static_imports(text, static_dir)
+    rewritten = stamped.encode("utf-8")
+    if rewritten == original:
+        return None
+    mtimes = [stat_result.st_mtime]
+    for target in targets:
+        try:
+            mtimes.append(target.stat().st_mtime)
+        except OSError:
+            continue
+    return rewritten, formatdate(max(mtimes), usegmt=True)
+
+
+class _RewrittenStaticResponse(Response):
+    """Stamped HTML or JS. HEAD stays header-only, same as FileResponse."""
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http" and str(scope.get("method", "GET")).upper() == "HEAD":
+            await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+            if self.background is not None:
+                await self.background()
+            return
+        await super().__call__(scope, receive, send)
 
 
 class RevalidatingStaticFiles(StaticFiles):
     """Send Cache-Control: no-cache and keep ETag so browsers revalidate.
 
     A cached room_client.js paired with a newer host.html or room.html throws
-    on import and the page script never starts.
+    on import and the page script never starts. Copies stored before this
+    header existed will not revalidate during their heuristic lifetime, so
+    served HTML and JS get a content-hash query on each /static/*.js import.
     """
 
     def file_response(
@@ -53,12 +163,30 @@ class RevalidatingStaticFiles(StaticFiles):
         scope: dict,
         status_code: int = 200,
     ) -> Response:
-        response = FileResponse(
-            full_path,
-            status_code=status_code,
-            stat_result=stat_result,
-            headers={"Cache-Control": "no-cache"},
-        )
+        directory = Path(self.directory) if self.directory is not None else Path(full_path).parent
+        stamped = _stamped_static(Path(full_path), directory, stat_result)
+        if stamped is None:
+            response: Response = FileResponse(
+                full_path,
+                status_code=status_code,
+                stat_result=stat_result,
+                headers={"Cache-Control": "no-cache"},
+            )
+        else:
+            body, last_modified = stamped
+            media_type = guess_type(str(full_path))[0] or "application/octet-stream"
+            # ETag is the stamped bytes, not mtime-size: a script edit changes
+            # the injected ?v= without touching the HTML file's stat.
+            response = _RewrittenStaticResponse(
+                content=body,
+                status_code=status_code,
+                media_type=media_type,
+                headers={
+                    "Cache-Control": "no-cache",
+                    "etag": _body_etag(body),
+                    "last-modified": last_modified,
+                },
+            )
         if self.is_not_modified(response.headers, Headers(scope=scope)):
             return NotModifiedResponse(response.headers)
         return response
