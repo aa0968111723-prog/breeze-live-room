@@ -32,4 +32,4 @@
 
 ## 儲存
 
-預設只在記憶體。設了 `BREEZE_DATA_PATH` 才把字幕寫進 SQLite，不存音檔。舊檔用 `ALTER TABLE` 補上新欄位，不是整庫搬遷。每個房間的術語表在 `room_glossary`，不跟字幕的 24 小時期限一起刪。
+預設只在記憶體。設了 `BREEZE_DATA_PATH` 才把字幕寫進 SQLite，不存音檔。舊檔用 `ALTER TABLE` 補上新欄位，不是整庫搬遷。每個房間的術語表在 `room_glossary`，不跟字幕的 24 小時期限一起刪。同一房間的新會話沿用這份詞表。關閉房間或閒置約 30 分鐘回收房間時也不清詞表；只有主持人整房刪除（`DELETE /api/captions?room_id=`）才清。舊的 `POST /api/glossary` 忽略 `session_id`，寫入的是整房詞表，不是某一堂。比對時才折全形、半形與英文大小寫；`zh_raw` 和 SRT 用的原文不改。
