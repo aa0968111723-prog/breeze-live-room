@@ -316,7 +316,7 @@ async def test_legacy_post_keeps_the_old_response_shape():
                 headers={**auth(token), "content-type": "application/json"},
             )
             assert saved.status_code == 200
-            assert saved.json() == {"ok": True, "count": 3}
+            assert saved.json() == {"ok": True, "count": 3, "deleted": 0}
             view = (await _get(client, token, "legacy")).json()
             assert [item["zh"] for item in view["terms"]] == ["般若", "開示", "菩薩"]
             assert view["terms"][0]["en"] == "prajna"
@@ -544,7 +544,7 @@ async def test_room_isolation_reset_and_missing_token():
                 json={"room_id": "class", "session_id": "a", "text": "般若=prajna\n# x\n空性=emptiness"},
                 headers={**auth(token), "content-type": "application/json"},
             )
-            assert saved.json() == {"ok": True, "count": 2}
+            assert saved.json() == {"ok": True, "count": 2, "deleted": 0}
             other = await _put(
                 client, token, "other",
                 [{"zh": "菩薩", "en": "bodhisattva", "aliases": []}],

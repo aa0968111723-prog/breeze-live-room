@@ -25,6 +25,8 @@ button.secondary { background: #5d6b4a; }
 .card { background: #fffaf3; border-radius: 18px; padding: 16px; margin-top: 16px; box-shadow: 0 10px 28px rgba(80, 48, 16, .08); }
 label { display: block; margin-top: 8px; }
 .warn { color: #8a2b12; font-weight: 650; }
+#glossary-note:empty { display: none; }
+textarea[readonly] { background: #f3eadb; color: #6b5644; }
 .meter { height: 12px; background: #eadfce; border-radius: 99px; overflow: hidden; margin-top: 8px; }
 .meter span { display: block; height: 100%; width: 0; background: #c47a32; }
 #phase { font-weight: 700; }
@@ -65,6 +67,7 @@ label { display: block; margin-top: 8px; }
 <div class="card">
 <label>這場術語，一行一個，例如 般若=prajna
 <textarea id="glossary" rows="4"></textarea></label>
+<p id="glossary-note" class="warn"></p>
 <button id="save-terms" class="secondary" type="button">儲存術語</button>
 <button id="export" class="secondary" type="button">匯出 SRT</button>
 <label>跳過序號 <input id="skip-seq" inputmode="numeric" value="1" style="width:5em"></label>
@@ -79,7 +82,7 @@ label { display: block; margin-top: 8px; }
 import { createCaptureController } from "/static/recorder_machine.js";
 import { connectRoom, createCaptionView, mergeCaptionUpdate } from "/static/room_client.js";
 import { applyCaption } from "/static/host_caption.js";
-import { glossaryPostBody, glossarySaveLine, glossaryTransportLine } from "/static/host_glossary.js";
+import { glossaryBoxText, glossaryLegacyBlock, glossarySaveLine, glossarySaveRequest, glossaryTransportLine } from "/static/host_glossary.js";
 const roomEl = document.querySelector("#room");
 const log = document.querySelector("#log");
 const status = document.querySelector("#status");
@@ -96,6 +99,8 @@ let holdRoom = "";
 let captionConn = null;
 let listenedRoom = "";
 let listenKey = "";
+let glossaryVersion = null;
+let glossaryLocked = false;
 const view = createCaptionView(80);
 const captions = view.items;
 const phaseLabels = {
@@ -165,7 +170,9 @@ function listenCaptions(roomId, force) {
       if (listenKey) address += "&k=" + encodeURIComponent(listenKey);
       return address;
     },
-    onState: () => {},
+    onState: (text) => {
+      if (typeof text === "string" && text.startsWith("已連上")) loadGlossary(room);
+    },
     onEvent: (item) => showCaption(item, true),
     onDelete: (item) => {
       view.apply(item);
@@ -206,43 +213,62 @@ function glossaryText() {
   const box = document.querySelector("#glossary");
   return box ? box.value : "";
 }
+async function loadGlossary(roomId) {
+  // Fill the box from the server and remember that version. A failed load leaves both alone.
+  if (!token) return;
+  const room = String(roomId || roomEl.value || "class").trim() || "class";
+  let resp;
+  try {
+    resp = await hostFetch("/api/rooms/" + encodeURIComponent(room) + "/glossary", { cache: "no-store" });
+  } catch (err) {
+    return;
+  }
+  if (!resp || !resp.ok) return;
+  if ((String(roomEl.value || "class").trim() || "class") !== room) return;
+  let data = null;
+  try {
+    data = await resp.json();
+  } catch (err) {
+    return;
+  }
+  if ((String(roomEl.value || "class").trim() || "class") !== room) return;
+  if (!data || !Array.isArray(data.terms) || !Number.isInteger(data.version)) return;
+  const block = glossaryLegacyBlock(data.terms);
+  glossaryVersion = data.version;
+  glossaryLocked = block.locked;
+  const box = document.querySelector("#glossary");
+  if (box) {
+    box.value = glossaryBoxText(data.terms);
+    box.readOnly = block.locked;
+  }
+  const saveBtn = document.querySelector("#save-terms");
+  if (saveBtn) saveBtn.disabled = block.locked;
+  const note = document.querySelector("#glossary-note");
+  if (note) note.textContent = block.note || "";
+}
 async function postGlossary(room, sessionId, headers) {
   const text = glossaryText();
-  // An empty box is the page default. Do not replace a glossary already saved for this room.
-  if (!String(text || "").trim()) return null;
-  const url = "/api/rooms/" + encodeURIComponent(room) + "/glossary";
-  const current = headers
-    ? await fetch(url, { headers, cache: "no-store" })
-    : await hostFetch(url, { cache: "no-store" });
-  let version = null;
-  if (current.ok) {
-    try {
-      const data = await current.json();
-      if (Number.isInteger(data && data.version)) version = data.version;
-    } catch (err) {
-      version = null;
-    }
-  }
-  // Never POST without the version this page just read. A stale page gets 409.
-  if (!Number.isInteger(version)) {
-    let body = null;
-    try {
-      body = await current.json();
-    } catch (err) {
-      body = null;
-    }
+  // if_version is the version stored when this box was filled. Do not GET a new
+  // version here: a page left open must send the old one and receive 409.
+  const request = glossarySaveRequest(room, sessionId, text, glossaryVersion, glossaryLocked);
+  if (!request.post) {
+    if (request.reason === "empty") return null;
+    const reason = request.reason === "locked"
+      ? "請用術語表編輯器修改"
+      : "讀不到目前的術語表版本，請重新整理頁面後再儲存";
     return {
-      status: current.ok ? 409 : current.status,
+      status: 409,
       async json() {
-        return body || { ok: false, rejected: [{ line: 0, reason: "讀不到目前的術語表版本，請重新整理頁面後再儲存" }] };
+        return { ok: false, rejected: [{ line: 0, reason }] };
       },
     };
   }
-  const payload = JSON.stringify(glossaryPostBody(room, sessionId, text, version));
-  if (headers) {
-    return fetch("/api/glossary", { method: "POST", headers, body: payload });
-  }
-  return hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: payload });
+  const payload = JSON.stringify(request.body);
+  const sent = headers
+    ? await fetch("/api/glossary", { method: "POST", headers, body: payload })
+    : await hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: payload });
+  if (sent && sent.ok) await loadGlossary(room);
+  return sent;
 }
 async function reportGlossary(room, sessionId, headers) {
   let resp;
@@ -333,6 +359,7 @@ async function setup() {
     : (data.translate_label + "。模型模式：" + data.asr_mode + (data.model_reloads_each_segment ? "，每段會重新載入。" : "，常駐服務已就緒。") + (data.storage ? "逐字稿已啟用儲存，可匯出保存期限內的完整內容。" : "逐字稿未啟用儲存；重開服務會清空，只可匯出近期字幕。"));
   go.disabled = !ready || !token || !ctl.canEditRoom();
   listenCaptions(roomEl.value);
+  loadGlossary(roomEl.value);
 }
 async function refreshMetrics() {
   if (!token) return;
@@ -529,6 +556,11 @@ document.querySelector("#try").onclick = async () => {
 };
 document.querySelector("#save-terms").onclick = async () => {
   if (!token || !ctl.session) { line("開始聽之後才會把術語存到這個房間。"); return; }
+  if (glossaryLocked) {
+    const note = document.querySelector("#glossary-note");
+    line((note && note.textContent) || "請用術語表編輯器修改");
+    return;
+  }
   if (!String(glossaryText() || "").trim()) {
     line("術語是空的，沒有覆蓋這個房間已儲存的詞表。");
     return;

@@ -1488,6 +1488,9 @@ async def test_active_room_expires_each_caption_not_the_whole_room():
 def test_device_acceptance_storage_off_export_covers_a_class():
     """A 100-minute export fits in the room caption cap. Storage is for restart, not for that export."""
     text = Path("docs/DEVICE-ACCEPTANCE.md").read_text(encoding="utf-8")
+    assert "再送一次術語，然後" not in text
+    assert "只在按儲存時送出" in text
+    assert "401 不會自動再送一次術語" in text
     assert "沒開儲存時 100 分鐘匯出會缺掉大部分" not in text
     assert "BREEZE_ROOM_CAPTION_CAP" in text
     assert "預設 5000" in text

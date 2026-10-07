@@ -22,7 +22,16 @@ from app.asr import CliAsr, ResidentAsr
 from app.audio import AudioError, convert_to_wav, ffmpeg_bin, wav_duration_seconds
 from app.auth import audience_origin_allowed, new_host_token, require_host, require_local_host, same_secret
 from app.dispatch import ListenerSlot, RoomBus, for_listener
-from app.glossary import GLOSSARY_MAX_BODY, SCHEMA_VERSION, legacy_terms, preserve_rich_fields, validate_terms
+from app.glossary import (
+    GLOSSARY_MAX_BODY,
+    LEGACY_BOX_LIMIT,
+    SCHEMA_VERSION,
+    legacy_box_block,
+    legacy_omitted_count,
+    legacy_terms,
+    preserve_rich_fields,
+    validate_terms,
+)
 from app.pipeline import Pipeline, PipelineError, Segment
 from app.rooms import RoomBook, RoomIdError, validate_room_id, validate_session_id
 from app.settings import Settings, fill_process_environ
@@ -44,6 +53,26 @@ class GlossaryRejected(Exception):
     def __init__(self, accepted: list, rejected: list) -> None:
         self.accepted = accepted
         self.rejected = rejected
+
+
+def _legacy_source_lines(rows: list[dict], rejected: list[dict]) -> list[dict]:
+    """validate_terms counts terms. The textarea also counts comments and blank lines."""
+    mapped = []
+    for item in rejected:
+        if not isinstance(item, dict):
+            mapped.append(item)
+            continue
+        line = item.get("line")
+        source = None
+        if isinstance(line, int) and not isinstance(line, bool) and 1 <= line <= len(rows):
+            candidate = rows[line - 1].get("line")
+            if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate > 0:
+                source = candidate
+        if source is None:
+            mapped.append(item)
+        else:
+            mapped.append({**item, "line": source})
+    return mapped
 
 
 def _glossary_conflict(version: int) -> JSONResponse:
@@ -401,6 +430,13 @@ def _public_result(done: Segment) -> JSONResponse:
     detail = utf8_text(done.error) if isinstance(done.error, str) else ""
     body["detail"] = detail or body.get("error") or ""
     return JSONResponse(status_code=code, content=body)
+
+
+def host_segment_payload(segment: Segment, *, ok: bool) -> dict:
+    """Scrub a host segment response. A lone surrogate in zh must not become a 500."""
+    body = scrub_caption(segment.public())
+    body["ok"] = bool(ok)
+    return body
 
 
 def create_app(settings: Settings | None = None, asr=None, translator: Translator | None = None, decoder=None) -> FastAPI:
@@ -951,7 +987,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         if book.get(room_id) is None:
             ensure_room(room_id)
         segment = pipeline.mark_missing(room_id, session_id, seq, str(body.get("reason") or "主持端放棄這段"))
-        return {"ok": True, **segment.public()}
+        return host_segment_payload(segment, ok=True)
 
     @app.post("/api/segment/cancel")
     async def segment_cancel(request: Request) -> dict:
@@ -966,7 +1002,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             segment = pipeline.request_cancel(room_id, session_id, seq)
         except PipelineError as exc:
             raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
-        return {"ok": segment.status == "cancelled", **segment.public()}
+        return host_segment_payload(segment, ok=segment.status == "cancelled")
 
     @app.post("/api/segment/retranslate")
     async def retranslate(request: Request) -> dict:
@@ -980,7 +1016,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             segment = await pipeline.retranslate(room_id, session_id, seq, zh if isinstance(zh, str) else None)
         except PipelineError as exc:
             raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
-        return {"ok": segment.status != "error", **segment.public()}
+        return host_segment_payload(segment, ok=segment.status != "error")
 
     def _glossary_body(view: dict, *, accepted=None, rejected=None) -> dict:
         payload = {
@@ -1002,20 +1038,28 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         terms: list,
         expected_version: int | None = None,
         preserve_rich: bool = False,
-    ) -> dict:
+    ) -> tuple[dict, int]:
         """Persist first. Memory changes only after the database accepts this version.
 
         `expected_version=None` means the legacy client, which does not send if_version:
         the version read under the lock is the one written against.
-        `preserve_rich` keeps PUT lock, note, category, and omitted aliases for a
-        canonical term that is still in the new text.
+        `preserve_rich` is the textarea path. Under this lock, a stored glossary
+        longer than the textarea cap, or one with lock, note, category, or aliases,
+        is refused and nothing is written. Otherwise omitted terms are dropped and
+        counted, and PUT fields stay on terms the new text still names.
         """
         async with _glossary_lock(room_id):
             current = pipeline.room_glossary_version(room_id)
             if expected_version is not None and int(expected_version) != current:
                 raise GlossaryConflict(current)
+            deleted = 0
             if preserve_rich:
-                merged = preserve_rich_fields(pipeline.room_glossary_view(room_id)["terms"], terms)
+                prior = pipeline.room_glossary_view(room_id)["terms"]
+                reason = legacy_box_block(prior)
+                if reason:
+                    raise GlossaryRejected([], [{"line": 0, "reason": reason}])
+                deleted = legacy_omitted_count(prior, terms)
+                merged = preserve_rich_fields(prior, terms)
                 accepted, rejected = validate_terms(merged)
                 if rejected or not accepted:
                     if not rejected:
@@ -1050,7 +1094,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 "terms": terms,
                 "updated_at": updated_at,
             })
-            return pipeline.room_glossary_view(room_id)
+            return pipeline.room_glossary_view(room_id), deleted
 
     @app.get("/api/rooms/{room_id}/glossary")
     async def get_room_glossary(room_id: str, request: Request) -> dict:
@@ -1071,7 +1115,8 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         raw = await _read_capped(request, GLOSSARY_MAX_BODY)
         try:
             body = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+            # An integer past the conversion limit is ValueError, not JSONDecodeError.
             raise HTTPException(status_code=400, detail="需要 JSON") from exc
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail="需要 JSON 物件")
@@ -1096,7 +1141,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 content={"ok": False, "accepted": accepted, "rejected": rejected},
             )
         try:
-            view = await _save_room_glossary(room_id, accepted, expected_version=int(body["if_version"]))
+            view, _deleted = await _save_room_glossary(room_id, accepted, expected_version=int(body["if_version"]))
         except GlossaryConflict as exc:
             return _glossary_conflict(exc.version)
         return _glossary_body(view, accepted=accepted, rejected=[])
@@ -1107,7 +1152,8 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         raw = await _read_capped(request, GLOSSARY_MAX_BODY)
         try:
             body = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+            # An integer past the conversion limit is ValueError, not JSONDecodeError.
             raise HTTPException(status_code=400, detail="需要 JSON") from exc
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail="需要 JSON 物件")
@@ -1153,7 +1199,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                     "rejected": [{"line": 0, "reason": "text 必須是文字"}],
                 },
             )
-        rows, problems = strict_legacy_rows(text)
+        rows, problems = strict_legacy_rows(text, limit=LEGACY_BOX_LIMIT)
         if problems:
             return JSONResponse(
                 status_code=400,
@@ -1165,14 +1211,19 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 rejected = [{"line": 0, "reason": "沒有有效的術語，不會清空這個房間的詞表"}]
             return JSONResponse(
                 status_code=400,
-                content={"ok": False, "count": 0, "accepted": accepted, "rejected": rejected},
+                content={"ok": False, "count": 0, "accepted": accepted, "rejected": _legacy_source_lines(rows, rejected)},
             )
         try:
-            await _save_room_glossary(room_id, accepted, expected_version=expected, preserve_rich=True)
+            _view, deleted = await _save_room_glossary(room_id, accepted, expected_version=expected, preserve_rich=True)
         except GlossaryRejected as exc:
             return JSONResponse(
                 status_code=400,
-                content={"ok": False, "count": 0, "accepted": exc.accepted, "rejected": exc.rejected},
+                content={
+                    "ok": False,
+                    "count": 0,
+                    "accepted": exc.accepted,
+                    "rejected": _legacy_source_lines(rows, exc.rejected),
+                },
             )
         except GlossaryConflict as exc:
             return JSONResponse(
@@ -1184,7 +1235,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                     "rejected": [{"line": 0, "reason": "術語表版本不符"}],
                 },
             )
-        return {"ok": True, "count": len(accepted)}
+        return {"ok": True, "count": len(_view["terms"]), "deleted": deleted}
 
     @app.post("/api/share-host")
     async def set_share_host(request: Request) -> dict:

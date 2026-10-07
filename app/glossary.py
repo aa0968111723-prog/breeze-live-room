@@ -11,6 +11,8 @@ import unicodedata
 
 SCHEMA_VERSION = 1
 MAX_TERMS = 200
+# The host textarea still refuses more than this many lines. Raising it waits on a product decision.
+LEGACY_BOX_LIMIT = 40
 MAX_ALIASES = 8
 MIN_ZH = 1
 MAX_ZH = 20
@@ -105,6 +107,8 @@ def preserve_rich_fields(existing, incoming: list[dict]) -> list[dict]:
     The canonical term is `zh`. A term still present in the new text keeps the fields
     the host set with PUT. Aliases typed on the legacy line replace the stored ones.
     An omitted alias list does not wipe them. Terms absent from the new text are dropped.
+    The legacy HTTP path calls this only when the stored glossary fits the textarea.
+    A longer table, or one with lock, note, category, or aliases, is refused first.
     """
     prior: dict[str, dict] = {}
     for term in existing or []:
@@ -147,6 +151,57 @@ def legacy_terms(rows: list[dict]) -> list[dict]:
             "note": "",
         })
     return terms
+
+
+def legacy_box_block(terms) -> str:
+    """Why the textarea must not replace this glossary. Empty when the box may edit it.
+
+    Lock off, a note, a category, or any alias cannot be shown in `zh|alias=en`,
+    and more than LEGACY_BOX_LIMIT rows cannot be shown either. Refusing the post
+    is what stops one visible line from deleting the rest.
+    """
+    rows = list(terms or [])
+    advanced = False
+    for term in rows:
+        if not isinstance(term, dict):
+            continue
+        if not is_locked(term):
+            advanced = True
+        if str(term.get("note") or "").strip():
+            advanced = True
+        if str(term.get("category") or "").strip():
+            advanced = True
+        aliases = term.get("aliases") or []
+        if isinstance(aliases, list) and any(str(alias or "").strip() for alias in aliases):
+            advanced = True
+    count = len(rows)
+    if count > LEGACY_BOX_LIMIT and advanced:
+        return f"這個房間的術語表有 {count} 條／含進階欄位，請用術語表編輯器修改"
+    if count > LEGACY_BOX_LIMIT:
+        return f"這個房間的術語表有 {count} 條，請用術語表編輯器修改"
+    if advanced:
+        return "這個房間的術語表含進階欄位，請用術語表編輯器修改"
+    return ""
+
+
+def legacy_omitted_count(existing, incoming) -> int:
+    """How many stored canonical terms the new legacy text does not mention."""
+    kept: set[str] = set()
+    for term in incoming or []:
+        if isinstance(term, dict) and isinstance(term.get("zh"), str) and term["zh"]:
+            kept.add(term["zh"])
+    omitted = 0
+    seen: set[str] = set()
+    for term in existing or []:
+        if not isinstance(term, dict):
+            continue
+        zh = term.get("zh")
+        if not isinstance(zh, str) or not zh or zh in seen:
+            continue
+        seen.add(zh)
+        if zh not in kept:
+            omitted += 1
+    return omitted
 
 
 def validate_terms(raw) -> tuple[list[dict], list[dict]]:

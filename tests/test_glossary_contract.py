@@ -226,17 +226,18 @@ async def test_legacy_post_does_not_store_terms_put_would_reject(tmp_path):
             assert round_trip.status_code == 200, round_trip.text
             replaced = await client.post(
                 "/api/glossary",
-                json={"room_id": "class", "session_id": "s", "text": "般若=prajna\n"},
+                json={"room_id": "class", "session_id": "s", "text": "般若=prajna\n", "if_version": 2},
                 headers={**auth(token), "content-type": "application/json"},
             )
-            assert replaced.status_code == 200, replaced.text
-            assert replaced.json() == {"ok": True, "count": 1}
+            assert replaced.status_code in (400, 409), replaced.text
+            assert replaced.json()["ok"] is False
             current = (await _get(client, token, "class")).json()
-            assert current["version"] == 3
-            assert current["terms"][0]["zh"] == "般若"
+            assert current["version"] == 2
+            assert current["terms"][0]["zh"] == "禪學社"
+            assert current["terms"][0]["aliases"] == ["柴學社"]
             stale = await _put(client, token, "class", [_term("空性", en="emptiness")], 1)
             assert stale.status_code == 409
-            assert (await _get(client, token, "class")).json()["terms"][0]["zh"] == "般若"
+            assert (await _get(client, token, "class")).json()["terms"][0]["zh"] == "禪學社"
     finally:
         await stop(app)
 

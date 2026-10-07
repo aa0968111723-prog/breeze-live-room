@@ -72,10 +72,13 @@ class _Body:
         return False
 
 
-def _translate(content: str, zh: str = "你好", glossary=None):
+def _translate(content: str, zh: str = "你好", glossary=None, finish_reason=None):
     seen = {}
+    choice = {"message": {"content": content}}
+    if finish_reason is not None:
+        choice["finish_reason"] = finish_reason
     raw = json.dumps({
-        "choices": [{"message": {"content": content}}],
+        "choices": [choice],
         "usage": {"prompt_tokens": 3, "completion_tokens": 2},
     }).encode()
 
@@ -202,19 +205,24 @@ def test_fullwidth_match_does_not_change_the_source_string():
 
 def test_line_separator_is_rejected_on_every_term_field():
     base = {"zh": "般若", "en": "prajna", "aliases": [], "category": "", "note": ""}
-    for field, value in (
-        ("zh", "般\u2028若"),
-        ("en", "pra\u2029jna"),
-        ("aliases", ["般\u2028若"]),
-        ("category", "社\u2028團"),
-        ("note", "備\u2029註"),
-    ):
-        item = dict(base)
-        item[field] = value
-        accepted, rejected = validate_terms([item])
-        assert accepted == [], field
-        assert rejected, field
-        assert any("控制" in entry["reason"] or "換行" in entry["reason"] for entry in rejected)
+    # Zl/Zp, Cf, Co, Cn, and Cs. A lone surrogate is Cs and must not be stored.
+    marks = ("\u2028", "\u2029", "\u202e", "\ue000", "\u0378", "\ud800")
+    samples = {
+        "zh": lambda mark: f"般{mark}若",
+        "en": lambda mark: f"pra{mark}jna",
+        "aliases": lambda mark: [f"般{mark}若"],
+        "category": lambda mark: f"社{mark}團",
+        "note": lambda mark: f"備{mark}註",
+    }
+    for field, paint in samples.items():
+        for mark in marks:
+            item = dict(base)
+            item["aliases"] = []
+            item[field] = paint(mark)
+            accepted, rejected = validate_terms([item])
+            assert accepted == [], (field, hex(ord(mark)))
+            assert rejected, (field, hex(ord(mark)))
+            assert any("控制" in entry["reason"] or "換行" in entry["reason"] for entry in rejected)
 
 
 def test_han_inside_a_hit_term_is_allowed_and_other_han_is_not():
@@ -340,24 +348,23 @@ async def test_t_leg2_legacy_post_ignores_session_and_rejects_a_stale_version():
             assert kept["terms"][0]["lock"] is False
             assert kept["terms"][0]["note"] == "主持人備註"
             assert kept["terms"][0]["category"] == "社團"
-            # The textarea omits aliases. PUT lock, note, category, and aliases stay.
+            # Aliases, an unlocked term, a note, or a category cannot be edited from the box.
             replaced = await _post(
                 client, token, "class", "禪學社=Zen Club\n般若=prajna", session_id="another-session",
+                if_version=1,
             )
-            assert replaced.status_code == 200, replaced.text
-            assert replaced.json() == {"ok": True, "count": 2}
+            assert replaced.status_code in (400, 409), replaced.text
+            assert replaced.json()["ok"] is False
+            assert any("進階" in item["reason"] or "編輯器" in item["reason"] for item in replaced.json()["rejected"])
             current = (await _get(client, token, "class")).json()
-            assert current["version"] == 2
-            by_zh = {item["zh"]: item for item in current["terms"]}
-            assert set(by_zh) == {"禪學社", "般若"}
-            assert by_zh["禪學社"]["en"] == "Zen Club"
-            assert by_zh["禪學社"]["aliases"] == ["柴學社"]
-            assert by_zh["禪學社"]["lock"] is False
-            assert by_zh["禪學社"]["note"] == "主持人備註"
-            assert by_zh["禪學社"]["category"] == "社團"
-            assert by_zh["般若"]["aliases"] == []
-            assert by_zh["般若"]["note"] == ""
-            assert by_zh["般若"]["lock"] is True
+            assert current["version"] == 1
+            term = current["terms"][0]
+            assert term["zh"] == "禪學社"
+            assert term["en"] == "Zen Club"
+            assert term["aliases"] == ["柴學社"]
+            assert term["lock"] is False
+            assert term["note"] == "主持人備註"
+            assert term["category"] == "社團"
             side = (await _get(client, token, "other-room")).json()
             assert side["terms"] == []
     finally:
@@ -646,21 +653,23 @@ async def test_legacy_post_keeps_put_fields_when_the_line_repeats_the_term():
             )
             assert saved.status_code == 200, saved.text
             edited = await _post(client, token, "class", "禪學社=Zen Society", if_version=1)
-            assert edited.status_code == 200, edited.text
+            assert edited.status_code in (400, 409), edited.text
             view = (await _get(client, token, "class")).json()
             term = view["terms"][0]
-            assert term["en"] == "Zen Society"
+            assert view["version"] == 1
+            assert term["en"] == "Zen Club"
             assert term["aliases"] == ["柴學社"]
             assert term["lock"] is False
             assert term["note"] == "主持人備註"
             assert term["category"] == "社團"
             typed = await _post(client, token, "class", "禪學社|新別名=Zen Society", if_version=view["version"])
-            assert typed.status_code == 200, typed.text
+            assert typed.status_code in (400, 409), typed.text
             renamed = (await _get(client, token, "class")).json()["terms"][0]
-            assert renamed["aliases"] == ["新別名"]
+            assert renamed["aliases"] == ["柴學社"]
             assert renamed["note"] == "主持人備註"
             assert renamed["lock"] is False
-            # Restoring the stored alias 柴學社 would collide with a new canonical term.
+            assert renamed["en"] == "Zen Club"
+            # A stored alias makes the textarea read-only, so the post cannot delete it or collide.
             clash_saved = await _put(
                 client, token, "side",
                 [_term("禪學社", ["柴學社"], en="Zen Club", lock=True)],
@@ -673,11 +682,269 @@ async def test_legacy_post_keeps_put_fields_when_the_line_repeats_the_term():
                 "禪學社=Zen Club\n柴學社=other",
                 if_version=side_version,
             )
-            assert clash.status_code == 400, clash.text
-            assert any("柴學社" in item["reason"] for item in clash.json()["rejected"])
+            assert clash.status_code in (400, 409), clash.text
+            assert any("進階" in item["reason"] or "編輯器" in item["reason"] for item in clash.json()["rejected"])
             after = (await _get(client, token, "side")).json()
             assert after["version"] == side_version
             assert after["terms"][0]["aliases"] == ["柴學社"]
             assert after["terms"][0]["zh"] == "禪學社"
     finally:
+        await stop(app)
+
+
+def test_content_filter_is_a_failed_translation_even_with_text():
+    full = "We begin the Dharma talk in full."
+    half = "We begin the Dharma talk and"
+    ok, _seen = _translate(full)
+    assert ok.status == "ok"
+    assert ok.text == full
+    kept, _seen = _translate(half)
+    assert kept.status == "ok"
+    assert kept.text == half
+    for content in (full, half, "", "   ", None):
+        result, _seen = _translate(content, finish_reason="content_filter")
+        assert result.status == "bad_response", content
+        assert result.text == ""
+        assert "過濾" in result.detail
+        if isinstance(content, str) and content.strip():
+            assert content not in result.detail
+
+
+def test_public_result_scrubs_a_lone_surrogate():
+    from app.pipeline import Segment
+    from app.server import _public_result, host_segment_payload
+
+    done = Segment(
+        room_id="class",
+        session_id="s",
+        seq=1,
+        zh="甲\ud800乙",
+        zh_raw="甲\ud800乙",
+        en="Hel\ud800lo",
+        status="ready",
+        translate_status="ok",
+    )
+    resp = _public_result(done)
+    assert resp.status_code == 200
+    raw = resp.body.decode("utf-8")
+    assert "\ud800" not in raw
+    body = json.loads(raw)
+    assert body["zh"] == "甲乙"
+    assert body["zh_raw"] == "甲乙"
+    assert body["en"] == ""
+    assert body["ok"] is True
+    cancelled = Segment(room_id="class", session_id="s", seq=2, zh="甲\ud800乙", status="transcribing")
+    payload = host_segment_payload(cancelled, ok=cancelled.status == "cancelled")
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    assert "\ud800" not in encoded.decode("utf-8")
+    assert payload["zh"] == "甲乙"
+    assert payload["ok"] is False
+
+
+@pytest.mark.anyio
+async def test_l7_editable_legacy_deletes_omitted_terms_and_reports_the_count():
+    app = app_for(settings=_settings(), translator=Translator(enabled=False))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            saved = await _put(
+                client, token, "class",
+                [_term("般若", en="prajna"), _term("空性", en="emptiness")],
+                0,
+            )
+            assert saved.status_code == 200, saved.text
+            posted = await _post(
+                client, token, "class", "般若=prajna", session_id="other-session", if_version=1,
+            )
+            assert posted.status_code == 200, posted.text
+            assert posted.json() == {"ok": True, "count": 1, "deleted": 1}
+            view = (await _get(client, token, "class")).json()
+            assert view["version"] == 2
+            assert [item["zh"] for item in view["terms"]] == ["般若"]
+            assert view["terms"][0]["en"] == "prajna"
+            assert view["terms"][0]["lock"] is True
+            side = (await _get(client, token, "other-room")).json()
+            assert side["terms"] == []
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_l7_advanced_glossary_legacy_post_does_not_delete():
+    app = app_for(settings=_settings(), translator=Translator(enabled=False))
+    cases = (
+        ("alias", {**_term("禪學社", ["柴學社"], en="Zen Club")}),
+        ("lock", _term("禪學社", en="Zen Club", lock=False)),
+        ("note", {**_term("禪學社", en="Zen Club"), "note": "主持人備註"}),
+        ("category", {**_term("禪學社", en="Zen Club"), "category": "社團"}),
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            for room, term in cases:
+                saved = await _put(client, token, room, [term], 0)
+                assert saved.status_code == 200, (room, saved.text)
+                posted = await _post(client, token, room, "般若=prajna", if_version=1)
+                assert posted.status_code in (400, 409), (room, posted.text)
+                assert any(
+                    "進階" in item["reason"] or "編輯器" in item["reason"]
+                    for item in posted.json()["rejected"]
+                )
+                view = (await _get(client, token, room)).json()
+                assert view["version"] == 1, room
+                assert view["terms"][0]["zh"] == "禪學社"
+                assert view["terms"][0]["en"] == term["en"]
+                assert view["terms"][0]["aliases"] == term["aliases"]
+                assert view["terms"][0]["lock"] is term["lock"]
+                assert view["terms"][0]["note"] == term["note"]
+                assert view["terms"][0]["category"] == term["category"]
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_legacy_box_cannot_shrink_a_large_glossary_and_a_stale_page_is_409():
+    app = app_for(settings=_settings(), translator=Translator(enabled=False))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            forty = [_term(f"詞{i:02d}", en=f"e{i}") for i in range(40)]
+            fit = await _put(client, token, "fit", forty, 0)
+            assert fit.status_code == 200, fit.text
+            same = "\n".join(f"詞{i:02d}=e{i}" for i in range(40))
+            kept = await _post(client, token, "fit", same, if_version=1)
+            assert kept.status_code == 200, kept.text
+            assert kept.json()["count"] == 40
+            assert kept.json()["deleted"] == 0
+            huge = [_term(f"詞{i:03d}", en=f"e{i}") for i in range(200)]
+            saved = await _put(client, token, "class", huge, 0)
+            assert saved.status_code == 200, saved.text
+            stale = await _post(client, token, "class", "般若=prajna", if_version=0)
+            assert stale.status_code == 409, stale.text
+            shrunk = await _post(client, token, "class", "般若=prajna", if_version=1)
+            assert shrunk.status_code == 400, shrunk.text
+            assert any("200" in item["reason"] and "編輯器" in item["reason"] for item in shrunk.json()["rejected"])
+            view = (await _get(client, token, "class")).json()
+            assert view["version"] == 1
+            assert len(view["terms"]) == 200
+            assert view["terms"][0]["zh"] == "詞000"
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_legacy_errors_use_textarea_lines_and_reject_empty_aliases():
+    app = app_for(settings=_settings(), translator=Translator(enabled=False))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            saved = await _put(client, token, "class", [_term("空性", en="emptiness")], 0)
+            assert saved.status_code == 200, saved.text
+            posted = await _post(client, token, "class", "# 註解\n\n般若|開始=prajna")
+            assert posted.status_code == 400, posted.text
+            assert any(item["line"] == 3 and "常用詞" in item["reason"] for item in posted.json()["rejected"])
+            simplified = await _post(client, token, "class", "# 註解\n\n禅学社=Zen Club")
+            assert simplified.status_code == 400, simplified.text
+            assert any(item["line"] == 3 and "繁體" in item["reason"] for item in simplified.json()["rejected"])
+            for text in ("般若||=prajna", "般若| |=prajna", "般若|\u3000=prajna"):
+                empty = await _post(client, token, "class", text)
+                assert empty.status_code == 400, (text, empty.text)
+                assert any(
+                    item["line"] == 1 and "別名是空的" in item["reason"] for item in empty.json()["rejected"]
+                ), empty.text
+            zwsp = await _post(client, token, "class", "般若|\u200b乙=prajna")
+            assert zwsp.status_code == 400, zwsp.text
+            assert any("控制" in item["reason"] for item in zwsp.json()["rejected"])
+            view = (await _get(client, token, "class")).json()
+            assert view["version"] == 1
+            assert [item["zh"] for item in view["terms"]] == ["空性"]
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_huge_if_version_is_400_not_500():
+    app = app_for(settings=_settings(), translator=Translator(enabled=False))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            saved = await _put(client, token, "class", [_term("般若", en="prajna")], 0)
+            assert saved.status_code == 200, saved.text
+            digits = "9" * 5000
+            headers = {**auth(token), "content-type": "application/json"}
+            put = await client.put(
+                "/api/rooms/class/glossary",
+                content=('{"if_version":' + digits + ',"terms":[]}').encode(),
+                headers=headers,
+            )
+            assert put.status_code == 400, put.text
+            assert digits not in put.text
+            assert put.json()["detail"] == "需要 JSON"
+            posted = await client.post(
+                "/api/glossary",
+                content=(
+                    '{"room_id":"class","session_id":"s","text":"空性=emptiness","if_version":'
+                    + digits
+                    + "}"
+                ).encode(),
+                headers=headers,
+            )
+            assert posted.status_code == 400, posted.text
+            assert digits not in posted.text
+            assert posted.json()["detail"] == "需要 JSON"
+            view = (await _get(client, token, "class")).json()
+            assert view["version"] == 1
+            assert [item["zh"] for item in view["terms"]] == ["般若"]
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_retranslate_and_cancel_scrub_a_lone_surrogate():
+    import threading
+
+    from tests.test_round2 import EchoAsr
+
+    gate = {"started": threading.Event(), "release": threading.Event()}
+    app = app_for(settings=_settings(), asr=EchoAsr(gate=gate), translator=Translator(enabled=False))
+    pushed = None
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await open_room(client, token, "class")
+            headers = {**auth(token), "content-type": "application/json"}
+            pushed = asyncio.create_task(
+                push(client, token, "class", "s", 1, "今天開示".encode(), t0_ms=0, t1_ms=1000)
+            )
+            assert await asyncio.to_thread(gate["started"].wait, 5)
+            segment = app.state.pipeline.results[("class", "s", 1)]
+            segment.zh = "甲\ud800乙"
+            segment.zh_raw = "甲\ud800乙"
+            cancelled = await client.post(
+                "/api/segment/cancel",
+                json={"room_id": "class", "session_id": "s", "seq": 1},
+                headers=headers,
+            )
+            assert cancelled.status_code == 200, cancelled.text
+            assert "\ud800" not in cancelled.text
+            assert cancelled.json()["zh"] == "甲乙"
+            assert cancelled.json()["zh_raw"] == "甲乙"
+            gate["release"].set()
+            first = await pushed
+            pushed = None
+            assert first.status_code == 409, first.text
+            assert "\ud800" not in first.text
+            second = await push(client, token, "class", "s", 2, "今天開示".encode(), t0_ms=1000, t1_ms=2000)
+            assert second.status_code == 200, second.text
+            raw = json.dumps(
+                {"room_id": "class", "session_id": "s", "seq": 2, "zh": "丙丁"}
+            ).encode().replace(b"\\u4e19\\u4e01", b"\\u4e19\\ud800\\u4e01")
+            edited = await client.post("/api/segment/retranslate", content=raw, headers=headers)
+            assert edited.status_code == 200, edited.text
+            assert "\ud800" not in edited.text
+            assert edited.json()["zh"] == "丙丁"
+    finally:
+        gate["release"].set()
+        if pushed is not None and not pushed.done():
+            pushed.cancel()
         await stop(app)

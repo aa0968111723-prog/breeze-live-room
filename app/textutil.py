@@ -141,9 +141,10 @@ def strict_legacy_rows(raw: str, limit: int = 40, max_en: int = 80) -> tuple[lis
     """Parse a host textarea without dropping rows or cutting English short.
 
     A non-blank line that is not `zh=en` is rejected. Any rejected entry means the
-    caller must not save. Blank lines and `#` comments are ignored. An empty box
-    is rejected so it cannot clear the room. `parse_glossary` still truncates for
-    old callers.
+    caller must not save. Blank lines and `#` comments are ignored, but they still
+    count toward the line number on each accepted row. An empty alias fragment is
+    rejected, same as PUT. An empty box is rejected so it cannot clear the room.
+    `parse_glossary` still truncates for old callers.
     """
     if not isinstance(raw, str):
         return [], [{"line": 0, "reason": "text 必須是文字"}]
@@ -162,22 +163,33 @@ def strict_legacy_rows(raw: str, limit: int = 40, max_en: int = 80) -> tuple[lis
             continue
         left, right = split
         en = right.strip()
+        line_bad = False
         if "|" in left:
             parts = [part.strip() for part in left.split("|")]
             zh = parts[0].strip()
-            aliases = [part for part in parts[1:] if part]
+            aliases = []
+            for part in parts[1:]:
+                # Whitespace-only, including a fullwidth space, is an empty alias.
+                # A zero-width character is not stripped; validation rejects it later.
+                if not part:
+                    rejected.append({"line": line_no, "reason": "別名是空的，不能當別名"})
+                    line_bad = True
+                    continue
+                aliases.append(part)
         else:
             zh = left.strip()
             aliases = []
         if not zh or not en:
             rejected.append({"line": line_no, "reason": "中文或英文是空的"})
+            line_bad = True
+        if line_bad:
             continue
         if len(rows) >= limit:
             return [], [{"line": line_no, "reason": f"術語超過 {limit} 條"}]
         if len(en) > max_en:
             rejected.append({"line": line_no, "reason": f"第 {line_no} 行的英文超過 {max_en} 字"})
             continue
-        row = {"zh": zh, "en": en}
+        row = {"zh": zh, "en": en, "line": line_no}
         if aliases:
             row["aliases"] = aliases
         rows.append(row)
