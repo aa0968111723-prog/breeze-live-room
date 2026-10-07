@@ -208,6 +208,13 @@ def test_host_metrics_line_keeps_existing_labels_and_adds_rtf():
     assert "最近 200 段" in text
     assert "（低於 0.9 才跟得上）" in text
     assert "狀態：" in text
+    assert "｜辨識速度：" in text
+    assert "（數字暫停更新）" in text
+    assert "setInterval(refreshMetrics, 2000)" in text
+    stale = re.search(r"#rtf-speed\.speed-stale\s*\{([^}]+)\}", text)
+    assert stale, "stale metrics need a visible indicator that does not replace the status colour"
+    assert "outline" in stale.group(1)
+    assert re.search(r"(?:^|;)\s*color\s*:", stale.group(1)) is None
     for word in ("跟得上", "接近上限", "跟不上，字幕會延遲"):
         assert word in text
 
@@ -545,39 +552,73 @@ def _extract_function(source: str, name: str) -> str:
     raise AssertionError(name)
 
 
+def _node_bin() -> str:
+    found = shutil.which("node")
+    if found:
+        return found
+    candidate = Path("/workspace/zen-bridge-qa/node22/bin/node")
+    if candidate.is_file():
+        return str(candidate)
+    pytest.skip("node is not installed")
+
+
 def test_host_speed_line_wording_for_each_band():
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("node is not installed")
+    node = _node_bin()
     source = Path("app/static/host.html").read_text(encoding="utf-8")
     function = _extract_function(source, "recognitionSpeedView")
+    failure = _extract_function(source, "noteMetricsFailure")
+    listening = {"roomId": "class", "sessionId": "live"}
+    empty = "辨識速度：開始聽之後才有數字"
 
-    def sample(p50, p95, count=4, limit=200):
-        return {"rtf": {"window": {"count": count, "limit": limit, "rtf": {"p50": p50, "p95": p95}}}}
+    def sample(p50, p95, count=5, limit=200, session="live"):
+        return {
+            "rtf": {
+                "window": {"count": 200, "limit": limit, "rtf": {"p50": 9.9, "p95": 9.9}},
+                "sessions": [
+                    {
+                        "room_id": "class",
+                        "session_id": "previous",
+                        "count": 80,
+                        "recent": {"count": 80, "limit": 200, "rtf": {"p50": 0.99, "p95": 1.2}},
+                    },
+                    {
+                        "room_id": "class",
+                        "session_id": session,
+                        "count": max(count, 1),
+                        "limit": 4096,
+                        "recent": {"count": count, "limit": limit, "rtf": {"p50": p50, "p95": p95}},
+                    },
+                ],
+            }
+        }
 
-    def line(p50, p95, word, limit=200):
-        return f"辨識速度：一般 {p50:.2f}、最慢 {p95:.2f}（低於 0.9 才跟得上）。最近 {limit} 段。狀態：{word}"
+    def line(p50, p95, word, count=5):
+        return f"{word}｜辨識速度：一般 {p50:.2f}、最慢 {p95:.2f}（低於 0.9 才跟得上）。最近 {count} 段"
 
     cases = [
-        {"data": None, "text": "辨識速度：開始聽之後才有數字", "tone": "speed-empty"},
-        {"data": {}, "text": "辨識速度：開始聽之後才有數字", "tone": "speed-empty"},
-        {"data": sample(None, None, count=0), "text": "辨識速度：開始聽之後才有數字", "tone": "speed-empty"},
-        {"data": sample(0.42, 0.50), "text": line(0.42, 0.50, "跟得上"), "tone": "speed-ok", "absent": ["接近上限", "跟不上"]},
-        {"data": sample(0.69, 0.69), "text": line(0.69, 0.69, "跟得上"), "tone": "speed-ok", "absent": ["接近上限", "跟不上"]},
-        {"data": sample(0.70, 0.70), "text": line(0.70, 0.70, "接近上限"), "tone": "speed-warn", "absent": ["跟不上"]},
-        {"data": sample(0.80, 0.89), "text": line(0.80, 0.89, "接近上限"), "tone": "speed-warn", "absent": ["跟不上"]},
-        {"data": sample(0.90, 0.90), "text": line(0.90, 0.90, "跟不上，字幕會延遲"), "tone": "speed-bad"},
-        {"data": sample(1.20, 1.40), "text": line(1.20, 1.40, "跟不上，字幕會延遲"), "tone": "speed-bad"},
+        {"data": None, "listening": listening, "text": empty, "tone": "speed-empty"},
+        {"data": {}, "listening": listening, "text": empty, "tone": "speed-empty"},
+        {"data": sample(None, None, count=0), "listening": listening, "text": empty, "tone": "speed-empty"},
+        {"data": sample(0.42, 0.50), "listening": None, "text": empty, "tone": "speed-empty", "absent": ["0.42", "0.99"]},
+        {"data": sample(0.42, 0.50), "listening": {"roomId": "class", "sessionId": "brand-new"}, "text": empty, "tone": "speed-empty", "absent": ["0.42", "0.99", "1.20"]},
+        {"data": sample(0.42, 0.50), "listening": listening, "text": line(0.42, 0.50, "跟得上"), "tone": "speed-ok", "absent": ["接近上限", "跟不上", "最近 200"]},
+        {"data": sample(0.69, 0.69), "listening": listening, "text": line(0.69, 0.69, "跟得上"), "tone": "speed-ok", "absent": ["接近上限", "跟不上"]},
+        {"data": sample(0.70, 0.70), "listening": listening, "text": line(0.70, 0.70, "接近上限"), "tone": "speed-warn", "absent": ["跟不上"]},
+        {"data": sample(0.80, 0.89), "listening": listening, "text": line(0.80, 0.89, "接近上限"), "tone": "speed-warn", "absent": ["跟不上"]},
+        {"data": sample(0.90, 0.90), "listening": listening, "text": line(0.90, 0.90, "跟不上，字幕會延遲"), "tone": "speed-bad"},
+        {"data": sample(1.20, 1.40), "listening": listening, "text": line(1.20, 1.40, "跟不上，字幕會延遲"), "tone": "speed-bad"},
+        {"data": sample(0.40, 0.55, count=200), "listening": listening, "text": line(0.40, 0.55, "跟得上", 200), "tone": "speed-ok"},
     ]
-    script = function + """
+    script = function + failure + """
 const cases = JSON.parse(process.argv[1]);
 let failed = 0;
 for (const item of cases) {
-  const view = recognitionSpeedView(item.data);
+  const view = recognitionSpeedView(item.data, item.listening);
   const problems = [];
   if (view.text !== item.text) problems.push("text " + JSON.stringify(view.text));
   if (view.tone !== item.tone) problems.push("tone " + view.tone);
   if (!String(view.title).includes("最近 200 段")) problems.push("title");
+  if (!String(view.title).includes("上一場")) problems.push("title session");
   for (const word of item.absent || []) {
     if (view.text.includes(word)) problems.push("unexpected " + word);
   }
@@ -585,6 +626,29 @@ for (const item of cases) {
     console.log(JSON.stringify(item.text), problems.join("; "));
     failed++;
   }
+}
+const speed = {
+  textContent: "跟得上｜辨識速度：一般 0.42、最慢 0.50（低於 0.9 才跟得上）。最近 5 段",
+  classList: { added: [], add(name) { if (!this.added.includes(name)) this.added.push(name); } },
+};
+noteMetricsFailure(speed);
+if (!speed.classList.added.includes("speed-stale")) {
+  console.log("missing stale class");
+  failed++;
+}
+if (!speed.textContent.includes("跟得上")) {
+  console.log("status word dropped");
+  failed++;
+}
+if (!speed.textContent.includes("（數字暫停更新）")) {
+  console.log("missing stale mark");
+  failed++;
+}
+noteMetricsFailure(speed);
+const marks = speed.textContent.split("（數字暫停更新）").length - 1;
+if (marks !== 1) {
+  console.log("stale mark repeated " + marks);
+  failed++;
 }
 if (failed) process.exit(1);
 """
@@ -596,8 +660,6 @@ if (failed) process.exit(1);
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-
-
 
 
 class TimeoutAsr:
