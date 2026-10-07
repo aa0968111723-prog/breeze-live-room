@@ -432,4 +432,61 @@ async function testStaleNudgeReconnectsFromLastMessageTime() {
   await conn.done;
 }
 await testStaleNudgeReconnectsFromLastMessageTime();
+
+async function testExpiredCaptionIsRemovedAndCanBeShownAgain() {
+  const view = createCaptionView();
+  view.apply({ id: "class:s:1", session_id: "s", seq: 1, version: 2, zh: "舊" });
+  view.apply({ id: "class:s:2", session_id: "s", seq: 2, version: 1, zh: "留下" });
+  view.apply({ type: "captions_expired", room_id: "class", ids: ["class:s:1"] });
+  assert.equal(view.items.has("class:s:1"), false);
+  assert.equal(view.items.get("class:s:2").zh, "留下");
+  view.apply({ id: "class:s:1", session_id: "s", seq: 1, version: 1, zh: "再來" });
+  assert.equal(view.items.get("class:s:1").zh, "再來");
+
+  const events = [];
+  const removed = [];
+  const expired = [];
+  const sockets = [];
+  const conn = connectRoom({
+    room: "class",
+    url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
+    openSocket(address) {
+      const ws = fakeSocket(address);
+      sockets.push(ws);
+      return ws;
+    },
+    sleep: () => Promise.resolve(),
+    onState: () => {},
+    onEvent: (item) => events.push(item),
+    onDelete: (item) => removed.push(item),
+    onExpire: (item) => expired.push(item),
+  });
+  await tick();
+  sockets[0].onopen();
+  sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "hello",
+      latest_cursor: 2,
+      history: [
+        { id: "class:s:1", session_id: "s", seq: 1, version: 1, cursor: 1, zh: "舊" },
+        { id: "class:s:2", session_id: "s", seq: 2, version: 1, cursor: 2, zh: "留下" },
+      ],
+    }),
+  });
+  sockets[0].onmessage({
+    data: JSON.stringify({ type: "captions_expired", room_id: "class", ids: ["class:s:1"] }),
+  });
+  assert.equal(expired.length, 1);
+  assert.deepEqual(expired[0].ids, ["class:s:1"]);
+  assert.equal(removed.length, 1);
+  assert.equal(removed[0].id, "class:s:1");
+  assert.equal(events.filter((item) => item.type === "captions_expired").length, 0);
+  sockets[0].onmessage({
+    data: JSON.stringify({ id: "class:s:1", session_id: "s", seq: 1, version: 1, cursor: 3, zh: "再來" }),
+  });
+  assert.equal(events.filter((item) => item.zh === "再來").length, 1);
+  conn.stop();
+  await conn.done;
+}
+await testExpiredCaptionIsRemovedAndCanBeShownAgain();
 console.log("room client ok");

@@ -45,6 +45,12 @@ export function createCaptionView(limit = 80) {
       if (Number.isFinite(epoch)) epochFloor = Math.max(epochFloor, epoch);
       return;
     }
+    if (item.type === "captions_expired") {
+      const ids = Array.isArray(item.ids) ? item.ids : [];
+      for (const id of ids) items.delete(id);
+      if (item.id) items.delete(item.id);
+      return;
+    }
     const epoch = Number(item.epoch);
     if (Number.isFinite(epoch) && epochFloor && epoch < epochFloor) return;
     if (!item.id) return;
@@ -167,7 +173,7 @@ function stateManual(kind, attempt) {
 }
 
 export function connectRoom({
-  room, url, onState, onEvent, onGap, onDelete, onClear, onBackfill, onReset, onHost,
+  room, url, onState, onEvent, onGap, onDelete, onClear, onBackfill, onReset, onHost, onExpire,
   openSocket, sleep, now, staleMs, random, schedule, cancelSchedule, isForeground, network, watchEvery,
 }) {
   const versions = new Map();
@@ -283,6 +289,20 @@ export function connectRoom({
       versions.clear();
       if (data.epoch != null && Number.isFinite(Number(data.epoch))) seenEpoch = Number(data.epoch);
       if (onClear) onClear(data);
+      return;
+    }
+    if (data.type === "captions_expired") {
+      const ids = Array.isArray(data.ids) ? data.ids.slice() : [];
+      if (data.id && !ids.includes(data.id)) ids.push(data.id);
+      for (const id of ids) {
+        for (const key of [...versions.keys()]) {
+          if (key === id || key.endsWith(":" + id)) versions.delete(key);
+        }
+      }
+      if (onExpire) onExpire(data);
+      if (onDelete) {
+        for (const id of ids) onDelete({ type: "captions_expired", id, ids, room_id: data.room_id });
+      }
       return;
     }
     if (isCaption(data) && remember(data)) onEvent(data);

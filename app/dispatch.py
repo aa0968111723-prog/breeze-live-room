@@ -19,12 +19,12 @@ _PASS = (
 _LISTENER_PASS = (
     "type", "id", "room_id", "session_id", "session_ord", "seq", "version",
     "zh", "en", "status", "translate_status", "error", "t0_ms", "t1_ms",
-    "epoch", "cursor",
+    "epoch", "cursor", "ids",
 )
 _AUDIENCE_DENY = frozenset({
     "zh_raw", "host_token", "token", "listen_key", "listen_url", "authorization",
 })
-_CONTROL = {"caption_deleted", "captions_cleared"}
+_CONTROL = {"caption_deleted", "captions_cleared", "captions_expired"}
 
 
 def for_listener(event: dict) -> dict:
@@ -102,6 +102,11 @@ class RoomBus:
             return dict(stored)
         if kind == "caption_deleted":
             self._remove_id(room, seg_id)
+            return dict(stored)
+        if kind == "captions_expired":
+            # Tell listeners which lines aged out. Do not tombstone them: a later
+            # upload of the same seq is a new line, not a replay of a deleted one.
+            stored["ids"] = [str(item) for item in (event.get("ids") or []) if item]
             return dict(stored)
         self._remember_state(room, stored, raw_updated)
         rows = self.by_room.setdefault(room, [])
@@ -218,7 +223,10 @@ class RoomBus:
         removed: list[tuple[str, str]] = []
         for room, stamps in list(self._caption_at.items()):
             stale = [seg_id for seg_id, stamp in list(stamps.items()) if float(stamp) < cutoff]
+            versions = self._ver.get(room)
             for seg_id in stale:
+                if versions is not None:
+                    versions.pop(seg_id, None)
                 self._remove_id(room, seg_id)
                 removed.append((room, seg_id))
             if not self._state.get(room):

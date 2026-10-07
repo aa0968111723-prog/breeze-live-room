@@ -675,7 +675,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             if snap is None:
                 return None
             _fanout(snap)
-            if store.enabled and snap.get("id") and snap.get("type") not in {"captions_cleared", "caption_deleted"}:
+            if store.enabled and snap.get("id") and snap.get("type") not in {"captions_cleared", "caption_deleted", "captions_expired"}:
                 store.submit_save(snap)
             return snap
         except Exception:
@@ -726,10 +726,16 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
     def _expire_captions() -> None:
         # Each caption expires on its own updated time, including in an open room.
         # SQLite purge uses the same rule. An empty idle room then drops its runtime.
-        for room_id, seg_id in bus.prune_expired(settings.caption_ttl_s):
+        removed = bus.prune_expired(settings.caption_ttl_s)
+        expired: dict[str, list[str]] = {}
+        for room_id, seg_id in removed:
             session_id, seq = _split_kept_id(room_id, seg_id)
             if session_id and seq:
                 pipeline.forget_expired(room_id, session_id, seq)
+            expired.setdefault(room_id, []).append(seg_id)
+        for room_id, ids in expired.items():
+            # Listeners must hear this. Dropping the line with no event looks like a glitch.
+            on_event({"type": "captions_expired", "room_id": room_id, "ids": ids})
         for room_id in list(bus._state):
             if bus.has_captions(room_id) or book.get(room_id) is not None:
                 continue

@@ -36,6 +36,7 @@ li { padding: 8px 0; border-top: 1px solid var(--line); font-size: 16px; }
 </header>
 <p id="sub" class="sub"></p>
 <p id="offline" class="banner" hidden>手機沒網路。恢復網路後會自動接回。</p>
+<p id="expiry" class="sub" hidden>較早的字幕已超過保存時間，已從畫面上拿掉</p>
 <div class="stage">
 <div class="en" id="en">等待主持端</div>
 <div class="zh" id="zh"></div>
@@ -69,6 +70,10 @@ function render() {
 }
 function show(item) {
   view.apply(item);
+  if (!item || (item.type !== "captions_expired" && item.type !== "caption_deleted" && item.type !== "captions_cleared")) {
+    const note = document.querySelector("#expiry");
+    if (note) note.hidden = true;
+  }
   render();
 }
 let conn = connect();
@@ -102,6 +107,12 @@ function connect() {
     },
     onEvent: show,
     onDelete: show,
+    onExpire: () => {
+      const note = document.querySelector("#expiry");
+      if (!note) return;
+      note.hidden = false;
+      note.textContent = "較早的字幕已超過保存時間，已從畫面上拿掉";
+    },
     onClear: (data) => { view.apply(data && data.type ? data : { type: "captions_cleared" }); render(); },
     onBackfill: (rows) => { view.replace(rows); render(); },
     // Do not paint here. The backfill callback renders the replacement in the

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -146,6 +147,8 @@ class Settings:
             raise ValueError("BREEZE_REPLAY_PER_MINUTE 至少為 1")
         if self.replay_client_per_minute < 1:
             raise ValueError("BREEZE_REPLAY_CLIENT_PER_MINUTE 至少為 1")
+        if not (math.isfinite(self.caption_ttl_s) and self.caption_ttl_s > 0):
+            raise ValueError("BREEZE_CAPTION_TTL 必須大於 0")
         if self.translate_workers < 1:
             raise ValueError("BREEZE_TRANSLATE_WORKERS 至少為 1")
         if self.gap_wait_s < 0 or self.room_idle_s < 0 or self.stop_flush_s < 0 or self.shutdown_flush_s < 0:
