@@ -344,6 +344,14 @@ def test_legacy_box_block_names_the_put_path_and_allows_alias_round_trip():
     assert "編輯器" not in over
     weird = legacy_box_block([_term("禪學社", ["柴|學社"], en="Zen Club")])
     assert "PUT /api/rooms/{room_id}/glossary" in weird
+    hashed = legacy_box_block([_term("#般若", en="prajna")])
+    assert hashed
+    assert "只能看" in hashed
+    named = legacy_box_block([{**_term("禪學社", en="Zen Club"), "note": "備註"}], "class")
+    assert "PUT /api/rooms/class/glossary" in named
+    assert "{room_id}" not in named
+    assert "請找負責詞表的人" in named
+    assert "修改房間術語表" in named
 
 
 @pytest.mark.anyio
@@ -380,6 +388,9 @@ async def test_t_leg2_legacy_post_ignores_session_and_rejects_a_stale_version():
             assert replaced.status_code == 400, replaced.text
             assert replaced.json()["ok"] is False
             assert any("PUT /api/rooms/" in item["reason"] for item in replaced.json()["rejected"])
+            assert any("/api/rooms/class/glossary" in item["reason"] for item in replaced.json()["rejected"])
+            assert any("請找負責詞表的人" in item["reason"] for item in replaced.json()["rejected"])
+            assert all("{room_id}" not in item["reason"] for item in replaced.json()["rejected"])
             assert all("編輯器" not in item["reason"] for item in replaced.json()["rejected"])
             current = (await _get(client, token, "class")).json()
             assert current["version"] == 1
@@ -997,4 +1008,68 @@ async def test_retranslate_and_cancel_scrub_a_lone_surrogate():
         gate["release"].set()
         if pushed is not None and not pushed.done():
             pushed.cancel()
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_legacy_english_may_contain_equals_or_pipe_and_stay_editable():
+    app = app_for(settings=_settings(), translator=Translator(enabled=False))
+    lines = (
+        ("eq0", "等號|等号=a=b", "等號", ["等号"], "a=b"),
+        ("eq1", "管道|管线=a|b", "管道", ["管线"], "a|b"),
+        ("eq2", "全形|全型=a＝b", "全形", ["全型"], "a＝b"),
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            for room, line, zh, aliases, en in lines:
+                first = await _post(client, token, room, line, if_version=0)
+                assert first.status_code == 200, (line, first.text)
+                view = (await _get(client, token, room)).json()
+                assert view["version"] == 1
+                term = view["terms"][0]
+                assert term["zh"] == zh
+                assert term["aliases"] == aliases
+                assert term["en"] == en
+                assert legacy_box_block(view["terms"], room) == ""
+                again = await _post(client, token, room, line, if_version=1)
+                assert again.status_code == 200, (line, again.text)
+                assert again.json()["deleted"] == 0
+                reloaded = (await _get(client, token, room)).json()
+                assert reloaded["version"] == 2
+                assert reloaded["terms"][0]["zh"] == zh
+                assert reloaded["terms"][0]["aliases"] == aliases
+                assert reloaded["terms"][0]["en"] == en
+                assert legacy_box_block(reloaded["terms"], room) == ""
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_retranslate_zh_over_500_is_413():
+    app = app_for(settings=_settings(), translator=Translator(enabled=False))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            headers = {**auth(token), "content-type": "application/json"}
+            over = await client.post(
+                "/api/segment/retranslate",
+                json={"room_id": "class", "session_id": "s", "seq": 1, "zh": "字" * 501},
+                headers=headers,
+            )
+            assert over.status_code == 413, over.text
+            assert "500" in over.text
+            edge = await client.post(
+                "/api/segment/retranslate",
+                json={"room_id": "class", "session_id": "s", "seq": 1, "zh": "字" * 500},
+                headers=headers,
+            )
+            assert edge.status_code == 404, edge.text
+            padded = await client.post(
+                "/api/segment/retranslate",
+                json={"room_id": "class", "session_id": "s", "seq": 1, "zh": "  " + ("字" * 500) + "  "},
+                headers=headers,
+            )
+            assert padded.status_code == 404, padded.text
+    finally:
         await stop(app)

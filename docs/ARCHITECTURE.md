@@ -33,3 +33,11 @@
 ## 儲存
 
 預設只在記憶體。設了 `BREEZE_DATA_PATH` 才把字幕寫進 SQLite，不存音檔。舊檔用 `ALTER TABLE` 補上新欄位，不是整庫搬遷。每個房間的術語表在 `room_glossary`，不跟字幕的 24 小時期限一起刪。同一房間的新會話沿用這份詞表。關閉房間或閒置約 30 分鐘回收房間時也不清詞表；只有主持人整房刪除（`DELETE /api/captions?room_id=`）才清。舊的 `POST /api/glossary` 忽略 `session_id`，寫入的是整房詞表，不是某一堂。比對時才折全形、半形與英文大小寫；`zh_raw` 和 SRT 用的原文不改。
+
+### 修改房間術語表
+
+主持頁文字框最多 40 條，格式是 `標準詞|別名=英文`。備註、分類、未鎖定，或無法原樣寫回的詞，文字框只能看。要改那些欄位，用主持權杖：
+
+`PUT /api/rooms/<房間代碼>/glossary`
+
+`Authorization: Bearer <主持權杖>`，`Content-Type: application/json`。主體是 `{"if_version": <目前版本>, "terms": [...]}`。`if_version` 必填，必須等於先 `GET` 同一個網址讀到的 `version`；不合回 409，不寫入。`terms` 最多 200 條。每一條有 `zh`（繁體，1–20 字）、`en`（1–80 字）、可省略的 `aliases`（最多 8 個，每個最多 20 字）、`lock`（省略視為鎖定）、`category`（最多 20 字）、`note`（最多 80 字）。成功回 200，帶新的 `version`。同一段說明在 README「修改房間術語表」。重譯某一段中文（`POST /api/segment/retranslate` 的 `zh`）超過 500 字回 413，不送進詞表正規化。

@@ -3,7 +3,7 @@
 // Lock off, a note, a category, text the line would change, or more than 40 rows do not.
 
 const LEGACY_BOX_LIMIT = 40;
-const LEGACY_EDIT_PLACE = "請用 PUT /api/rooms/{room_id}/glossary 修改";
+const LEGACY_EDIT_PLACE = "請用 PUT /api/rooms/{room_id}/glossary 修改。這是技術操作，請找負責詞表的人。格式見 README「修改房間術語表」。";
 const LEGACY_RICH = "含備註、分類或未鎖定的詞，或文字框無法原樣表示的內容";
 
 export function glossarySaveLine(status, body) {
@@ -60,8 +60,14 @@ export function glossaryBoxText(terms) {
   return lines.join("\n");
 }
 
-function glossarySeparators(text) {
-  return /[|=\uFF1D\n\r\u0085\u2028\u2029]/.test(text);
+function glossaryLineBreaks(text) {
+  return /[\n\r\u0085\u2028\u2029]/.test(text);
+}
+
+// The left side is split on | and the line is split on the first = or ＝.
+// English is everything after that first equals, so = | ＝ inside en still round-trip.
+function glossaryLeftSeparators(text) {
+  return /[|=\uFF1D]/.test(text) || glossaryLineBreaks(text);
 }
 
 function glossaryTermUnexpressable(term) {
@@ -71,11 +77,13 @@ function glossaryTermUnexpressable(term) {
   if (typeof term.category === "string" && term.category.trim()) return true;
   const zh = typeof term.zh === "string" ? term.zh : "";
   const en = typeof term.en === "string" ? term.en : "";
-  if (zh.trim() !== zh || en.trim() !== en || glossarySeparators(zh) || glossarySeparators(en)) return true;
+  if (zh.trim() !== zh || en.trim() !== en || glossaryLeftSeparators(zh) || glossaryLineBreaks(en)) return true;
+  // A leading # is a comment in the textarea, so the canonical would not round-trip.
+  if (zh.startsWith("#")) return true;
   const aliases = Array.isArray(term.aliases) ? term.aliases : [];
   for (const alias of aliases) {
     if (typeof alias !== "string" || !alias) continue;
-    if (alias.trim() !== alias || !alias.trim() || glossarySeparators(alias)) return true;
+    if (alias.trim() !== alias || !alias.trim() || glossaryLeftSeparators(alias)) return true;
   }
   return false;
 }
@@ -87,27 +95,41 @@ export function glossaryHasAdvanced(terms) {
   return false;
 }
 
-export function glossaryLegacyBlock(terms) {
+function glossaryRoomName(room) {
+  return String(room || "").trim() || "class";
+}
+
+function glossaryEditPlace(room) {
+  if (room == null) return LEGACY_EDIT_PLACE;
+  return LEGACY_EDIT_PLACE.replace("{room_id}", glossaryRoomName(room));
+}
+
+function glossaryPrefillNote(count) {
+  return "伺服器上有 " + count + " 條術語。這個文字框是載入前就有的內容，沒有採用伺服器版本。直接儲存會取代它們，所以沒有寫入。請先清空文字框再重新整理，才會看到伺服器上的詞表。";
+}
+
+export function glossaryLegacyBlock(terms, room) {
   const list = Array.isArray(terms) ? terms : [];
   const advanced = glossaryHasAdvanced(list);
   const over = list.length > LEGACY_BOX_LIMIT;
   const limit = "（主持頁最多 " + LEGACY_BOX_LIMIT + " 條）";
+  const place = glossaryEditPlace(room);
   if (over && advanced) {
     return {
       locked: true,
-      note: "這個房間的術語表有 " + list.length + " 條" + limit + "，而且" + LEGACY_RICH + "，這裡只能看、不能改。" + LEGACY_EDIT_PLACE,
+      note: "這個房間的術語表有 " + list.length + " 條" + limit + "，而且" + LEGACY_RICH + "，這裡只能看、不能改。" + place,
     };
   }
   if (over) {
     return {
       locked: true,
-      note: "這個房間的術語表有 " + list.length + " 條" + limit + "，這裡只能看、不能改。" + LEGACY_EDIT_PLACE,
+      note: "這個房間的術語表有 " + list.length + " 條" + limit + "，這裡只能看、不能改。" + place,
     };
   }
   if (advanced) {
     return {
       locked: true,
-      note: "這個房間的術語表" + LEGACY_RICH + "，這裡只能看、不能改。" + LEGACY_EDIT_PLACE,
+      note: "這個房間的術語表" + LEGACY_RICH + "，這裡只能看、不能改。" + place,
     };
   }
   return { locked: false, note: "" };
@@ -132,6 +154,9 @@ export function glossaryRoomState() {
     readOnly: false,
     generation: 0,
     pendingRoom: null,
+    // True when the box held text before the first load of a non-empty glossary.
+    // That text must not be given the server version.
+    prefillUnversioned: false,
   };
 }
 
@@ -145,11 +170,7 @@ export function glossaryEdit(state, text) {
 
 export function glossaryMarkSaved(state) {
   // Drop the version until the following load reads the one the server just wrote.
-  return { ...state, loadedText: state.text, version: null };
-}
-
-function glossaryRoomName(room) {
-  return String(room || "").trim() || "class";
+  return { ...state, loadedText: state.text, version: null, prefillUnversioned: false };
 }
 
 export function glossaryPrepareLoad(state, room) {
@@ -168,22 +189,61 @@ export function glossaryPrepareLoad(state, room) {
     readOnly: true,
     generation,
     pendingRoom: nextRoom,
+    prefillUnversioned: false,
+  };
+}
+
+export function glossaryLoadTargetsSelector(requestedRoom, selectorRoom) {
+  return glossaryRoomName(requestedRoom) === glossaryRoomName(selectorRoom);
+}
+
+// A GET for a room the selector is not showing must not clear the box.
+export function glossaryBeginLoad(state, requestedRoom, selectorRoom) {
+  if (!glossaryLoadTargetsSelector(requestedRoom, selectorRoom)) {
+    return { started: false, state, generation: state.generation };
+  }
+  const next = glossaryPrepareLoad(state, requestedRoom);
+  return {
+    started: true,
+    state: next,
+    generation: next.generation,
+    room: glossaryRoomName(requestedRoom),
   };
 }
 
 export function glossaryApplyLoaded(state, room, generation, terms, version) {
   const nextRoom = glossaryRoomName(room);
   if (generation !== state.generation || state.pendingRoom !== nextRoom) return state;
-  const block = glossaryLegacyBlock(terms);
+  const block = glossaryLegacyBlock(terms, nextRoom);
   const serverText = glossaryBoxText(terms);
   const dirty = state.text !== state.loadedText;
+  const count = Array.isArray(terms) ? terms.length : 0;
   if (dirty && state.room === nextRoom) {
+    if (state.prefillUnversioned) {
+      return { ...state, version: null, note: glossaryPrefillNote(count) };
+    }
     return {
       ...state,
       note: "這個文字框有還沒儲存的修改，沒有用伺服器上的詞表覆蓋。",
     };
   }
+  // First paint can already hold typed or browser-restored text. Pairing that
+  // text with the server version lets a save replace terms the host has not seen.
   if (dirty && state.room == null && !block.locked) {
+    if (count > 0 && state.text !== serverText) {
+      return {
+        room: nextRoom,
+        version: null,
+        locked: false,
+        text: state.text,
+        loadedText: serverText,
+        note: glossaryPrefillNote(count),
+        readOnly: false,
+        generation,
+        pendingRoom: nextRoom,
+        prefillUnversioned: true,
+      };
+    }
     return {
       room: nextRoom,
       version,
@@ -194,6 +254,7 @@ export function glossaryApplyLoaded(state, room, generation, terms, version) {
       readOnly: false,
       generation,
       pendingRoom: nextRoom,
+      prefillUnversioned: false,
     };
   }
   return {
@@ -206,6 +267,7 @@ export function glossaryApplyLoaded(state, room, generation, terms, version) {
     readOnly: block.locked,
     generation,
     pendingRoom: nextRoom,
+    prefillUnversioned: false,
   };
 }
 
@@ -229,6 +291,7 @@ export function glossaryApplyLoadFailure(state, room, generation) {
     readOnly: true,
     generation,
     pendingRoom: nextRoom,
+    prefillUnversioned: false,
   };
 }
 
@@ -239,12 +302,25 @@ export function glossarySaveDecision(state, selectorRoom, sessionId) {
   return glossarySaveRequest(state.room, sessionId, state.text, state.version, false);
 }
 
+// Mark the box saved only when it still shows the room that was posted, and no
+// newer load has started. Otherwise a late 200 would clear the room on screen.
+export function glossarySaveSettlement(state, requestRoom, requestGeneration) {
+  const room = glossaryRoomName(requestRoom);
+  if (!state || state.room !== room || state.generation !== requestGeneration) {
+    return { settle: false, state };
+  }
+  return { settle: true, state: glossaryMarkSaved(state), reloadRoom: room };
+}
+
 export function glossaryRefusal(state, reason) {
   if (reason === "locked") {
-    return (state && state.note) || ("這裡只能看、不能改。" + LEGACY_EDIT_PLACE);
+    return (state && state.note) || ("這裡只能看、不能改。" + glossaryEditPlace(state && state.room));
   }
   if (reason === "room-mismatch") {
     return (state && state.note) || "文字框裡的術語不是這個房間的，沒有寫入。";
+  }
+  if (reason === "no-version" && state && state.prefillUnversioned && state.note) {
+    return state.note;
   }
   return "讀不到目前的術語表版本，請重新整理頁面後再儲存。";
 }

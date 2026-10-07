@@ -66,7 +66,7 @@ textarea[readonly] { background: #f3eadb; color: #6b5644; }
 </div>
 <div class="card">
 <label>這個房間的術語<span id="glossary-readonly"></span>，一行一個，例如 般若=prajna，別名寫成 禪學社|柴學社=Zen Club
-<textarea id="glossary" rows="4" aria-describedby="glossary-note"></textarea></label>
+<textarea id="glossary" rows="4" autocomplete="off" aria-describedby="glossary-note"></textarea></label>
 <p id="glossary-note" class="warn" role="status"></p>
 <button id="save-terms" class="secondary" type="button">儲存術語</button>
 <button id="export" class="secondary" type="button">匯出 SRT</button>
@@ -82,7 +82,7 @@ textarea[readonly] { background: #f3eadb; color: #6b5644; }
 import { createCaptureController } from "/static/recorder_machine.js";
 import { connectRoom, createCaptionView, mergeCaptionUpdate } from "/static/room_client.js";
 import { applyCaption } from "/static/host_caption.js";
-import { glossaryApplyLoadFailure, glossaryApplyLoaded, glossaryEdit, glossaryMarkSaved, glossaryPrepareLoad, glossaryRefusal, glossaryRoomState, glossarySaveDecision, glossarySaveLine, glossaryTextDirty, glossaryTransportLine } from "/static/host_glossary.js";
+import { glossaryApplyLoadFailure, glossaryApplyLoaded, glossaryBeginLoad, glossaryEdit, glossaryRefusal, glossaryRoomState, glossarySaveDecision, glossarySaveLine, glossarySaveSettlement, glossaryTextDirty, glossaryTransportLine } from "/static/host_glossary.js";
 const roomEl = document.querySelector("#room");
 const log = document.querySelector("#log");
 const status = document.querySelector("#status");
@@ -196,7 +196,8 @@ async function recoverAuth() {
     const data = await resp.json();
     if (!data || typeof data.token !== "string" || !data.token) throw new Error("無法重新取得主持權限");
     token = data.token;
-    const room = (ctl.session && ctl.session.roomId) || (roomEl.value || "class").trim() || "class";
+    // The room on screen, not the last recording. After stop the selector can already be another room.
+    const room = (roomEl.value || "class").trim() || "class";
     const headers = { authorization: "Bearer " + token, "content-type": "application/json" };
     const opened = await fetch("/api/rooms/open", { method: "POST", headers, body: JSON.stringify({ room_id: room }) });
     if (opened.ok) rememberRoom(await opened.json());
@@ -233,12 +234,15 @@ async function loadGlossary(roomId) {
   // Fill the box from the server and remember that room and version.
   // A room switch clears both before the GET, so a failed load cannot keep the previous room.
   // A reconnect keeps unsaved text and the version already on screen.
+  // A load aimed at a room the selector is not showing must not clear the box.
   if (!token) return;
   syncGlossaryText();
   const room = String(roomId || roomEl.value || "class").trim() || "class";
-  glossaryState = glossaryPrepareLoad(glossaryState, room);
+  const began = glossaryBeginLoad(glossaryState, room, roomEl.value);
+  if (!began.started) return;
+  glossaryState = began.state;
   paintGlossary();
-  const generation = glossaryState.generation;
+  const generation = began.generation;
   let resp;
   try {
     resp = await hostFetch("/api/rooms/" + encodeURIComponent(room) + "/glossary", { cache: "no-store" });
@@ -289,12 +293,17 @@ async function postGlossary(selectorRoom, sessionId, headers) {
     };
   }
   const payload = JSON.stringify(request.body);
+  const requestRoom = request.body.room_id;
+  const requestGeneration = glossaryState.generation;
   const sent = headers
     ? await fetch("/api/glossary", { method: "POST", headers, body: payload })
     : await hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: payload });
   if (sent && sent.ok) {
-    glossaryState = glossaryMarkSaved(glossaryState);
-    await loadGlossary(request.body.room_id);
+    const settled = glossarySaveSettlement(glossaryState, requestRoom, requestGeneration);
+    if (settled.settle) {
+      glossaryState = settled.state;
+      await loadGlossary(settled.reloadRoom);
+    }
   }
   return sent;
 }

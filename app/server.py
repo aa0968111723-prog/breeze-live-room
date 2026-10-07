@@ -86,6 +86,10 @@ def _glossary_conflict(version: int) -> JSONResponse:
     )
 
 
+# Retranslate runs glossary normalize on the submitted Chinese. Past this, that
+# walk is slow enough to matter and the caption is no longer a spoken line.
+_RETRANSLATE_ZH_MAX = 500
+
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = Path(__file__).resolve().parent / "static"
 DEFAULT_MODEL = ROOT / "models" / "ggml-breeze-asr-25-q5_0.bin"
@@ -1011,6 +1015,9 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         session_id = validate_session_id(str(body.get("session_id") or ""))
         seq = int(body.get("seq") or 0)
         zh = body.get("zh")
+        # A long zh is normalized against every glossary span. Cap it before that work.
+        if isinstance(zh, str) and len(zh.strip()) > _RETRANSLATE_ZH_MAX:
+            raise HTTPException(status_code=413, detail=f"中文超過 {_RETRANSLATE_ZH_MAX} 字，已拒絕")
         try:
             segment = await pipeline.retranslate(room_id, session_id, seq, zh if isinstance(zh, str) else None)
         except PipelineError as exc:
@@ -1046,7 +1053,8 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         the textarea cannot round-trip is refused and nothing is written. That is
         more than LEGACY_BOX_LIMIT rows, lock off, a note, a category, or text the
         `zh|alias=en` line would change. Aliases the line can show are editable:
-        an omitted alias is deleted with the omitted terms and counted.
+        an omitted alias is removed, but `deleted` counts omitted canonical
+        terms only, not aliases.
         """
         async with _glossary_lock(room_id):
             current = pipeline.room_glossary_version(room_id)
@@ -1055,7 +1063,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             deleted = 0
             if preserve_rich:
                 prior = pipeline.room_glossary_view(room_id)["terms"]
-                reason = legacy_box_block(prior)
+                reason = legacy_box_block(prior, room_id)
                 if reason:
                     raise GlossaryRejected([], [{"line": 0, "reason": reason}])
                 deleted = legacy_omitted_count(prior, terms)

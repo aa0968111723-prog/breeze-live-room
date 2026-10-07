@@ -6,9 +6,12 @@ import fs from "node:fs";
 import {
   glossaryApplyLoadFailure,
   glossaryApplyLoaded,
+  glossaryBeginLoad,
   glossaryBoxText,
   glossaryEdit,
   glossaryLegacyBlock,
+  glossaryLoadTargetsSelector,
+  glossaryMarkSaved,
   glossaryPostBody,
   glossaryPrepareLoad,
   glossaryRefusal,
@@ -16,6 +19,7 @@ import {
   glossarySaveDecision,
   glossarySaveLine,
   glossarySaveRequest,
+  glossarySaveSettlement,
   glossaryTransportLine,
 } from "../app/static/host_glossary.js";
 
@@ -92,11 +96,35 @@ const aliasBlock = glossaryLegacyBlock([aliasTerm]);
 assert.equal(aliasBlock.locked, false, JSON.stringify(aliasTerm));
 assert.equal(aliasBlock.note, "");
 assert.equal(glossaryBoxText([aliasTerm]), "禪學社|柴學社=Zen Club");
+for (const sample of [
+  { zh: "等號", en: "a=b", aliases: ["等号"], text: "等號|等号=a=b" },
+  { zh: "管道", en: "a|b", aliases: ["管线"], text: "管道|管线=a|b" },
+  { zh: "全形", en: "a＝b", aliases: ["全型"], text: "全形|全型=a＝b" },
+]) {
+  const term = { zh: sample.zh, en: sample.en, aliases: sample.aliases, lock: true, note: "", category: "" };
+  const block = glossaryLegacyBlock([term]);
+  assert.equal(block.locked, false, sample.text);
+  assert.equal(block.note, "");
+  assert.equal(glossaryBoxText([term]), sample.text);
+  let round = glossaryRoomState();
+  round = glossaryPrepareLoad(round, "class");
+  round = glossaryApplyLoaded(round, "class", round.generation, [term], 1);
+  assert.equal(round.locked, false, sample.text);
+  assert.equal(round.readOnly, false, sample.text);
+  assert.equal(round.text, sample.text);
+  const again = glossarySaveDecision(round, "class", "s");
+  assert.equal(again.post, true, sample.text);
+  assert.equal(again.body.text, sample.text);
+  assert.equal(again.body.if_version, 1);
+}
+const englishBreak = glossaryLegacyBlock([{ zh: "般若", en: "pra\njna", aliases: [], lock: true, note: "", category: "" }]);
+assert.equal(englishBreak.locked, true);
 for (const term of [
   { zh: "禪學社", en: "Zen Club", aliases: [], lock: false, note: "", category: "" },
   { zh: "禪學社", en: "Zen Club", aliases: [], lock: true, note: "備註", category: "" },
   { zh: "禪學社", en: "Zen Club", aliases: [], lock: true, note: "", category: "社團" },
   { zh: "禪學社", en: "Zen Club", aliases: ["柴|學社"], lock: true, note: "", category: "" },
+  { zh: "#般若", en: "prajna", aliases: [], lock: true, note: "", category: "" },
 ]) {
   const block = glossaryLegacyBlock([term]);
   assert.equal(block.locked, true, JSON.stringify(term));
@@ -166,7 +194,13 @@ const save = extractBlock(html, 'document.querySelector("#save-terms").onclick =
 const post = extractBlock(html, "async function postGlossary(");
 const setup = extractBlock(html, "async function setup()");
 const listen = extractBlock(html, "function listenCaptions(");
+const load = extractBlock(html, "async function loadGlossary(");
 assert.equal(/reportGlossary|postGlossary|\/api\/glossary/.test(recover), false);
+assert.equal(recover.includes("ctl.session"), false);
+assert.match(recover, /roomEl\.value/);
+assert.match(load, /glossaryBeginLoad/);
+assert.equal(load.includes("glossaryPrepareLoad"), false);
+assert.ok(load.indexOf("glossaryBeginLoad") < load.indexOf("paintGlossary"));
 assert.equal(/reportGlossary|postGlossary|\/api\/glossary/.test(start), false);
 assert.match(save, /glossarySaveDecision/);
 assert.ok(save.indexOf("glossarySaveDecision") < save.indexOf("reportGlossary"));
@@ -179,13 +213,19 @@ assert.equal(post.includes("ctl.session.roomId"), false);
 assert.equal(post.includes("/api/rooms/"), false);
 assert.equal(/Number\.isInteger\(/.test(post), false);
 assert.match(post, /409/);
-assert.match(post, /glossaryMarkSaved/);
+assert.match(post, /glossarySaveSettlement/);
+assert.equal(post.includes("glossaryMarkSaved"), false);
+assert.ok(post.indexOf("glossarySaveSettlement") < post.indexOf("loadGlossary"));
 assert.equal(post.includes("這頁剛剛讀到"), false);
 assert.match(setup, /loadGlossary/);
 assert.match(listen, /loadGlossary/);
 assert.match(listen, /已連上/);
-assert.match(html, /glossaryPrepareLoad/);
+assert.match(html, /glossaryBeginLoad/);
 assert.match(html, /glossaryApplyLoadFailure/);
+assert.match(html, /autocomplete="off"/);
+const glossaryBox = html.match(/<textarea id="glossary"[^>]*>/);
+assert.ok(glossaryBox);
+assert.match(glossaryBox[0], /autocomplete="off"/);
 assert.match(start, /術語尚未儲存/);
 assert.equal(/reportGlossary|postGlossary|\/api\/glossary/.test(start), false);
 
@@ -250,3 +290,145 @@ assert.equal(dirty.text, "甲=changed\n乙=b");
 assert.equal(dirty.version, 1);
 assert.match(dirty.note, /還沒儲存/);
 assert.match(glossaryRefusal(dirty, "room-mismatch"), /還沒儲存|不是這個房間/);
+
+function plainTerm(zh, en) {
+  return { zh, en, aliases: [], lock: true, note: "", category: "" };
+}
+
+// Text typed before the first load must not be saved over terms the host has not seen.
+const thirty = Array.from({ length: 30 }, (_, i) => plainTerm("詞" + i, "e" + i));
+let typedEarly = glossaryEdit(glossaryRoomState(), "般若=prajna");
+typedEarly = glossaryPrepareLoad(typedEarly, "room-a");
+typedEarly = glossaryApplyLoaded(typedEarly, "room-a", typedEarly.generation, thirty, 1);
+assert.equal(typedEarly.text, "般若=prajna");
+assert.equal(typedEarly.version, null);
+assert.equal(typedEarly.prefillUnversioned, true);
+assert.match(typedEarly.note, /伺服器上有 30 條/);
+assert.match(typedEarly.note, /沒有寫入/);
+const wipe = glossarySaveDecision(typedEarly, "room-a", "s");
+assert.equal(wipe.post, false, "prefilled text must not be posted over unseen server terms");
+assert.equal(wipe.reason, "no-version");
+assert.equal(wipe.body, undefined);
+const wipeHint = glossaryRefusal(typedEarly, wipe.reason);
+assert.match(wipeHint, /30/);
+assert.match(wipeHint, /沒有寫入/);
+assert.equal(wipeHint.includes("已儲存"), false);
+
+// An empty server glossary can still take text the host typed before the first load.
+let typedEmpty = glossaryEdit(glossaryRoomState(), "般若=prajna");
+typedEmpty = glossaryPrepareLoad(typedEmpty, "room-a");
+typedEmpty = glossaryApplyLoaded(typedEmpty, "room-a", typedEmpty.generation, [], 0);
+assert.equal(typedEmpty.text, "般若=prajna");
+assert.equal(typedEmpty.version, 0);
+const saveEmpty = glossarySaveDecision(typedEmpty, "room-a", "s");
+assert.equal(saveEmpty.post, true);
+assert.equal(saveEmpty.body.if_version, 0);
+assert.equal(saveEmpty.body.text, "般若=prajna");
+
+// 409 tells the host to reload. A browser that restores the stale textarea must not
+// receive the new version, or the next save overwrites the remote edit.
+let restored = glossaryEdit(glossaryRoomState(), "般若=prajna");
+restored = glossaryPrepareLoad(restored, "class");
+const remoteEdit = [plainTerm("甲", "remote-a"), plainTerm("乙", "remote-b")];
+restored = glossaryApplyLoaded(restored, "class", restored.generation, remoteEdit, 7);
+assert.equal(restored.text, "般若=prajna");
+assert.equal(restored.version, null);
+assert.notEqual(restored.version, 7);
+assert.match(restored.note, /伺服器上有 2 條/);
+const overwrite = glossarySaveDecision(restored, "class", "s");
+assert.equal(overwrite.post, false, "restored text must not be posted with the remote version");
+assert.equal(overwrite.reason, "no-version");
+assert.match(glossaryRefusal(restored, overwrite.reason), /2/);
+assert.match(glossaryRefusal(restored, overwrite.reason), /沒有採用伺服器版本/);
+
+// A→B→A, with B's response arriving last, keeps A. An older A response is dropped too.
+let ordered = glossaryRoomState();
+ordered = glossaryPrepareLoad(ordered, "room-a");
+const genFirstA = ordered.generation;
+ordered = glossaryApplyLoaded(ordered, "room-a", genFirstA, roomA, 1);
+ordered = glossaryPrepareLoad(ordered, "room-b");
+const genB = ordered.generation;
+ordered = glossaryPrepareLoad(ordered, "room-a");
+const genSecondA = ordered.generation;
+assert.notEqual(genB, genSecondA);
+const lateB = glossaryApplyLoaded(ordered, "room-b", genB, roomB, 9);
+assert.equal(lateB.pendingRoom, "room-a");
+assert.equal(lateB.room, null);
+assert.equal(lateB.text, "");
+assert.equal(lateB.version, null);
+ordered = glossaryApplyLoaded(lateB, "room-a", genSecondA, roomA, 2);
+assert.equal(ordered.room, "room-a");
+assert.equal(ordered.version, 2);
+assert.equal(ordered.text, glossaryBoxText(roomA));
+const lateOldA = glossaryApplyLoaded(ordered, "room-a", genFirstA, [plainTerm("舊", "old")], 8);
+assert.equal(lateOldA.room, "room-a");
+assert.equal(lateOldA.version, 2);
+assert.equal(lateOldA.text, glossaryBoxText(roomA));
+
+// Save in flight, then the selector moves to B. The late 200 must not clear B or drop B's edit.
+let inflight = glossaryRoomState();
+inflight = glossaryPrepareLoad(inflight, "room-a");
+inflight = glossaryApplyLoaded(inflight, "room-a", inflight.generation, roomA, 1);
+inflight = glossaryEdit(inflight, "甲=A1\n乙=A2");
+const saveInFlight = glossarySaveDecision(inflight, "room-a", "session-a");
+assert.equal(saveInFlight.post, true);
+const saveGen = inflight.generation;
+const saveRoom = saveInFlight.body.room_id;
+inflight = glossaryPrepareLoad(inflight, "room-b");
+inflight = glossaryApplyLoaded(inflight, "room-b", inflight.generation, roomB, 1);
+inflight = glossaryEdit(inflight, "丙=unsaved");
+const unsavedB = inflight.text;
+const settledLate = glossarySaveSettlement(inflight, saveRoom, saveGen);
+assert.equal(settledLate.settle, false);
+assert.equal(settledLate.state.room, "room-b");
+assert.equal(settledLate.state.text, unsavedB);
+assert.equal(settledLate.state.version, 1);
+const strayLoad = glossaryBeginLoad(settledLate.state, saveRoom, "room-b");
+assert.equal(strayLoad.started, false);
+assert.equal(strayLoad.state.text, unsavedB);
+assert.equal(strayLoad.state.room, "room-b");
+assert.notEqual(strayLoad.state.note, "正在讀取這個房間的術語。");
+assert.equal(glossaryLoadTargetsSelector(saveRoom, "room-b"), false);
+assert.equal(glossaryLoadTargetsSelector("room-b", "room-b"), true);
+assert.equal(glossaryLoadTargetsSelector("  class ", "class"), true);
+
+// Same room and the same generation: settlement marks saved and reloads that room.
+let quiet = glossaryRoomState();
+quiet = glossaryPrepareLoad(quiet, "room-a");
+quiet = glossaryApplyLoaded(quiet, "room-a", quiet.generation, roomA, 1);
+quiet = glossaryEdit(quiet, "甲=A1\n乙=A2");
+const quietGen = quiet.generation;
+const quietSave = glossarySaveDecision(quiet, "room-a", "s");
+const appliedSave = glossarySaveSettlement(quiet, quietSave.body.room_id, quietGen);
+assert.equal(appliedSave.settle, true);
+assert.equal(appliedSave.reloadRoom, "room-a");
+assert.equal(appliedSave.state.version, null);
+assert.equal(appliedSave.state.loadedText, quiet.text);
+assert.equal(appliedSave.state.text, quiet.text);
+assert.equal(appliedSave.state.prefillUnversioned, false);
+const reconnected = glossaryPrepareLoad(quiet, "room-a");
+const raced = glossarySaveSettlement(reconnected, "room-a", quietGen);
+assert.equal(raced.settle, false);
+assert.equal(raced.state.text, quiet.text);
+assert.equal(raced.state.room, "room-a");
+
+// The lock hint names the room on screen and points at a person, not a bare placeholder.
+let named = glossaryRoomState();
+named = glossaryPrepareLoad(named, "class");
+named = glossaryApplyLoaded(named, "class", named.generation, [
+  { zh: "禪學社", en: "Zen Club", aliases: [], lock: false, note: "", category: "" },
+], 1);
+assert.equal(named.locked, true);
+assert.match(named.note, /PUT \/api\/rooms\/class\/glossary/);
+assert.equal(named.note.includes("{room_id}"), false);
+assert.match(named.note, /請找負責詞表的人/);
+assert.match(named.note, /修改房間術語表/);
+
+let marked = glossaryEdit(glossaryRoomState(), "甲=changed");
+marked = { ...marked, room: "room-a", version: 3, loadedText: "甲=old", prefillUnversioned: true };
+marked = glossaryMarkSaved(marked);
+assert.equal(marked.text, "甲=changed");
+assert.equal(marked.loadedText, "甲=changed");
+assert.equal(marked.version, null);
+assert.equal(marked.prefillUnversioned, false);
+assert.equal(marked.room, "room-a");

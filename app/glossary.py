@@ -119,8 +119,15 @@ def legacy_terms(rows: list[dict]) -> list[dict]:
 
 
 # The host page has no separate editor. Rich fields are changed with this request.
-_LEGACY_EDIT_PLACE = "請用 PUT /api/rooms/{room_id}/glossary 修改"
+_LEGACY_EDIT_PLACE = "請用 PUT /api/rooms/{room_id}/glossary 修改。這是技術操作，請找負責詞表的人。格式見 README「修改房間術語表」。"
 _LEGACY_RICH = "含備註、分類或未鎖定的詞，或文字框無法原樣表示的內容"
+
+
+def _legacy_edit_place(room_id: str | None = None) -> str:
+    if room_id is None:
+        return _LEGACY_EDIT_PLACE
+    room = str(room_id).strip() or "class"
+    return _LEGACY_EDIT_PLACE.replace("{room_id}", room)
 
 
 def _box_aliases(term: dict) -> list[str]:
@@ -157,24 +164,26 @@ def _term_unexpressable(term) -> bool:
     return row.get("zh") != zh or row.get("en") != en or list(row.get("aliases") or []) != aliases
 
 
-def legacy_box_block(terms) -> str:
+def legacy_box_block(terms, room_id: str | None = None) -> str:
     """Why the textarea must not replace this glossary. Empty when the box may edit it.
 
     More than LEGACY_BOX_LIMIT rows cannot be shown. Lock off, a note, a category,
     or text that does not round-trip through `zh|alias=en` cannot be shown either.
     Aliases that survive that syntax do not lock the box. Refusing the post is what
     stops one visible line from deleting a field the box cannot write back.
+    `room_id`, when known, replaces the `{room_id}` placeholder in the hint.
     """
     rows = list(terms or [])
     rich = any(_term_unexpressable(term) for term in rows)
     count = len(rows)
     limit = f"（主持頁最多 {LEGACY_BOX_LIMIT} 條）"
+    place = _legacy_edit_place(room_id)
     if count > LEGACY_BOX_LIMIT and rich:
-        return f"這個房間的術語表有 {count} 條{limit}，而且{_LEGACY_RICH}，這裡只能看、不能改。{_LEGACY_EDIT_PLACE}"
+        return f"這個房間的術語表有 {count} 條{limit}，而且{_LEGACY_RICH}，這裡只能看、不能改。{place}"
     if count > LEGACY_BOX_LIMIT:
-        return f"這個房間的術語表有 {count} 條{limit}，這裡只能看、不能改。{_LEGACY_EDIT_PLACE}"
+        return f"這個房間的術語表有 {count} 條{limit}，這裡只能看、不能改。{place}"
     if rich:
-        return f"這個房間的術語表{_LEGACY_RICH}，這裡只能看、不能改。{_LEGACY_EDIT_PLACE}"
+        return f"這個房間的術語表{_LEGACY_RICH}，這裡只能看、不能改。{place}"
     return ""
 
 
