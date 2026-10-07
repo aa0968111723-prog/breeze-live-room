@@ -8,17 +8,19 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import unquote_to_bytes
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
-from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import Headers
+from starlette.staticfiles import NotModifiedResponse, StaticFiles
 
 from app.aio import cancellation_pending, wait_bounded
 from app.asr import CliAsr, ResidentAsr
 from app.native_asr import NativeResidentAsr
 from app.audio import AudioError, convert_to_wav, ffmpeg_bin, wav_duration_seconds
-from app.auth import new_host_token, require_host, require_local_host
-from app.dispatch import ListenerSlot, RoomBus
+from app.auth import audience_origin_allowed, new_host_token, require_host, require_local_host, same_secret
+from app.dispatch import ListenerSlot, RoomBus, for_listener
 from app.pipeline import Pipeline, PipelineError, Segment
 from app.rooms import RoomBook, RoomIdError, validate_room_id, validate_session_id
 from app.settings import Settings, fill_process_environ
@@ -38,6 +40,31 @@ PROMPT = "以下是台灣國語的句子，請用繁體中文輸出。常見專�
 _TRACKED: list[FastAPI] = []
 
 
+class RevalidatingStaticFiles(StaticFiles):
+    """Send Cache-Control: no-cache and keep ETag so browsers revalidate.
+
+    A cached room_client.js paired with a newer host.html or room.html throws
+    on import and the page script never starts.
+    """
+
+    def file_response(
+        self,
+        full_path: str | os.PathLike[str],
+        stat_result: os.stat_result,
+        scope: dict,
+        status_code: int = 200,
+    ) -> Response:
+        response = FileResponse(
+            full_path,
+            status_code=status_code,
+            stat_result=stat_result,
+            headers={"Cache-Control": "no-cache"},
+        )
+        if self.is_not_modified(response.headers, Headers(scope=scope)):
+            return NotModifiedResponse(response.headers)
+        return response
+
+
 def rss_bytes() -> int:
     try:
         with open("/proc/self/statm", encoding="ascii") as handle:
@@ -52,6 +79,29 @@ class Conn:
         self.ws = ws
         self.slot = ListenerSlot(ws.send_json, maxsize=maxsize)
         self.slot.last_pong = time.monotonic()
+
+
+class _ReplayGate:
+    """Caps full replay/backfill dumps per client IP. Live captions are not counted."""
+
+    def __init__(self, limit: int, window_s: float = 60.0):
+        self.limit = max(1, int(limit))
+        self.window_s = window_s
+        self._hits: dict[str, list[float]] = {}
+
+    def allow(self, ip: str) -> bool:
+        now = time.monotonic()
+        bucket = self._hits.get(ip)
+        if bucket is None:
+            bucket = []
+            self._hits[ip] = bucket
+        cutoff = now - self.window_s
+        if bucket and bucket[0] <= cutoff:
+            bucket[:] = [item for item in bucket if item > cutoff]
+        if len(bucket) >= self.limit:
+            return False
+        bucket.append(now)
+        return True
 
 
 def _content_too_large(request: Request, settings: Settings) -> bool:
@@ -77,11 +127,14 @@ def _early_key(request: Request) -> tuple[str, str, int] | None:
         return None
 
 
-async def _wait_until_join_ready(pipeline: Pipeline, key: tuple[str, str, int]) -> None:
+async def _wait_until_join_ready(pipeline: Pipeline, key: tuple[str, str, int], timeout: float) -> None:
     """Owner has reserved this segment but not registered a flight. Do not take another slot."""
+    deadline = time.monotonic() + max(0.0, float(timeout))
     while key in pipeline._reserved or key in pipeline._active:
         flight = pipeline._flight.get(key)
         if flight is not None and not flight.done():
+            return
+        if time.monotonic() >= deadline:
             return
         await asyncio.sleep(0.01)
 
@@ -102,6 +155,294 @@ async def _read_upload(upload, limit: int) -> bytes:
     if total == 0:
         raise AudioError(400, "沒有收到音訊")
     return b"".join(chunks)
+
+
+class _PushFormError(Exception):
+    """Multipart body is not a form this route can read."""
+
+
+class _MemoryUpload:
+    """File part kept in memory. read() does not hop to the threadpool."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+        self._pos = 0
+
+    async def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = len(self._data) - self._pos
+        end = self._pos + size
+        if end > len(self._data):
+            end = len(self._data)
+        block = self._data[self._pos:end]
+        self._pos = end
+        return block
+
+    async def close(self) -> None:
+        self._data = b""
+        self._pos = 0
+
+
+class _PushForm:
+    """Last field wins, same as Starlette's form mapping."""
+
+    def __init__(self) -> None:
+        self._values: dict[str, str | _MemoryUpload] = {}
+
+    def add(self, name: str, value: str | _MemoryUpload) -> None:
+        self._values[name] = value
+
+    def get(self, name: str, default=None):
+        return self._values.get(name, default)
+
+    async def close(self) -> None:
+        for value in self._values.values():
+            close = getattr(value, "close", None)
+            if close is not None:
+                await close()
+        self._values.clear()
+
+
+def _multipart_boundary(content_type: str) -> bytes | None:
+    media, _, rest = content_type.partition(";")
+    if media.strip().lower() != "multipart/form-data":
+        return None
+    for section in rest.split(";"):
+        piece = section.strip()
+        if not piece.lower().startswith("boundary="):
+            continue
+        raw = piece.split("=", 1)[1].strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+            raw = raw[1:-1]
+        if not raw or len(raw) > 200:
+            return None
+        try:
+            token = raw.encode("latin-1")
+        except UnicodeEncodeError:
+            return None
+        if b"\r" in token or b"\n" in token:
+            return None
+        return token
+    return None
+
+
+def _boundary_line(body: bytes, at: int, token: bytes) -> tuple[bool, int] | None:
+    """Return (closing, index after the line) when a boundary line starts at `at`."""
+    if not body.startswith(token, at):
+        return None
+    index = at + len(token)
+    while index < len(body) and body[index] in (0x20, 0x09):
+        index += 1
+    closing = False
+    if body.startswith(b"--", index):
+        closing = True
+        index += 2
+        while index < len(body) and body[index] in (0x20, 0x09):
+            index += 1
+    if index == len(body):
+        return (True, index) if closing else None
+    if body.startswith(b"\r\n", index):
+        return closing, index + 2
+    return None
+
+
+def _find_boundary(body: bytes, start: int, token: bytes) -> tuple[int, bool, int] | None:
+    """Next boundary at or after `start`: (line start, closing, resume)."""
+    if start == 0:
+        opened = _boundary_line(body, 0, token)
+        if opened is not None:
+            closing, resume = opened
+            return 0, closing, resume
+    needle = b"\r\n" + token
+    scan = start
+    while True:
+        at = body.find(needle, scan)
+        if at < 0:
+            return None
+        opened = _boundary_line(body, at + 2, token)
+        if opened is not None:
+            closing, resume = opened
+            return at, closing, resume
+        scan = at + 2
+
+
+def _split_semicolon(value: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    quoted = False
+    escaped = False
+    for index, char in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quoted:
+            escaped = True
+            continue
+        if char == '"':
+            quoted = not quoted
+            continue
+        if char == ";" and not quoted:
+            parts.append(value[start:index])
+            start = index + 1
+    parts.append(value[start:])
+    return parts
+
+
+def _unquote_param(raw: str) -> str:
+    text = raw.strip()
+    if text.startswith('"'):
+        chars: list[str] = []
+        escaped = False
+        for char in text[1:]:
+            if escaped:
+                chars.append(char)
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                break
+            chars.append(char)
+        text = "".join(chars)
+    else:
+        text = text.split()[0] if text else ""
+    try:
+        return text.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+
+
+def _decode_ext_param(raw: str) -> str:
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        text = text[1:-1]
+    charset, sep, rest = text.partition("'")
+    if not sep:
+        return _unquote_param(raw)
+    _lang, sep2, encoded = rest.partition("'")
+    if not sep2:
+        return _unquote_param(raw)
+    data = unquote_to_bytes(encoded)
+    for encoding in (charset or "utf-8", "utf-8"):
+        try:
+            return data.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return data.decode("latin-1")
+
+
+def _disposition_params(value: str) -> dict[str, str]:
+    params: dict[str, str] = {}
+    for index, piece in enumerate(_split_semicolon(value)):
+        piece = piece.strip()
+        if index == 0 or "=" not in piece:
+            continue
+        key, _, raw = piece.partition("=")
+        key = key.strip().lower()
+        if not key:
+            continue
+        params[key] = _decode_ext_param(raw.strip()) if key.endswith("*") else _unquote_param(raw.strip())
+    return params
+
+
+def _decode_field(data: bytes) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
+
+
+def _header_map(blob: bytes) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if not blob:
+        return headers
+    for line in blob.decode("latin-1").split("\r\n"):
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        headers[key.strip().lower()] = value.strip()
+    return headers
+
+
+def _add_part(form: _PushForm, raw: bytes, files: list[int], fields: list[int]) -> None:
+    sep = raw.find(b"\r\n\r\n")
+    if sep < 0:
+        raise _PushFormError("part has no header")
+    params = _disposition_params(_header_map(raw[:sep]).get("content-disposition", ""))
+    name = params.get("name", "")
+    if not name:
+        raise _PushFormError("part has no name")
+    is_file = "filename" in params or "filename*" in params
+    if is_file:
+        files[0] += 1
+        if files[0] > 1000:
+            raise _PushFormError("too many files")
+        form.add(name, _MemoryUpload(raw[sep + 4:]))
+        return
+    fields[0] += 1
+    if fields[0] > 1000:
+        raise _PushFormError("too many fields")
+    form.add(name, _decode_field(raw[sep + 4:]))
+
+
+def _parse_multipart(body: bytes, boundary: bytes) -> _PushForm:
+    token = b"--" + boundary
+    found = _find_boundary(body, 0, token)
+    if found is None:
+        raise _PushFormError("missing boundary")
+    _line, closing, resume = found
+    form = _PushForm()
+    if closing:
+        return form
+    counts = [0]
+    fields = [0]
+    pos = resume
+    while True:
+        nxt = _find_boundary(body, pos, token)
+        if nxt is None:
+            raise _PushFormError("truncated multipart")
+        line_start, closing, resume = nxt
+        _add_part(form, body[pos:line_start], counts, fields)
+        if closing:
+            return form
+        pos = resume
+
+
+async def _read_body_capped(request: Request, limit: int, settings: Settings) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(status_code=413, detail=f"音訊超過 {settings.max_audio_bytes} bytes，已拒絕")
+        chunks.append(chunk)
+    if len(chunks) == 1:
+        return chunks[0]
+    return b"".join(chunks)
+
+
+async def _push_form(request: Request, settings: Settings):
+    """Read the upload form.
+
+    python-multipart walks the body one byte at a time on the event loop.
+    A traced few-hundred-kilobyte slice then holds the loop longer than the
+    compressed 6s period, so the host books a recorder wait. Bulk search
+    stays on the loop but does not scale with every byte.
+    """
+    content_type = request.headers.get("content-type", "")
+    if content_type.split(";", 1)[0].strip().lower() != "multipart/form-data":
+        return await request.form()
+    boundary = _multipart_boundary(content_type)
+    if boundary is None:
+        raise HTTPException(status_code=400, detail="上傳格式不正確")
+    body = await _read_body_capped(request, settings.max_audio_bytes + 65536, settings)
+    try:
+        return _parse_multipart(body, boundary)
+    except _PushFormError as exc:
+        raise HTTPException(status_code=400, detail="上傳格式不正確") from exc
 
 
 def _field(form, request: Request, name: str) -> str:
@@ -190,10 +531,110 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             asr = CliAsr(whisper, model, threads=settings.asr_threads, timeout_s=settings.asr_timeout_s, audio_context=settings.asr_audio_context, beam_size=settings.asr_beam_size, best_of=settings.asr_best_of)
     share_override = {"host": settings.share_host}
     tasks: list[asyncio.Task] = []
+    replay_floors: dict[str, float] = {}
+    replay_gate = _ReplayGate(settings.replay_per_minute)
+    share_cache: dict[str, object] = {"at": 0.0, "hosts": []}
 
     def current_host() -> str | None:
         host = (share_override["host"] or "").strip()
         return host or None
+
+    def _audience_extra_hosts() -> tuple[str, ...]:
+        now = time.monotonic()
+        cached_at = float(share_cache.get("at") or 0.0)
+        cached = share_cache.get("hosts")
+        if not isinstance(cached, list) or now - cached_at >= 5:
+            try:
+                cached = list_share_hosts()
+            except Exception:
+                logging.getLogger("breeze.server").exception("share host list failed")
+                cached = []
+            share_cache["hosts"] = cached
+            share_cache["at"] = now
+        hosts = [str(item) for item in cached if item]
+        chosen = current_host()
+        if chosen:
+            hosts.append(chosen)
+        if settings.share_host:
+            hosts.append(settings.share_host)
+        return tuple(hosts)
+
+    def _load_replay_floor(room_id: str) -> float | None:
+        if room_id in replay_floors:
+            return replay_floors[room_id]
+        if not store.enabled:
+            return None
+        try:
+            value = store.get_replay_floor(room_id)
+        except Exception:
+            logging.getLogger("breeze.server").exception("replay floor lookup failed")
+            return None
+        if value is None:
+            return None
+        replay_floors[room_id] = value
+        return value
+
+    def _seal_replay(room_id: str) -> None:
+        # Flush first so saved updated_at values are already behind this floor.
+        if store.enabled:
+            try:
+                store.flush()
+            except Exception:
+                logging.getLogger("breeze.server").exception("caption store flush before replay seal failed")
+        floor = time.time()
+        replay_floors[room_id] = floor
+        if store.enabled:
+            try:
+                store.set_replay_floor(room_id, floor)
+            except Exception:
+                logging.getLogger("breeze.server").exception("replay floor save failed")
+
+    def ensure_room(room_id: str) -> dict:
+        fresh = book.get(room_id) is None
+        room = book.open(room_id)
+        if fresh:
+            room["replay_not_before"] = _load_replay_floor(room_id)
+        return room
+
+    def _host_authorized(request: Request) -> bool:
+        try:
+            require_host(request, token, settings)
+        except HTTPException:
+            return False
+        return True
+
+    def _listen_key_of(room_id: str) -> str:
+        room = book.get(room_id)
+        if not room:
+            return ""
+        return str(room.get("listen_key") or "")
+
+    def _listener_authorized(ws: WebSocket, room: dict, listen_key: str) -> bool:
+        if same_secret(listen_key, str(room.get("listen_key") or "")):
+            return True
+        header = ws.headers.get("authorization", "")
+        supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        return same_secret(supplied, token)
+
+    def _captions_since_open(room_id: str, rows: list[dict]) -> list[dict]:
+        room = book.get(room_id)
+        floor = None if room is None else room.get("replay_not_before")
+        if floor is None:
+            return list(rows)
+        stamps = bus._caption_at.get(room_id, {})
+        kept: list[dict] = []
+        for row in rows:
+            kind = str(row.get("type") or "")
+            if kind in {"captions_cleared", "caption_deleted", "ping", "pong"}:
+                kept.append(row)
+                continue
+            stamp = stamps.get(str(row.get("id") or ""))
+            if stamp is not None and float(stamp) > float(floor):
+                kept.append(row)
+        return kept
+
+    def _audience_captions(rows: list[dict]) -> list[dict]:
+        return [for_listener(item) for item in rows]
 
     def _fanout(snap: dict) -> None:
         room = book.get(str(snap.get("room_id") or ""))
@@ -201,9 +642,10 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             return
         room["history"] = bus.history(str(snap.get("room_id") or ""))
         room["last_active"] = time.monotonic()
+        outgoing = for_listener(snap)
         dead = []
         for conn in list(room["listeners"]):
-            if not conn.slot.offer(snap):
+            if not conn.slot.offer(outgoing):
                 dead.append(conn)
         for conn in dead:
             room["listeners"].discard(conn)
@@ -245,6 +687,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         pipeline.drop_room(room_id)
         if retained:
             pipeline.note_retained_order(room_id, retained)
+        _seal_replay(room_id)
 
     def _split_kept_id(room_id: str, seg_id: str) -> tuple[str, int]:
         prefix = room_id + ":"
@@ -372,7 +815,8 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             await shutdown()
 
     app = FastAPI(title="breeze-live-room", lifespan=lifespan)
-    app.mount("/static", StaticFiles(directory=STATIC), name="static")
+    static_files = RevalidatingStaticFiles(directory=STATIC)
+    app.mount("/static", static_files, name="static")
     app.state.settings = settings
     app.state.token = token
     app.state.pipeline = pipeline
@@ -387,20 +831,29 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
     app.state.sweep_once = sweep_once
     app.state.resident_error = resident_error
 
-    def share_for(room_id: str) -> str | None:
-        return listen_url(room_id, settings.port, settings.share_scheme, current_host())
+    def share_for(room_id: str, *, include_key: bool = False) -> str | None:
+        key = _listen_key_of(room_id) if include_key else ""
+        return listen_url(room_id, settings.port, settings.share_scheme, current_host(), key or None)
+
+    async def _page(path: Path, request: Request) -> Response:
+        stat_result = await asyncio.to_thread(path.stat)
+        return static_files.file_response(
+            path,
+            stat_result,
+            {"type": "http", "headers": request.scope["headers"]},
+        )
 
     @app.get("/")
-    async def host_page() -> FileResponse:
-        return FileResponse(STATIC / "host.html")
+    async def host_page(request: Request) -> Response:
+        return await _page(STATIC / "host.html", request)
 
     @app.get("/r/{room_id}")
-    async def room_page(room_id: str) -> FileResponse:
+    async def room_page(request: Request, room_id: str) -> Response:
         try:
             validate_room_id(room_id)
         except RoomIdError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return FileResponse(STATIC / "room.html")
+        return await _page(STATIC / "room.html", request)
 
     @app.get("/api/host-token")
     async def host_token(request: Request) -> Response:
@@ -408,15 +861,16 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         return JSONResponse({"token": token}, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
     @app.get("/api/setup")
-    async def setup(room_id: str = "class") -> dict:
+    async def setup(request: Request, room_id: str = "class") -> dict:
         try:
             room_id = validate_room_id(room_id)
         except RoomIdError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        url = share_for(room_id)
+        host_view = _host_authorized(request)
+        url = share_for(room_id, include_key=host_view)
         resident_ready = isinstance(asr, ResidentAsr) and await asyncio.to_thread(asr.health)
         asr_ready = resident_ready if isinstance(asr, ResidentAsr) else (whisper.is_file() and model.is_file() if isinstance(asr, CliAsr) else True)
-        return {
+        payload = {
             "room": room_id,
             "listen_url": url,
             "share_ready": url is not None,
@@ -440,6 +894,11 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             "storage": store.enabled,
             "storage_recovered": bool(getattr(store, "recovered", False)),
         }
+        if host_view:
+            key = _listen_key_of(room_id)
+            if key:
+                payload["listen_key"] = key
+        return payload
 
     @app.get("/api/health")
     async def health() -> Response:
@@ -449,12 +908,12 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         return JSONResponse({"service": "breeze-live-room", "ready": ready, "asr_ready": asr_ready, "error": error, "instance_id": os.getenv("BREEZE_DESKTOP_INSTANCE", "")}, status_code=200 if ready else 503, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/qr")
-    async def qr(room_id: str = "class") -> Response:
+    async def qr(request: Request, room_id: str = "class") -> Response:
         try:
             room_id = validate_room_id(room_id)
         except RoomIdError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        url = share_for(room_id)
+        url = share_for(room_id, include_key=_host_authorized(request))
         if not url:
             return JSONResponse(status_code=409, content={"ok": False, "detail": "尚無可供其他裝置使用的連結"})
         import qrcode
@@ -468,9 +927,14 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         require_host(request, token, settings)
         body = await _json(request)
         room_id = validate_room_id(str(body.get("room_id") or "class"))
-        book.open(room_id)
+        room = ensure_room(room_id)
         await ensure_hydrated(room_id)
-        return {"ok": True, "room": room_id, "listen_url": share_for(room_id)}
+        return {
+            "ok": True,
+            "room": room_id,
+            "listen_url": share_for(room_id, include_key=True),
+            "listen_key": room.get("listen_key") or "",
+        }
 
     @app.post("/api/rooms/touch")
     async def touch_room(request: Request) -> dict:
@@ -514,7 +978,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         body = await _json(request)
         room_id = validate_room_id(str(body.get("room_id") or ""))
         if book.get(room_id) is None:
-            book.open(room_id)
+            ensure_room(room_id)
         book.set_session_active(room_id, bool(body.get("active")))
         return {"ok": True}
 
@@ -554,7 +1018,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         if seq < 1:
             raise HTTPException(status_code=400, detail="段落序號不正確")
         if book.get(room_id) is None:
-            book.open(room_id)
+            ensure_room(room_id)
         segment = pipeline.mark_missing(room_id, session_id, seq, str(body.get("reason") or "主持端放棄這段"))
         return {"ok": True, **segment.public()}
 
@@ -602,7 +1066,12 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         require_host(request, token, settings)
         body = await _json(request)
         share_override["host"] = str(body.get("host") or "").strip()
-        return {"ok": True, "listen_url": share_for(str(body.get("room_id") or "class"))}
+        room_id = str(body.get("room_id") or "class")
+        return {
+            "ok": True,
+            "listen_url": share_for(room_id, include_key=True),
+            "listen_key": _listen_key_of(room_id),
+        }
 
     @app.get("/api/metrics")
     async def metrics(request: Request) -> dict:
@@ -674,7 +1143,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         try:
             removed = await asyncio.wrap_future(pending)
         except Exception:
-            pipeline.unmute_room(room_id)
+            pipeline.unmute_room(room_id, abort=True)
             logging.getLogger("breeze.server").exception("caption store delete failed")
             return JSONResponse(
                 status_code=503,
@@ -706,7 +1175,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 reserved_key = query_key
         form = None
         try:
-            form = await request.form()
+            form = await _push_form(request, settings)
             try:
                 room_id = validate_room_id(_field(form, request, "room_id"))
                 session_id = validate_session_id(_field(form, request, "session_id"))
@@ -733,7 +1202,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             elif reserved and reserved_key is None:
                 pipeline.note_reserved(key)
                 reserved_key = key
-            book.open(room_id)
+            ensure_room(room_id)
             await ensure_hydrated(room_id)
             retry = _field(form, request, "retry") == "1" or request.headers.get("x-breeze-retry") == "1"
             t0_ms = _optional_ms(form, request, "t0_ms")
@@ -763,7 +1232,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                     held = False
                 raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
             if not held and (key in pipeline._reserved or key in pipeline._active):
-                await _wait_until_join_ready(pipeline, key)
+                await _wait_until_join_ready(pipeline, key, pipeline._result_wait_s())
             # Default still waits for English. Opt in to return at Chinese: form
             # wait_translation=0 and/or header x-breeze-async-translation: 1.
             opt_out = _field(form, request, "wait_translation").strip().lower() in {"0", "false"}
@@ -794,14 +1263,27 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 await form.close()
 
     @app.websocket("/ws/listen")
-    async def listen(ws: WebSocket, room_id: str = "class", cursor: int = 0, replay: int = 0) -> None:
+    async def listen(ws: WebSocket, room_id: str = "class", cursor: int = 0, replay: int = 0, k: str = "") -> None:
         try:
             room_id = validate_room_id(room_id)
         except RoomIdError:
             await ws.close(code=1008)
             return
-        await ws.accept()
+        # Origin and the listen key are checked before accept, so a rejected
+        # socket never receives hello or a caption.
+        if not audience_origin_allowed(
+            ws.headers.get("origin"),
+            ws.headers.get("host", ""),
+            settings,
+            _audience_extra_hosts(),
+        ):
+            await ws.close(code=1008)
+            return
         room = book.get(room_id)
+        if room is not None and not _listener_authorized(ws, room, k):
+            await ws.close(code=4401)
+            return
+        await ws.accept()
         if room is None:
             await ws.send_json({"type": "room_unavailable", "room_id": room_id, "reason": "unknown_or_ended"})
             await ws.close(code=4404)
@@ -814,20 +1296,28 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         room["listeners"].add(conn)
         await ensure_hydrated(room_id)
         resumed = bus.since(room_id, cursor)
+        history = bus.history(room_id) if cursor <= 0 else []
+        events = list(resumed["events"]) if cursor > 0 else []
         hello = {
             "type": "hello",
-            "history": bus.history(room_id) if cursor <= 0 else [],
-            "events": resumed["events"] if cursor > 0 else [],
+            "history": _audience_captions(_captions_since_open(room_id, history)),
+            "events": _audience_captions(_captions_since_open(room_id, events)),
             "gap": bool(resumed["gap"]) if cursor > 0 else False,
             "latest_cursor": bus.latest_cursor(room_id),
             "oldest_cursor": resumed["oldest_cursor"],
             "room_id": room_id,
             "epoch": bus.epoch(room_id),
         }
-        if cursor > 0 and resumed.get("gap"):
-            hello["backfill"] = list(resumed.get("backfill") or [])
-        if int(replay or 0) == 1:
-            hello["backfill"] = bus.caption_state(room_id)
+        wants_backfill = int(replay or 0) == 1 or (cursor > 0 and bool(resumed.get("gap")))
+        if wants_backfill:
+            if int(replay or 0) == 1:
+                source = bus.caption_state(room_id)
+            else:
+                source = list(resumed.get("backfill") or [])
+            visible = _captions_since_open(room_id, source)
+            ip = ws.client.host if ws.client is not None else ""
+            if replay_gate.allow(ip):
+                hello["backfill"] = _audience_captions(visible)
         try:
             await ws.send_json(hello)
         except Exception:

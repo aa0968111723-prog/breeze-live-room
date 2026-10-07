@@ -117,7 +117,9 @@ class Pipeline:
         self._index: dict[tuple[str, str, int], dict] = {}
         self._sealed: dict[str, set[str]] = {}
         self._braced: dict[str, set[str]] = {}
+        self._braced_dropped: dict[str, dict] = {}
         self._muted: set[str] = set()
+        self._mute_backlog: dict[str, list[Segment]] = {}
         self.inflight = 0
         self.rejected = 0
         self.missing_count = 0
@@ -309,6 +311,10 @@ class Pipeline:
         self._sealed.pop(room_id, None)
         self._braced.pop(room_id, None)
         self._muted.discard(room_id)
+        self._mute_backlog.pop(room_id, None)
+        prefix = room_id + ":"
+        for ident in [ident for ident in self._braced_dropped if ident.startswith(prefix)]:
+            self._braced_dropped.pop(ident, None)
 
     def note_retained_order(self, room_id: str, rows: list[dict]) -> None:
         """Reseed session ordinals after a close that kept the room's captions.
@@ -359,16 +365,51 @@ class Pipeline:
 
     def _mark_emitted(self, segment: Segment) -> None:
         self._emitted_segs.add(segment.key)
-        for fut in self._emit_waiters.pop(segment.key, []):
+        self._release_emit_waiters(segment.key)
+
+    def _release_emit_waiters(self, key: tuple[str, str, int]) -> None:
+        """Unblock a push waiting to publish. Does not count the caption as emitted."""
+        for fut in self._emit_waiters.pop(key, []):
             if not fut.done():
                 fut.set_result(True)
+
+    def _discard_emit_waiter(self, key: tuple[str, str, int], fut: asyncio.Future) -> None:
+        waiters = self._emit_waiters.get(key)
+        if not waiters:
+            return
+        remaining = [item for item in waiters if item is not fut]
+        if remaining:
+            self._emit_waiters[key] = remaining
+        else:
+            self._emit_waiters.pop(key, None)
+
+    def _emit_wait_s(self) -> float:
+        """Long enough for a gap fill and a session flush. Not long enough to hang a push."""
+        return max(0.0, float(self.settings.gap_wait_s)) + max(0.0, float(self.settings.stop_flush_s)) + 5.0
+
+    def _result_wait_s(self) -> float:
+        """Bound for a push waiting on decode, recognition, ordered emit, or English."""
+        settings = self.settings
+        return (
+            self._emit_wait_s()
+            + max(0.0, float(settings.decode_timeout_s))
+            + max(0.0, float(settings.asr_timeout_s))
+            + max(0.0, float(settings.translate_timeout_s)) * 2
+            + 5.0
+        )
 
     async def _wait_emitted(self, segment: Segment) -> None:
         if segment.key in self._emitted_segs:
             return
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._emit_waiters.setdefault(segment.key, []).append(fut)
-        await fut
+        try:
+            await wait_bounded(fut, self._emit_wait_s())
+        except asyncio.TimeoutError:
+            self._discard_emit_waiter(segment.key, fut)
+        except asyncio.CancelledError:
+            self._discard_emit_waiter(segment.key, fut)
+            raise
 
     def _voided(self, segment: Segment) -> bool:
         return segment.id in self._sealed.get(segment.room_id, ())
@@ -481,6 +522,14 @@ class Pipeline:
             self._held.pop(group, None)
         for key in [key for key in self._tr_epoch if key[0] == room_id]:
             self._tr_epoch[key] = self._tr_epoch.get(key, 0) + 1
+        # A single-caption delete still in flight must not unseal what this room delete sealed.
+        self._braced.pop(room_id, None)
+        self._mute_backlog.pop(room_id, None)
+        prefix = room_id + ":"
+        for ident in [ident for ident in self._braced_dropped if ident.startswith(prefix)]:
+            self._braced_dropped.pop(ident, None)
+        for key in [key for key in self._emit_waiters if key[0] == room_id]:
+            self._release_emit_waiters(key)
 
     def caption_known(self, room_id: str, session_id: str, seq: int) -> bool:
         """True when this seq is still in pipeline state. A sealed id that was removed is not known."""
@@ -517,24 +566,42 @@ class Pipeline:
         """Hold publishes while a room delete is waiting on the store."""
         self._muted.add(room_id)
 
-    def unmute_room(self, room_id: str) -> None:
+    def unmute_room(self, room_id: str, *, abort: bool = False) -> None:
+        """End the mute. A failed delete republishes captions finalized during the window."""
         self._muted.discard(room_id)
+        backlog = self._mute_backlog.pop(room_id, [])
+        if not abort:
+            return
+        for segment in backlog:
+            try:
+                self._emit(segment)
+            except Exception:
+                logging.getLogger("breeze.pipeline").exception("muted caption replay failed")
+                self._release_emit_waiters(segment.key)
+
+    def _park_muted(self, segment: Segment) -> None:
+        rows = self._mute_backlog.setdefault(segment.room_id, [])
+        for index, item in enumerate(rows):
+            if item.key == segment.key:
+                rows[index] = segment
+                return
+        rows.append(segment)
 
     def brace_delete(self, room_id: str, session_id: str, seq: int) -> None:
         """Stop a later emit from saving this id before the store delete settles.
 
         The caption stays in memory. abort_delete undoes a seal this call added.
+        A sealed id is already void, so this does not bump the translation epoch.
         """
         ident = f"{room_id}:{session_id}:{seq}"
-        key = (room_id, session_id, seq)
         already = ident in self._sealed.get(room_id, ())
         self._sealed.setdefault(room_id, set()).add(ident)
         if not already:
             self._braced.setdefault(room_id, set()).add(ident)
-        self._tr_epoch[key] = self._tr_epoch.get(key, 0) + 1
 
     def abort_delete(self, room_id: str, session_id: str, seq: int) -> None:
         ident = f"{room_id}:{session_id}:{seq}"
+        key = (room_id, session_id, seq)
         braced = self._braced.get(room_id)
         if braced is None or ident not in braced:
             return
@@ -542,6 +609,36 @@ class Pipeline:
         sealed = self._sealed.get(room_id)
         if sealed is not None:
             sealed.discard(ident)
+        dropped = self._braced_dropped.pop(ident, None) or {}
+        segment = self.results.get(key)
+        if segment is None and key in self._index:
+            segment = self._rehydrate(key)
+        result = dropped.get("result")
+        if (
+            result is not None
+            and segment is not None
+            and segment.status == "zh_ready"
+            and segment.zh == dropped.get("zh")
+            and not self._stale(segment)
+        ):
+            self._finish_translation(segment, result, None, segment.zh)
+            self._wake(key, self.results.get(key, segment))
+            return
+        if (
+            dropped.get("requeue")
+            and segment is not None
+            and segment.status == "zh_ready"
+            and not self._stale(segment)
+        ):
+            self.ensure_workers()
+            if self._translate_q is not None:
+                self._put_translation(segment)
+            return
+        emit_seg = dropped.get("emit")
+        if emit_seg is not None:
+            self._emit(emit_seg)
+        if segment is not None and not segment.translate_queued:
+            self._wake(key, self.results.get(key, segment))
 
     def delete_segment(self, room_id: str, session_id: str, seq: int) -> None:
         key = (room_id, session_id, seq)
@@ -550,6 +647,7 @@ class Pipeline:
         if braced is not None:
             braced.discard(ident)
         self._sealed.setdefault(room_id, set()).add(ident)
+        self._braced_dropped.pop(ident, None)
         self._tr_epoch[key] = self._tr_epoch.get(key, 0) + 1
         self._index.pop(key, None)
         self._hashes.pop(key, None)
@@ -567,11 +665,20 @@ class Pipeline:
             self._next[(room_id, session_id)] = seq + 1
             self._gap_since.pop((room_id, session_id, seq), None)
             self._drain((room_id, session_id))
+        self._release_emit_waiters(key)
 
     def _emit(self, segment: Segment) -> None:
-        if segment.room_id in self._muted or self._stale(segment) or self._voided(segment):
-            # Do not mark emitted: that would unblock zh_ready into a translation wait
-            # for a caption that will never be queued.
+        if segment.room_id in self._muted and not self._stale(segment) and not self._voided(segment):
+            # _drain already advanced _next. Keep the caption and publish it if the delete fails.
+            self._park_muted(segment)
+            return
+        if self._voided(segment) and segment.id in self._braced.get(segment.room_id, ()) and not self._stale(segment):
+            # The seal is temporary. Remember the version so a 503 can publish it.
+            self._braced_dropped.setdefault(segment.id, {})["emit"] = segment
+            return
+        if self._stale(segment) or self._voided(segment):
+            # Not published, so it must not count as emitted. The waiting push still has to return.
+            self._release_emit_waiters(segment.key)
             return
         marker = (*segment.key, segment.version)
         if marker in self._seen_versions:
@@ -760,7 +867,11 @@ class Pipeline:
         self._drain(group)
 
     def _seq_settled(self, key: tuple[str, str, int]) -> bool:
-        """True once this seq has arrived and is no longer decoding or queued for English."""
+        """True once this seq has arrived and left decoding.
+
+        English may still be queued. The host already opted out of waiting for
+        it on upload, and stop should not sit out the flush window for a translation.
+        """
         if key in self._active or key in self._reserved:
             return False
         flight = self._flight.get(key)
@@ -771,14 +882,6 @@ class Pipeline:
             current = self._rehydrate(key)
         if current is None or current.status in {"queued", "decoding", "transcribing"}:
             return False
-        if current.translate_queued:
-            return False
-        if self._translate_q is not None:
-            room_id, session_id, seq = key
-            for item in list(self._translate_q._queue):
-                segment = item[2]
-                if segment.room_id == room_id and segment.session_id == session_id and segment.seq == seq:
-                    return False
         return True
 
     def _through_seq_settled(self, group: tuple[str, str], last_seq: int) -> bool:
@@ -908,7 +1011,7 @@ class Pipeline:
             if not reprocess:
                 if slot_held:
                     self.release_slot()
-                return await self._wait_result(existing)
+                return await self._wait_result(existing, wait_translation=wait_translation)
             segment.version = max(existing.version + 1, 1)
         elif existing and stored != digest:
             # Restored rows have no audio hash. Returning the saved caption
@@ -920,7 +1023,7 @@ class Pipeline:
                 floor = self._version_floor.get(segment.key, 0)
                 if floor and existing.version < floor:
                     existing.version = floor
-                return await self._wait_result(existing)
+                return await self._wait_result(existing, wait_translation=wait_translation)
             if not salvage:
                 if slot_held:
                     self.release_slot()
@@ -971,20 +1074,46 @@ class Pipeline:
             setattr(fut, "room_gen", segment.room_gen)
         return fut
 
-    def _result_ready(self, segment: Segment) -> bool:
+    def _result_ready(self, segment: Segment, *, wait_translation: bool = True) -> bool:
         if self._stale(segment):
             return True
         if segment.status in TERMINAL and segment.status != "zh_ready":
             return True
-        # Ordered Chinese with no translation queued will never wake a waiter.
-        return segment.status == "zh_ready" and segment.key in self._emitted_segs and not segment.translate_queued
+        if segment.status != "zh_ready" or segment.key not in self._emitted_segs:
+            return False
+        # Async opt-in returns as soon as ordered Chinese is published.
+        return (not wait_translation) or (not segment.translate_queued)
 
-    async def _wait_result(self, segment: Segment) -> Segment:
-        if self._result_ready(segment):
+    async def _wait_result(self, segment: Segment, *, wait_translation: bool = True) -> Segment:
+        if self._result_ready(segment, wait_translation=wait_translation):
             return segment
+        if not wait_translation:
+            try:
+                if segment.key not in self._emitted_segs:
+                    await self._wait_emitted(segment)
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    raise
+            current = self.results.get(segment.key)
+            current = current if current is not None else segment
+            if self._result_ready(current, wait_translation=False):
+                return current
+            if self._stale(current) or current.status in TERMINAL:
+                return current
         fut = self._future(segment)
         self._waiters.setdefault(segment.key, []).append(fut)
-        return await fut
+        try:
+            return await wait_bounded(fut, self._result_wait_s())
+        except asyncio.TimeoutError:
+            self._discard_waiter(segment.key, fut)
+            if not fut.done():
+                fut.cancel()
+            current = self.results.get(segment.key)
+            return current if current is not None else segment
+        except asyncio.CancelledError:
+            self._discard_waiter(segment.key, fut)
+            raise
 
     def _discard_waiter(self, key: tuple[str, str, int], fut: asyncio.Future) -> None:
         waiters = self._waiters.get(key)
@@ -1148,7 +1277,14 @@ class Pipeline:
                     return self._abandon(segment)
                 return segment
             if not fut.done():
-                await fut
+                await wait_bounded(fut, self._result_wait_s())
+        except asyncio.TimeoutError:
+            self._discard_waiter(segment.key, fut)
+            if not fut.done():
+                fut.cancel()
+            if self._stale(segment) or self._voided(segment):
+                return self._abandon(segment)
+            return self.results.get(segment.key, segment)
         except asyncio.CancelledError:
             task = asyncio.current_task()
             if task is not None and task.cancelling():
@@ -1319,9 +1455,63 @@ class Pipeline:
                 self._translate_busy = max(0, self._translate_busy - 1)
                 self._translate_q.task_done()
 
+    def _suppress_attempt(self, segment: Segment, epoch: int, result: TranslateResult | None) -> None:
+        """Remember work hidden by a temporary seal. A real delete or a newer epoch owns the flag."""
+        if self._stale(segment):
+            return
+        if segment.id not in self._braced.get(segment.room_id, ()):
+            return
+        if self._tr_epoch.get(segment.key) != epoch:
+            return
+        slot = self._braced_dropped.setdefault(segment.id, {})
+        if result is not None:
+            slot["result"] = result
+            slot["zh"] = segment.zh
+            slot.pop("requeue", None)
+            return
+        if "result" not in slot:
+            slot["requeue"] = True
+
+    def _finish_translation(
+        self,
+        segment: Segment,
+        translated: TranslateResult,
+        epoch: int | None,
+        zh_snapshot: str | None,
+    ) -> bool:
+        """Publish one finished attempt. Return False when this attempt must not land.
+
+        Pass epoch=None only after abort_delete has lifted the seal.
+        """
+        if epoch is not None and not self._epoch_current(segment, epoch):
+            # A newer attempt owns translate_queued. Do not clear it.
+            # A brace is not a newer attempt: keep the result for abort_delete.
+            self._suppress_attempt(segment, epoch, translated)
+            return False
+        if zh_snapshot is not None and segment.zh != zh_snapshot:
+            segment.translate_queued = False
+            return False
+        segment.en = translated.text or ""
+        segment.translate_status = translated.status
+        segment.error = translated.detail
+        segment.status = "ready" if translated.status in {"ok", "off", "no_key"} else "translate_failed"
+        segment.translate_queued = False
+        segment.version = segment.version + 1
+        if epoch is not None and not self._epoch_current(segment, epoch):
+            segment.en = ""
+            return False
+        if zh_snapshot is not None and segment.zh != zh_snapshot:
+            segment.en = ""
+            segment.translate_queued = False
+            return False
+        self.results[segment.key] = segment
+        self._emit(segment)
+        return True
+
     async def _apply_translation(self, segment: Segment, epoch: int, enqueued_at: float) -> None:
         if not self._epoch_current(segment, epoch):
             # A newer attempt owns translate_queued. Do not clear it.
+            self._suppress_attempt(segment, epoch, None)
             return
         if segment.key not in self._emitted_segs:
             segment.translate_queued = False
@@ -1354,6 +1544,8 @@ class Pipeline:
             cfut.cancel()
             if self._epoch_current(segment, epoch):
                 self._fail_translation(segment, "timeout", "英譯逾時，不假設沒有計費。中文仍保留")
+            else:
+                self._suppress_attempt(segment, epoch, None)
             return
         except asyncio.CancelledError:
             if cancel is not None:
@@ -1365,28 +1557,10 @@ class Pipeline:
                 cancel.set()
             if self._epoch_current(segment, epoch):
                 self._fail_translation(segment, "error", "英譯失敗，中文仍保留")
+            else:
+                self._suppress_attempt(segment, epoch, None)
             return
-        if not self._epoch_current(segment, epoch):
-            # A newer attempt owns translate_queued. Do not clear it.
-            return
-        if segment.zh != zh_snapshot:
-            segment.translate_queued = False
-            return
-        segment.en = translated.text or ""
-        segment.translate_status = translated.status
-        segment.error = translated.detail
-        segment.status = "ready" if translated.status in {"ok", "off", "no_key"} else "translate_failed"
-        segment.translate_queued = False
-        segment.version = segment.version + 1
-        if not self._epoch_current(segment, epoch):
-            segment.en = ""
-            return
-        if segment.zh != zh_snapshot:
-            segment.en = ""
-            segment.translate_queued = False
-            return
-        self.results[segment.key] = segment
-        self._emit(segment)
+        self._finish_translation(segment, translated, epoch, zh_snapshot)
 
     def _remember_zh(self, segment: Segment) -> None:
         if not segment.zh or self._stale(segment):
@@ -1495,7 +1669,10 @@ class Pipeline:
             self._max_seq[group] = int(info["max_seq"])
             # Past the saved seqs, so a continuing session does not invent 1..N gaps.
             self._next[group] = int(info["max_seq"]) + 1
-            for seq in range(1, int(info["max_seq"]) + 1):
+            # Seq below the oldest saved caption were expired or purged, not missing.
+            # Filling 1..max_seq would resurrect them as blank captions with a new TTL.
+            oldest = min(info["seqs"]) if info["seqs"] else 1
+            for seq in range(oldest, int(info["max_seq"]) + 1):
                 if seq not in info["seqs"]:
                     self.mark_missing(room_id, session_id, seq, "缺段：這段沒有留在逐字稿裡")
         if max_ord:

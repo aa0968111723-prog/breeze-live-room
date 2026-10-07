@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import time
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -22,6 +23,57 @@ class HoldEnglish(Translator):
         self.started.set()
         self.release.wait(3)
         return TranslateResult("EN " + zh, "ok")
+
+
+@pytest.mark.anyio
+async def test_async_retry_duplicate_returns_at_zh():
+    """A recorder retry of the same digest must honour wait_translation=0 while English is stuck."""
+    translator = HoldEnglish()
+    app = app_for(
+        translator=translator,
+        settings=settings_with(
+            allow_testclient=True,
+            translate_workers=1,
+            translate_timeout_s=5,
+        ),
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            first = await asyncio.wait_for(
+                push(client, token, "class", "s", 1, "新".encode(), wait_translation="0", async_header=True),
+                2,
+            )
+            assert first.status_code == 200, first.text
+            assert first.json()["status"] == "zh_ready"
+            assert await asyncio.to_thread(translator.started.wait, 2)
+            started = time.monotonic()
+            again = await asyncio.wait_for(
+                push(
+                    client, token, "class", "s", 1, "新".encode(),
+                    wait_translation="0", async_header=True, retry=True,
+                ),
+                0.5,
+            )
+            assert time.monotonic() - started < 0.5
+            assert again.status_code == 200, again.text
+            body = again.json()
+            assert body["status"] == "zh_ready"
+            assert body["zh"] == "新"
+            assert not body.get("en")
+            blocked = asyncio.create_task(
+                push(client, token, "class", "s", 1, "新".encode(), retry=True),
+            )
+            await asyncio.sleep(0.3)
+            assert not blocked.done()
+            translator.release.set()
+            synced = await asyncio.wait_for(blocked, 3)
+            assert synced.status_code == 200, synced.text
+            assert synced.json()["status"] == "ready"
+            assert synced.json()["en"] == "EN 新"
+    finally:
+        translator.release.set()
+        await stop(app)
 
 
 @pytest.mark.anyio

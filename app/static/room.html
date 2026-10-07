@@ -2,21 +2,23 @@
 <html lang="zh-Hant">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>禪譯聽眾</title>
 <style>
-:root { --bg: #fbf6ee; --fg: #2a2118; --muted: #6b5644; --line: rgba(90, 60, 30, .2); --size: 34px; }
-body { margin: 0; background: var(--bg); color: var(--fg); font-family: "Segoe UI", "PingFang TC", sans-serif; }
+:root { --bg: #fbf6ee; --fg: #2a2118; --muted: #6b5644; --line: rgba(90, 60, 30, .2); --size: 40px; }
+body { margin: 0; min-height: 100dvh; display: flex; flex-direction: column; background: var(--bg); color: var(--fg); font-family: "Segoe UI", "PingFang TC", sans-serif; }
 body.dark { --bg: #16130f; --fg: #f6f1e7; --muted: #d9d0c3; --line: rgba(255, 255, 255, .16); }
 body.zh-only .en, body.en-only .zh { display: none; }
-.en { font-size: var(--size); padding: 24px 20px 8px; line-height: 1.35; }
-.zh { font-size: calc(var(--size) * .62); color: var(--muted); padding: 0 20px 20px; line-height: 1.45; }
-header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 12px 16px; }
+header { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 16px calc(10px + env(safe-area-inset-top)); background: color-mix(in srgb, var(--bg) 92%, transparent); }
 button, select { font-size: 16px; min-height: 44px; padding: 8px 12px; border-radius: 10px; border: 0; background: #8a5424; color: white; }
-#state { color: var(--muted); }
-ul { list-style: none; margin: 0; padding: 0 16px 24px; max-height: 40vh; overflow: auto; }
-li { padding: 8px 0; border-top: 1px solid var(--line); }
-#hist-label { margin: 0 16px; color: var(--muted); }
+button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px solid #c47a32; outline-offset: 2px; }
+#state { color: var(--fg); font-weight: 750; }
+.stage { flex: 1; display: flex; flex-direction: column; justify-content: center; min-height: 42vh; padding: 8px 8px 12px; }
+.en { font-size: var(--size); font-weight: 700; padding: 12px 20px 8px; line-height: 1.35; }
+.zh { font-size: calc(var(--size) * .62); color: var(--muted); padding: 0 20px 20px; line-height: 1.45; }
+ul { list-style: none; margin: 0; padding: 0 16px calc(24px + env(safe-area-inset-bottom)); max-height: 28vh; overflow: auto; }
+li { padding: 8px 0; border-top: 1px solid var(--line); font-size: 16px; }
+#hist-label { margin: 0 16px; color: var(--muted); font-size: 14px; }
 </style>
 </head>
 <body>
@@ -30,13 +32,16 @@ li { padding: 8px 0; border-top: 1px solid var(--line); }
 <label><input id="pause" type="checkbox"> 暫停跟隨</label>
 <button id="live" type="button">回到即時</button>
 </header>
+<div class="stage">
 <div class="en" id="en">等待主持端</div>
 <div class="zh" id="zh"></div>
+</div>
 <p id="hist-label">最近字幕</p>
 <ul id="history"></ul>
 <script type="module">
 import { connectRoom, createCaptionView, liveTail, orderedCaptions } from "/static/room_client.js";
 const room = location.pathname.split("/").filter(Boolean).pop();
+const listenKey = new URLSearchParams(location.search).get("k") || "";
 const view = createCaptionView(80);
 const items = view.items;
 const state = { follow: true, pinned: null };
@@ -67,7 +72,9 @@ function connect() {
     room,
     url: () => {
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      return proto + "://" + location.host + "/ws/listen?room_id=" + encodeURIComponent(room);
+      let address = proto + "://" + location.host + "/ws/listen?room_id=" + encodeURIComponent(room);
+      if (listenKey) address += "&k=" + encodeURIComponent(listenKey);
+      return address;
     },
     onState: (text) => { document.querySelector("#state").textContent = text; },
     onEvent: show,

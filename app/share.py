@@ -51,8 +51,17 @@ def list_share_hosts() -> list[str]:
     return found
 
 
-def listen_url(room_id: str, port: int, scheme: str = "http", host: str | None = None) -> str | None:
+def listen_url(
+    room_id: str,
+    port: int,
+    scheme: str = "http",
+    host: str | None = None,
+    listen_key: str | None = None,
+) -> str | None:
     ip = host if host else lan_ip()
     if not ip or not shareable(ip):
         return None
-    return f"{scheme}://{ip}:{port}/r/{quote(room_id)}"
+    url = f"{scheme}://{ip}:{port}/r/{quote(room_id)}"
+    if listen_key:
+        url += "?k=" + quote(listen_key, safe="")
+    return url

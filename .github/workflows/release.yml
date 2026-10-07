@@ -11,10 +11,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
       - run: python -m pip install -r requirements-lock.txt -r requirements-dev.txt
@@ -75,7 +75,7 @@ jobs:
           if ((Get-FileHash (Join-Path $target '.env')).Hash -ne $before) { throw 'Setup overwrote user settings' }
           if ((Get-Content (Join-Path $target 'data/preservation-check.txt')).Trim() -ne 'keep-user-data') { throw 'Setup removed user data' }
       - run: python scripts/package_release.py
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Breeze-Windows-installer
           path: |
@@ -83,7 +83,7 @@ jobs:
             dist/Breeze-Live-Room-Setup.exe.sha256
             dist/Breeze-Live-Room-Windows.zip
             dist/Breeze-Live-Room-Windows.zip.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: Windows-inference-report
@@ -96,7 +96,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: Breeze-Windows-installer
           path: dist

@@ -30,7 +30,7 @@ from pathlib import Path
 from httpx import ASGITransport, AsyncClient
 
 from app.asr import AsrResult
-from app.server import create_app
+from app.server import create_app, rss_bytes
 from app.settings import Settings
 from app.translate import Translator
 from tests.test_round2 import Socket, auth, copy_decoder, open_room, stop, token_of
@@ -58,8 +58,18 @@ def virtual_s(real_s: float) -> float:
 
 
 def vlimit(limit: float) -> float:
-    """More generous of ±20% or +2 virtual seconds, not both stacked."""
-    return limit + max(limit * 0.2, 2.0)
+    """Spec threshold in virtual seconds.
+
+    Windows is the only platform that gets any slack, and only 20%. Its timer
+    tick is about 15.6 ms, which at the Windows sim scale is a large fraction
+    of a short limit. A zero-wait check and the SRT end bound do not go through
+    here: one Windows 3.11 run booked a 109 ms stall as 5.45 virtual seconds
+    of recorder pause (scale 0.02) and the same stretch on the last cue. That
+    is a simulator stall while a slot was still held, not a wider spec limit.
+    """
+    if sys.platform == "win32":
+        return limit * 1.2
+    return limit
 
 
 def percentile(values: list[float], p: float) -> float:
@@ -98,15 +108,19 @@ def sim_settings(**over) -> Settings:
 class TextAsr:
     """Audio bytes are the Chinese line. delay_v is virtual seconds."""
 
-    def __init__(self, delay_v: float = 1.5, gate=None):
+    def __init__(self, delay_v: float = 1.5, gate=None, on_start=None):
         self.delay_v = delay_v
         self.gate = gate
+        self.on_start = on_start
         self.calls = 0
         self.done_at: list[float] = []
         self.seen: list[str] = []
 
     def transcribe(self, wav: Path, prompt: str = "") -> AsrResult:
         del prompt
+        # The admit slot is still held here. Callers use this to observe pending.
+        if self.on_start is not None:
+            self.on_start()
         text = wav.read_bytes().decode()
         self.seen.append(text)
         self.calls += 1
@@ -348,7 +362,10 @@ async def post_segment(client, token, room, session, seq, payload: bytes, t0_ms:
 class VirtualHost:
     """recorder_machine.js with the host page's async-translation opt-in."""
 
-    def __init__(self, client, token, room, session, scale=None, max_inflight=2, period_v=6.0, retry_429_v=0.8):
+    def __init__(
+        self, client, token, room, session, scale=None, max_inflight=2, period_v=6.0, retry_429_v=0.8,
+        hold_for_retry: bool = False,
+    ):
         self.client = client
         self.token = token
         self.room = room
@@ -357,6 +374,14 @@ class VirtualHost:
         self.max_inflight = max_inflight
         self.period_v = period_v
         self.retry_429_v = retry_429_v
+        # host.html retries a 429 inside the upload and keeps recording until
+        # maxInflight uploads are out. Only a one-slot queue must hold the
+        # recorder for that retry, or the next slice takes the slot.
+        self.hold_for_retry = hold_for_retry
+        # Cleared only around a stop-the-world sample so that sample is not
+        # inside the upload whose latency we measure. Set means slices may start.
+        self._release_slice = asyncio.Event()
+        self._release_slice.set()
         self.waiting: list[tuple[float, float]] = []
         self.responses: list[dict] = []
         self.retries: list[int] = []
@@ -373,7 +398,18 @@ class VirtualHost:
         self._tasks = {task for task in self._tasks if not task.done()}
         return set(self._tasks)
 
+    def hold_new_slices(self) -> None:
+        """Park uploads that have not started. Already-running slices are left alone."""
+        self._release_slice.clear()
+
+    def release_new_slices(self) -> None:
+        self._release_slice.set()
+
     async def upload_one(self, seq: int, t0_ms: int, t1_ms: int, text: str):
+        # Event.wait() returns immediately when the event is set, without yielding.
+        # A cleared event parks this slice until the heap sample is done, and
+        # segment_end is taken after that so the sample is not latency.
+        await self._release_slice.wait()
         payload = text.encode()
         self.segment_end_mono[seq] = time.monotonic()
         started = time.monotonic()
@@ -382,17 +418,19 @@ class VirtualHost:
         try:
             resp = await post_segment(self.client, self.token, self.room, self.session, seq, payload, t0_ms, t1_ms)
             if resp.status_code == 429:
-                # host.html awaits this same upload through one 800ms retry. While that
-                # promise is in flight the recorder must not open another slice: with
-                # max_queue=1 the new slice would take the slot the retry is waiting for.
+                # host.html sleeps 800ms and posts this same upload once more.
+                # With max_queue=1 that retry has to wait until the other upload
+                # releases the only slot, and the recorder must not start a slice
+                # that would take it. A wider queue retries immediately.
                 self.retries.append(seq)
                 current = asyncio.current_task()
-                if current is not None:
+                if current is not None and self.hold_for_retry:
                     self._retry_tasks.add(current)
                 try:
-                    holders = [task for task in self._active_tasks() if task not in self._retry_tasks]
-                    if holders:
-                        await asyncio.wait(holders)
+                    if self.hold_for_retry:
+                        holders = [task for task in self._active_tasks() if task not in self._retry_tasks]
+                        if holders:
+                            await asyncio.wait(holders)
                     await asyncio.sleep(self.retry_429_v * self.scale)
                     resp = await post_segment(
                         self.client, self.token, self.room, self.session, seq, payload, t0_ms, t1_ms, retry=True,
@@ -440,12 +478,15 @@ class VirtualHost:
     ) -> None:
         """Record ``count`` slices. drain=False returns once the last slice is handed to
         upload, like pressing stop right after speaking; stop() then settles uploads.
-        before_slice(seq) runs synchronously before the slot check, outside any
-        measured wait."""
+        before_slice(seq) runs before the slot check, outside any measured wait.
+        An async hook is awaited; a hook that returns without awaiting does not
+        yield, so arming a 429 storm still beats the upload created last slice."""
         text_of = text_of or (lambda i: f"第{i}句")
         for seq in range(1, count + 1):
             if before_slice is not None:
-                before_slice(seq)
+                hooked = before_slice(seq)
+                if asyncio.iscoroutine(hooked):
+                    await hooked
             await self._wait_slot()
             if pace:
                 await asyncio.sleep(self.period_v * self.scale)
@@ -540,7 +581,15 @@ class SimReport:
     missing: int = 0
     silent: int = 0
     tracemalloc_500: int = 0
+    tracemalloc_750: int = 0
     tracemalloc_1000: int = 0
+    rss_500: int = 0
+    rss_750: int = 0
+    rss_1000: int = 0
+    pending_peak: int = 0
+    storm_rejects: int = 0
+    retries: list[int] = field(default_factory=list)
+    translate_skipped: int = 0
 
 
 def _zh_ready_times(listeners: list[Listener]) -> dict[int, float]:
@@ -565,6 +614,42 @@ def caption_rows(app, room: str) -> list[dict]:
     return [dict(item) for item in bus.by_room.get(room, [])]
 
 
+def _translations_idle(pipe) -> bool:
+    queued = 0 if pipe._translate_q is None else pipe._translate_q.qsize()
+    return pipe._translate_busy <= 0 and queued == 0
+
+
+async def _wait_translate_idle(pipe, timeout: float = 5.0) -> None:
+    """Wait until no English is queued or in a worker.
+
+    The admit slot is already released at Chinese, so this is not a recorder
+    pause. Callers that then hold the loop (gc, tracemalloc) need the wait:
+    the scaled translate budget is a few hundred real milliseconds, and a
+    longer hold stores that line as a timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if _translations_idle(pipe):
+            # A deferred queue offer is a call_soon. Let it land, then recheck.
+            await asyncio.sleep(0)
+            if _translations_idle(pipe):
+                return
+        if time.monotonic() >= deadline:
+            return
+        await asyncio.sleep(0.005)
+
+
+async def sample_after_translations(pipe, sample):
+    """Run sample() only after in-flight English has landed.
+
+    sample() may stop the loop. On Python 3.11 a tracemalloc walk of this
+    process is longer than the scaled 40s translate budget, so a line the
+    worker has already started would be published with no English.
+    """
+    await _wait_translate_idle(pipe)
+    return sample()
+
+
 async def _wait_translations(app, translator, count: int) -> None:
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
@@ -573,9 +658,57 @@ async def _wait_translations(app, translator, count: int) -> None:
         # _translate_busy is this branch's worker counter. Main has no such attribute;
         # the queue size is enough to know the scripted translator has finished.
         busy = getattr(app.state.pipeline, "_translate_busy", 0)
-        if done >= count and stats.get("translate_queued", 0) == 0 and busy <= 0:
+        # A full translate queue drops the oldest line. That line never calls
+        # the translator, so it is not in ``finished``; it still left the queue.
+        skipped = int(getattr(app.state.pipeline, "translate_skipped", 0) or 0)
+        if done + skipped >= count and stats.get("translate_queued", 0) == 0 and busy <= 0:
             return
         await asyncio.sleep(0.01)
+
+
+def _seq_of(zh: str) -> int:
+    digits = "".join(ch for ch in zh if ch.isdigit())
+    return int(digits) if digits else 0
+
+
+def _app_traced_bytes() -> int:
+    """Live bytes allocated from app/. The sim client is not included."""
+    if not tracemalloc.is_tracing():
+        return 0
+    root = (Path(__file__).resolve().parents[1] / "app").resolve()
+    total = 0
+    for stat in tracemalloc.take_snapshot().statistics("filename"):
+        raw = stat.traceback[0].filename
+        if not raw or raw.startswith("<"):
+            continue
+        filename = Path(raw).resolve()
+        if filename == root or root in filename.parents:
+            total += stat.size
+    return total
+
+
+def _sample_server_memory() -> tuple[int, int]:
+    """One collection with GC enabled, then server heap and process RSS.
+
+    The paced run leaves automatic GC off so a collection cannot be booked as
+    a recorder pause. This turns it on for the sample only.
+    """
+    was = gc.isenabled()
+    gc.enable()
+    gc.collect()
+    traced = _app_traced_bytes()
+    rss = rss_bytes()
+    if not was:
+        gc.disable()
+    return traced, rss
+
+
+def _class_plan(zh: str):
+    """2s English, except a 40s window on segments 300-330 (the translate timeout)."""
+    seq = _seq_of(zh)
+    if 300 <= seq <= 330:
+        return ("ok", 40.0)
+    return ("ok", 2.0)
 
 
 async def _run_100min_async() -> SimReport:
@@ -583,10 +716,40 @@ async def _run_100min_async() -> SimReport:
     session = "sim100"
     root = Path(tempfile.mkdtemp(prefix="breeze-sim-"))
     db_path = root / "class.sqlite3"
-    translator = ScriptedTranslator(lambda zh: ("ok", 2.0))
-    asr = TextAsr(1.5)
+    translator = ScriptedTranslator(_class_plan)
+    observed = {"pipe": None, "pending": 0}
+
+    def on_start() -> None:
+        pipe = observed["pipe"]
+        if pipe is None:
+            return
+        pending = int(pipe.stats()["pending"])
+        if pending > observed["pending"]:
+            observed["pending"] = pending
+
+    asr = TextAsr(1.5, on_start=on_start)
     settings = sim_settings(data_path=str(db_path))
     app = create_app(settings, asr=asr, translator=translator, decoder=copy_decoder)
+    observed["pipe"] = app.state.pipeline
+    # At segment 600 the next 16 admits fail once each. The following admit
+    # (the host's single retry) is let through. rejected counts those 429s.
+    storm = {"rounds": 0, "let_pass": False, "rejects": 0}
+    pipe = app.state.pipeline
+    orig_admit = pipe.try_admit_count
+
+    def storm_admit() -> bool:
+        if storm["let_pass"]:
+            storm["let_pass"] = False
+            return orig_admit()
+        if storm["rounds"] > 0:
+            storm["rounds"] -= 1
+            storm["let_pass"] = True
+            pipe.rejected += 1
+            storm["rejects"] += 1
+            return False
+        return orig_admit()
+
+    pipe.try_admit_count = storm_admit
     tracing = tracemalloc.is_tracing()
     if not tracing:
         tracemalloc.start()
@@ -597,14 +760,42 @@ async def _run_100min_async() -> SimReport:
     # server never see. Freeze what exists before the class, turn automatic GC off
     # for the paced run, and collect at slice boundaries before the slot check,
     # where a pause is not inside any measured wait.
+    # A Windows 3.11 run booked 109 real ms (5.45 virtual s at scale 0.02) as
+    # waiting and as the same SRT end drift. That is a stall while a slot was
+    # still held, not a recorder backlog. Collecting before the slot check keeps
+    # the pause out of the measured wait; the zero-wait and ±2s SRT bounds stay exact.
+    # The same hold is longer than the scaled translate budget, so the sample
+    # runs only after in-flight English has landed (sample_after_translations).
     gc_was_enabled = gc.isenabled()
     gc.collect()
     gc.freeze()
     gc.disable()
+    mem_at: dict[int, tuple[int, int]] = {}
 
-    def collect_between_slices(seq: int) -> None:
-        if seq % 50 == 0:
-            gc.collect()
+    def collect_between_slices(seq: int):
+        # The upload for seq-1 is created at the end of the previous slice and
+        # admits on the next yield. Arming here makes that upload the first 429.
+        # A plain return does not yield, so the upload cannot admit first.
+        if seq == 601:
+            storm["rounds"] = 16
+        if seq not in (500, 750) and seq % 50 != 0:
+            return None
+        # The upload created at the end of the previous slice has not run yet.
+        # Park it so the sample is not inside its Chinese latency, then let any
+        # English already in flight land before the loop is held.
+
+        async def _pause_for_sample() -> None:
+            assert host is not None
+            host.hold_new_slices()
+            try:
+                if seq in (500, 750):
+                    mem_at[seq] = await sample_after_translations(pipe, _sample_server_memory)
+                else:
+                    await sample_after_translations(pipe, gc.collect)
+            finally:
+                host.release_new_slices()
+
+        return _pause_for_sample()
     snapshots: list[dict] = []
     listeners: list[Listener] = []
     host: VirtualHost | None = None
@@ -636,12 +827,16 @@ async def _run_100min_async() -> SimReport:
                 pending_snaps.append(asyncio.create_task(_snapshot(app, client, token, seq, snapshots)))
 
             await host.run(SEGMENTS, pace=True, on_each=on_each, before_slice=collect_between_slices)
-            if gc_was_enabled:
-                gc.enable()
             if pending_snaps:
                 await asyncio.gather(*pending_snaps)
             await _snapshot(app, client, token, SEGMENTS, snapshots)
+            # Settle English before the end sample. The sample blocks this thread
+            # on a collection and a tracemalloc snapshot; doing that while the last
+            # line is still queued trips the translate timeout (40s virtual).
             await _wait_translations(app, translator, SEGMENTS + 1)
+            mem_at[1000] = await sample_after_translations(app.state.pipeline, _sample_server_memory)
+            if gc_was_enabled:
+                gc.enable()
             # flush is this branch's async store. Main writes each row before publish returns.
             flush = getattr(app.state.store, "flush", None)
             if flush is not None:
@@ -653,6 +848,9 @@ async def _run_100min_async() -> SimReport:
             final = (await client.get("/api/metrics", headers=auth(token))).json()
             state = caption_rows(app, room)
             pipe = app.state.pipeline
+            traced_500, rss_500 = mem_at.get(500, (0, 0))
+            traced_750, rss_750 = mem_at.get(750, (0, 0))
+            traced_1000, rss_1000 = mem_at.get(1000, (0, 0))
             report = SimReport(
                 segments=SEGMENTS,
                 room=room,
@@ -674,8 +872,16 @@ async def _run_100min_async() -> SimReport:
                 state_count=len(state),
                 missing=sum(1 for row in state if row.get("status") == "missing"),
                 silent=sum(1 for row in state if row.get("status") == "silent"),
-                tracemalloc_500=next((int(item["traced"]) for item in snapshots if int(item["seq"]) == 500), 0),
-                tracemalloc_1000=next((int(item["traced"]) for item in reversed(snapshots) if int(item["seq"]) >= 1000), 0),
+                tracemalloc_500=traced_500,
+                tracemalloc_750=traced_750,
+                tracemalloc_1000=traced_1000,
+                rss_500=rss_500,
+                rss_750=rss_750,
+                rss_1000=rss_1000,
+                pending_peak=int(observed["pending"]),
+                storm_rejects=int(storm["rejects"]),
+                retries=list(host.retries),
+                translate_skipped=int(getattr(pipe, "translate_skipped", 0) or 0),
             )
             await host.stop()
     finally:
@@ -705,7 +911,7 @@ async def _snapshot(app, client, token, seq: int, snapshots: list[dict]) -> None
 
 def run_100min() -> SimReport:
     """One paced 100-minute class per process. Shared by backlog, SRT, and limit tests."""
-    key = (SEGMENTS, SCALE, "100min-v1")
+    key = (SEGMENTS, SCALE, "100min-v2")
     cached = _RUN_CACHE.get(key)
     if cached is not None:
         return cached
