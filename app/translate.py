@@ -207,6 +207,15 @@ class Translator:
                 self._add_tokens(prompt_tokens)
             if isinstance(completion_tokens, int):
                 self._add_tokens(completion_tokens)
+            # max_tokens cut the reply off. A half sentence is not a caption.
+            if data["choices"][0].get("finish_reason") == "length":
+                return TranslateResult(
+                    "",
+                    "bad_response",
+                    "英譯被截斷，中文仍保留",
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
             # A billed reply can still be unusable. Never publish the raw body as a caption.
             accepted = _accept_translation(text, zh=zh, glossary=glossary)
             if accepted is None:

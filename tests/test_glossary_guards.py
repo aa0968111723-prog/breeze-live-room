@@ -430,6 +430,27 @@ def test_json_escaped_surrogate_reply_is_rejected():
     assert "Hello" not in (result.text or "")
 
 
+def test_truncated_reply_is_a_failed_translation():
+    raw = json.dumps({
+        "choices": [{
+            "finish_reason": "length",
+            "message": {"content": "We begin the Dharma talk and"},
+        }],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 8},
+    }).encode()
+
+    def opener(req, timeout=40):
+        del req, timeout
+        return _Body(raw)
+
+    result = Translator(enabled=True, key="k", opener=opener).translate("今天開示", glossary=[], context=[])
+    assert result.status == "bad_response"
+    assert result.text == ""
+    assert "截斷" in result.detail
+    assert result.prompt_tokens == 3
+    assert result.completion_tokens == 8
+
+
 def test_store_and_broadcast_drop_a_lone_surrogate(tmp_path):
     event = {
         "type": "caption",
@@ -523,6 +544,37 @@ async def test_surrogate_reply_keeps_chinese_and_new_listeners_can_replay(tmp_pa
             assert fresh.get("history")
             assert any(item.get("zh") == "今天開示" for item in (replay.get("backfill") or replay.get("history") or []))
             assert resumed["type"] == "hello"
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_truncated_push_keeps_chinese(tmp_path):
+    raw = json.dumps({
+        "choices": [{
+            "finish_reason": "length",
+            "message": {"content": "We begin the Dharma talk and"},
+        }],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 8},
+    }).encode()
+
+    def opener(req, timeout=40):
+        del req, timeout
+        return _Body(raw)
+
+    translator = Translator(enabled=True, key="k", opener=opener)
+    app = app_for(settings=_settings(tmp_path / "captions.sqlite3"), translator=translator)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await open_room(client, token, "class")
+            pushed = await push(client, token, "class", "s", 1, "今天開示".encode(), t0_ms=0, t1_ms=1000)
+            assert pushed.status_code == 200, pushed.text
+            body = pushed.json()
+            assert body["zh"] == "今天開示"
+            assert body["en"] == ""
+            assert body["status"] == "translate_failed"
+            assert body["translate_status"] == "bad_response"
     finally:
         await stop(app)
 
