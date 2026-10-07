@@ -31,3 +31,11 @@ def test_room_page_keeps_the_caption_in_front():
     assert "safe-area-inset-left" in header
     assert "calc(10px + env(safe-area-inset-top))" not in text
     assert "body.zh-only .zh" in text
+    assert 'value="project"' in text and "投影" in text
+    assert "特大" in text and "只看譯文" in text and "保持螢幕亮著" in text
+    assert "clamp(" in text and "body.project" in text
+    assert "leaveProjection" in text and "refreshWakeLock" in text
+    assert "fullscreenAvailable" in text
+    prefs = (ROOT / "app/static/room_prefs.js").read_text(encoding="utf-8")
+    assert "breeze.audience.prefs" in prefs
+    assert "自動鎖定改長一點" in text

@@ -5,20 +5,31 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>禪譯聽眾</title>
 <style>
-:root { --bg: #fbf6ee; --fg: #2a2118; --muted: #6b5644; --line: rgba(90, 60, 30, .2); --size: 2.125rem; }
+:root { --bg: #fbf6ee; --fg: #2a2118; --muted: #6b5644; --line: rgba(90, 60, 30, .2); --size: clamp(1.5rem, 7vw, 2.125rem); }
 body { margin: 0; min-height: 100dvh; display: flex; flex-direction: column; background: var(--bg); color: var(--fg); font-family: "Segoe UI", "PingFang TC", sans-serif; }
 body.dark { --bg: #16130f; --fg: #f6f1e7; --muted: #d9d0c3; --line: rgba(255, 255, 255, .16); }
+body.size-28 { --size: clamp(1.15rem, 5.5vw, 1.75rem); }
+body.size-34 { --size: clamp(1.5rem, 7vw, 2.125rem); }
+body.size-46 { --size: clamp(1.75rem, 8.5vw, 2.875rem); }
+body.size-64 { --size: clamp(2rem, 11vw, 4rem); }
 body.zh-only .en, body.en-only .zh { display: none; }
 body.zh-only .zh, body.en-only .en { font-size: var(--size); color: var(--fg); font-weight: 700; }
+body.project { --bg: #16130f; --fg: #f6f1e7; --muted: #d9d0c3; --line: rgba(255, 255, 255, .16); --size: clamp(2rem, 5.5vw, 4.5rem); }
+body.project .stage { flex-direction: row; flex-wrap: wrap; align-items: center; min-height: calc(100dvh - 72px); }
+body.project .stage-note { flex: 1 1 100%; }
+body.project .en, body.project .zh { flex: 1 1 18rem; color: var(--fg); font-weight: 700; }
+body.project .zh { font-size: clamp(1.6rem, 4.2vw, 3.2rem); }
+body.project #history, body.project #hist-label { display: none; }
 header { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; min-height: 44px; padding: calc(8px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) 8px calc(12px + env(safe-area-inset-left)); background: var(--bg); background: color-mix(in srgb, var(--bg) 92%, transparent); }
 button, select { font-size: 16px; min-height: 44px; padding: 8px 12px; border-radius: 10px; border: 0; background: #8a5424; color: white; }
-body.dark button, body.dark select { background: #c9843f; }
+body.dark button, body.dark select, body.project button, body.project select { background: #c9843f; }
 button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px solid #c47a32; outline-offset: 2px; }
 #state { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); font-weight: 750; }
 #settings { margin-left: auto; flex: none; }
 .sub { margin: 0; padding: 0 16px 8px; color: var(--muted); font-size: 16px; }
 .banner { margin: 0; padding: 10px 16px; background: #8a5424; color: #fff; font-size: 16px; }
-#drawer { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 16px 12px; }
+#drawer { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px calc(16px + env(safe-area-inset-right)) 12px calc(16px + env(safe-area-inset-left)); }
+#wake-help { flex: 1 1 100%; margin: 0; color: var(--muted); font-size: 16px; }
 .stage { flex: 1; display: flex; flex-direction: column; justify-content: center; min-height: 42vh; padding: 8px 8px 12px; }
 .stage-note { margin: 0; padding: 0 20px; min-height: 24px; color: var(--muted); font-size: 16px; }
 .stage.idle .en, .stage.idle .zh, .stage.stale .en, .stage.stale .zh { color: var(--muted); font-weight: 650; }
@@ -39,16 +50,18 @@ li.gap { color: var(--muted); text-align: center; font-size: 14px; border-top-st
 <header>
 <span id="state" role="status" aria-live="polite">連線中</span>
 <button id="retry" type="button" hidden>再試一次</button>
-<button id="settings" type="button" aria-expanded="false">設定</button>
+<button id="settings" type="button" aria-expanded="false">⚙ 設定</button>
 </header>
 <p id="sub" class="sub"></p>
 <p id="offline" class="banner" hidden>手機沒網路。恢復網路後會自動接回。</p>
 <p id="expiry" class="sub" hidden>較早的字幕已超過保存時間，已從畫面上拿掉</p>
 <div id="drawer" hidden>
-<button id="theme" type="button">暗色</button>
+<label>顯示 <select id="mode"><option value="both">中英</option><option value="zh">中文</option><option value="en">只看譯文</option><option value="project">投影</option></select></label>
+<label>字級 <select id="size"><option value="28">小</option><option value="34" selected>中</option><option value="46">大</option><option value="64">特大</option></select></label>
+<label>主題 <select id="theme"><option value="system" selected>跟隨系統</option><option value="light">亮色</option><option value="dark">暗色</option></select></label>
+<label id="wake-label"><input id="wake" type="checkbox" checked> 保持螢幕亮著</label>
+<p id="wake-help" hidden>這個瀏覽器不能保持螢幕亮著，請把自動鎖定改長一點。</p>
 <button id="full" type="button">全螢幕</button>
-<label>顯示 <select id="mode"><option value="both">中英</option><option value="zh">中文</option><option value="en">英文</option></select></label>
-<label>字級 <select id="size"><option value="28">小</option><option value="34" selected>中</option><option value="46">大</option></select></label>
 <label><input id="pause" type="checkbox"> 暫停跟隨</label>
 </div>
 <div class="stage" id="stage">
@@ -63,12 +76,59 @@ li.gap { color: var(--muted); text-align: center; font-size: 14px; border-top-st
 <script type="module">
 import { audienceClientId, connectRoom, createCaptionView, liveTail, orderedCaptions } from "/static/room_client.js";
 import { GAP_TOAST_MS, HISTORY_DIVIDER, gapCopy, historyStick, stageMode, stageNote } from "/static/room_view.js";
+import { appearance, fullscreenAvailable, leaveProjection, readPrefs, refreshWakeLock, releaseWakeLock, themeIsDark, wakeLockSupported, writePrefs } from "/static/room_prefs.js";
 const room = location.pathname.split("/").filter(Boolean).pop();
 const listenKey = new URLSearchParams(location.search).get("k") || "";
 const clientId = audienceClientId(window.sessionStorage);
 const view = createCaptionView(80);
 const items = view.items;
 const state = { follow: true, pinned: null };
+let prefs = readPrefs(window.localStorage);
+let wakeSentinel = null;
+const LOOK = ["zh-only", "en-only", "project", "dark", "size-28", "size-34", "size-46", "size-64"];
+function prefersDark() {
+  return themeIsDark("system", (query) => window.matchMedia(query));
+}
+function applyAppearance() {
+  const classes = appearance(prefs, prefersDark());
+  for (const name of LOOK) document.body.classList.toggle(name, classes.includes(name));
+  const mode = document.querySelector("#mode");
+  const size = document.querySelector("#size");
+  const theme = document.querySelector("#theme");
+  const wake = document.querySelector("#wake");
+  if (mode) mode.value = prefs.mode;
+  if (size) size.value = prefs.size;
+  if (theme) theme.value = prefs.theme;
+  if (wake) wake.checked = prefs.wake !== false;
+  const supported = wakeLockSupported(navigator);
+  const wakeLabel = document.querySelector("#wake-label");
+  const wakeHelp = document.querySelector("#wake-help");
+  if (wakeLabel) wakeLabel.hidden = !supported;
+  if (wakeHelp) wakeHelp.hidden = supported;
+  if (prefs.mode === "project") {
+    const drawer = document.querySelector("#drawer");
+    if (drawer) drawer.hidden = true;
+    const settings = document.querySelector("#settings");
+    if (settings) settings.setAttribute("aria-expanded", "false");
+  }
+}
+function remember(next) {
+  prefs = writePrefs(window.localStorage, next);
+  applyAppearance();
+}
+async function syncWake(visibility) {
+  const state = visibility || (document.visibilityState || "visible");
+  if (prefs.wake === false || state !== "visible") {
+    await releaseWakeLock(wakeSentinel);
+    wakeSentinel = null;
+    return;
+  }
+  const next = await refreshWakeLock(navigator, prefs, "visible");
+  if (!next) return;
+  if (wakeSentinel && wakeSentinel !== next) await releaseWakeLock(wakeSentinel);
+  wakeSentinel = next;
+}
+applyAppearance();
 let hostLive = false;
 let kind = "connecting";
 let lastCaptionAt = 0;
@@ -211,24 +271,26 @@ document.querySelector("#settings").onclick = () => {
   drawer.hidden = !drawer.hidden;
   document.querySelector("#settings").setAttribute("aria-expanded", drawer.hidden ? "false" : "true");
 };
-document.querySelector("#theme").onclick = () => {
-  document.body.classList.toggle("dark");
-  document.querySelector("#theme").textContent = document.body.classList.contains("dark") ? "亮色" : "暗色";
-};
+document.querySelector("#theme").onchange = (ev) => { remember({ ...prefs, theme: ev.target.value }); };
 const full = document.querySelector("#full");
-if (!document.fullscreenEnabled) full.hidden = true;
+if (!fullscreenAvailable(document)) full.hidden = true;
 full.onclick = () => {
   const request = !document.fullscreenElement
     ? document.documentElement.requestFullscreen()
     : document.exitFullscreen();
   if (request && typeof request.catch === "function") request.catch(() => {});
 };
-document.querySelector("#mode").onchange = (ev) => {
-  document.body.classList.remove("zh-only", "en-only");
-  if (ev.target.value === "zh") document.body.classList.add("zh-only");
-  if (ev.target.value === "en") document.body.classList.add("en-only");
+document.querySelector("#mode").onchange = (ev) => { remember({ ...prefs, mode: ev.target.value }); };
+document.querySelector("#size").onchange = (ev) => { remember({ ...prefs, size: ev.target.value }); };
+document.querySelector("#wake").onchange = (ev) => {
+  remember({ ...prefs, wake: ev.target.checked });
+  syncWake("visible");
 };
-document.querySelector("#size").onchange = (ev) => { document.documentElement.style.setProperty("--size", ev.target.value + "px"); };
+document.addEventListener("keydown", (ev) => {
+  const next = leaveProjection(prefs, ev.key);
+  if (!next) return;
+  remember(next);
+});
 document.querySelector("#pause").onchange = (ev) => {
   state.follow = !ev.target.checked;
   if (!state.follow) state.pinned = liveTail(items, true) && liveTail(items, true).id;
@@ -250,9 +312,20 @@ history.addEventListener("scroll", () => {
     document.querySelector("#live").hidden = false;
   }
 });
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") conn.nudge(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") conn.nudge();
+  syncWake(document.visibilityState);
+});
+document.addEventListener("pointerdown", () => { syncWake("visible"); }, { once: true });
+if (window.matchMedia) {
+  const scheme = window.matchMedia("(prefers-color-scheme: dark)");
+  const onScheme = () => { if (prefs.theme === "system") applyAppearance(); };
+  if (scheme.addEventListener) scheme.addEventListener("change", onScheme);
+  else if (scheme.addListener) scheme.addListener(onScheme);
+}
 setInterval(paintChrome, 1000);
 paintChrome();
+syncWake("visible");
 </script>
 </body>
 </html>
