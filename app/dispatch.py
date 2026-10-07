@@ -9,10 +9,11 @@ from app.aio import cancellation_pending, wait_bounded
 
 # Stored captions, host export, and host HTTP bodies. zh_raw is the recognition
 # text from before a host edit, and any partial text left when recognition failed.
+# term_flags is the host-only locked-term check.
 _PASS = (
     "type", "id", "room_id", "session_id", "session_ord", "seq", "version",
     "zh", "en", "status", "translate_status", "error", "t0_ms", "t1_ms", "zh_raw",
-    "epoch",
+    "term_flags", "epoch",
 )
 # Audience sockets. Same caption fields, without zh_raw. A host token or listen
 # key is not a caption field and must not be added here.
@@ -22,7 +23,7 @@ _LISTENER_PASS = (
     "epoch", "cursor",
 )
 _AUDIENCE_DENY = frozenset({
-    "zh_raw", "host_token", "token", "listen_key", "listen_url", "authorization",
+    "zh_raw", "term_flags", "host_token", "token", "listen_key", "listen_url", "authorization",
 })
 _CONTROL = {"caption_deleted", "captions_cleared"}
 
