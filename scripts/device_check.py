@@ -240,6 +240,15 @@ def _sample(client: HostClient, room: str) -> dict:
         "asr_mode": setup.get("asr_mode"),
         "asr_ready": setup.get("asr_ready"),
         "translate_configured": setup.get("translate_configured"),
+        "asr_rtf_p50": metrics.get("asr_rtf_p50"),
+        "asr_rtf_p95": metrics.get("asr_rtf_p95"),
+        "backlog_s": metrics.get("backlog_s", metrics.get("backlog_audio_s")),
+        "backlog_estimated": metrics.get("backlog_estimated"),
+        "asr_wait_ms_p95": metrics.get("asr_wait_ms_p95"),
+        "decode_ms_p95": metrics.get("decode_ms_p95"),
+        "silent_skipped": metrics.get("silent_skipped"),
+        "asr_empty": metrics.get("asr_empty"),
+        "asr_timeouts": metrics.get("asr_timeouts"),
     }
 
 
@@ -254,6 +263,8 @@ def cmd_watch(client: HostClient, args) -> int:
         "time", "pending", "oldest_wait_ms", "rejected", "missing", "rss_bytes",
         "translate_queued", "translate_skipped", "held", "listeners", "storage",
         "storage_recovered", "asr_mode", "asr_ready", "translate_configured",
+        "asr_rtf_p50", "asr_rtf_p95", "backlog_s", "backlog_estimated",
+        "asr_wait_ms_p95", "decode_ms_p95", "silent_skipped", "asr_empty", "asr_timeouts",
     ]
     print(f"每 {args.every:g} 秒記錄一次。輸出 {csv_path} 與 {json_path}。Ctrl-C 結束。")
     try:
@@ -267,7 +278,8 @@ def cmd_watch(client: HostClient, args) -> int:
             json_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
             print(
                 f"{row['time']}  pending={row['pending']} rejected={row['rejected']} "
-                f"missing={row['missing']} rss={row['rss_bytes']} translate_queued={row['translate_queued']}"
+                f"missing={row['missing']} rss={row['rss_bytes']} translate_queued={row['translate_queued']} "
+                f"rtf_p95={row.get('asr_rtf_p95')} backlog_s={row.get('backlog_s')}"
             )
             if deadline is not None and time.monotonic() >= deadline:
                 break

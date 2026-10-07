@@ -206,6 +206,8 @@ class Pipeline:
             "pending": self._slots,
             "inflight": len(self._active),
             "oldest_wait_ms": oldest,
+            # Decode plus recognition for the last slice that finished ASR.
+            # Does not include ASR slot wait (asr_wait_ms) and is not the RTF numerator.
             "last_process_ms": None if self.last_process_s is None else int(self.last_process_s * 1000),
             "rejected": self.rejected,
             "missing": self.missing_count,
@@ -1065,6 +1067,9 @@ class Pipeline:
         self._flight[segment.key] = fut
         holder = {"held": slot_held, "bytes": len(audio), "wait_translation": wait_translation}
         try:
+            # From upload, before decode. Unknown length uses segment_ms until the WAVE header is known.
+            estimate_s = max(int(self.settings.segment_ms), 1) / 1000.0
+            self._rtf.note_waiting(segment.key, estimate_s, estimated=True)
             result = await self._process(segment, audio, decoder, holder)
             if not fut.done():
                 fut.set_result(result)
@@ -1081,6 +1086,7 @@ class Pipeline:
                     fut.exception()
             raise
         finally:
+            self._rtf.clear_waiting(segment.key)
             if self._flight.get(segment.key) is fut:
                 self._flight.pop(segment.key, None)
 
@@ -1170,8 +1176,11 @@ class Pipeline:
         self._reserved.discard(segment.key)
         work = self.tmp / uuid.uuid4().hex
         started = time.monotonic()
+        decode_s = 0.0
+        slot_wait_s = 0.0
         try:
             segment.status = "decoding"
+            decode_mark = time.monotonic()
             try:
                 wav = await wait_bounded(
                     asyncio.to_thread(self._decode_sync, work, audio, decoder),
@@ -1186,6 +1195,7 @@ class Pipeline:
             except Exception as exc:
                 self.fail_received(segment, str(exc)[:180] or "解碼失敗", status="error")
                 return segment
+            decode_s = time.monotonic() - decode_mark
             if segment.key in self._cancel:
                 self.fail_received(segment, "主持端取消這段", status="cancelled")
                 return segment
@@ -1202,16 +1212,22 @@ class Pipeline:
                     segment.status = "silent"
                     segment.error = "這段太安靜，沒有送去辨識"
                     segment.zh = ""
+                    self._rtf.clear_waiting(segment.key)
+                    self._rtf.note_silent_skip((segment.room_id, segment.session_id))
                     self._release(segment)
                     return segment
             segment.status = "transcribing"
-            # Queue wait is backlog, not recognition speed. Only a real WAVE duration counts.
+            # Real WAVE length replaces the upload estimate. Non-WAVE stays estimated until ASR starts.
             audio_s = float(known) if known else 0.0
             if audio_s > 0:
-                self._rtf.note_waiting(segment.key, audio_s)
+                self._rtf.note_waiting(segment.key, audio_s, estimated=False)
             record_s: float | None = None
             try:
+                slot_mark = time.monotonic()
                 async with self._asr_slots:
+                    slot_wait_s = time.monotonic() - slot_mark
+                    # Backlog ends when this segment's recognition starts, not when it returns.
+                    self._rtf.clear_waiting(segment.key)
                     asr_started = time.monotonic()
                     try:
                         asr = await wait_bounded(
@@ -1230,14 +1246,22 @@ class Pipeline:
             finally:
                 self._rtf.clear_waiting(segment.key)
                 if record_s is not None:
-                    self._rtf.record(record_s, audio_s, (segment.room_id, segment.session_id))
-            self.last_process_s = time.monotonic() - started
+                    self._rtf.record(
+                        record_s,
+                        audio_s,
+                        (segment.room_id, segment.session_id),
+                        decode_s,
+                        slot_wait_s,
+                    )
+            # Decode plus recognition. Slot wait is asr_wait_ms, not part of this number.
+            self.last_process_s = max(0.0, (time.monotonic() - started) - slot_wait_s)
             if segment.key in self._cancel:
                 self.fail_received(segment, "主持端取消這段", status="cancelled")
                 return segment
             text = (asr.text or "").strip()
             if not asr.ok or not text:
                 if asr.ok or not asr.error:
+                    self._rtf.note_empty((segment.room_id, segment.session_id))
                     segment.status = "silent"
                     segment.error = asr.error or "這段沒聽到話"
                     segment.zh_raw = text
