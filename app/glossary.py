@@ -466,6 +466,7 @@ def _parse_term(item) -> tuple[dict | None, list[str]]:
                 continue
             text = alias.strip()
             if not text:
+                problems.append("別名是空的，不能當別名")
                 continue
             if _has_control(text):
                 problems.append(f"別名「{_clip(text)}」含有控制字元")

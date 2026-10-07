@@ -100,6 +100,17 @@ def test_fullwidth_equals_and_alias_syntax():
     ]
 
 
+def test_empty_alias_is_rejected_with_a_reason():
+    accepted, rejected = validate_terms([
+        {"zh": "開示", "en": "Dharma talk", "aliases": ["", "  "]},
+        {"zh": "般若", "en": "prajna", "aliases": []},
+    ])
+    assert [item["zh"] for item in accepted] == ["般若"]
+    assert rejected
+    assert all(item["line"] == 1 for item in rejected)
+    assert any("空" in item["reason"] for item in rejected)
+
+
 def test_bad_aliases_are_rejected_with_reasons():
     accepted, rejected = validate_terms([
         {"zh": "開示", "en": "Dharma talk", "aliases": ["開", "開始", "法師"]},
