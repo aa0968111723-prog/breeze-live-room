@@ -39,9 +39,10 @@ li { padding: 8px 0; border-top: 1px solid var(--line); font-size: 16px; }
 <p id="hist-label">最近字幕</p>
 <ul id="history"></ul>
 <script type="module">
-import { connectRoom, createCaptionView, liveTail, orderedCaptions } from "/static/room_client.js";
+import { audienceClientId, connectRoom, createCaptionView, liveTail, orderedCaptions } from "/static/room_client.js";
 const room = location.pathname.split("/").filter(Boolean).pop();
 const listenKey = new URLSearchParams(location.search).get("k") || "";
+const clientId = audienceClientId(window.sessionStorage);
 const view = createCaptionView(80);
 const items = view.items;
 const state = { follow: true, pinned: null };
@@ -74,6 +75,7 @@ function connect() {
       const proto = location.protocol === "https:" ? "wss" : "ws";
       let address = proto + "://" + location.host + "/ws/listen?room_id=" + encodeURIComponent(room);
       if (listenKey) address += "&k=" + encodeURIComponent(listenKey);
+      if (clientId) address += "&cid=" + encodeURIComponent(clientId);
       return address;
     },
     onState: (text) => { document.querySelector("#state").textContent = text; },
@@ -81,7 +83,9 @@ function connect() {
     onDelete: show,
     onClear: (data) => { view.apply(data && data.type ? data : { type: "captions_cleared" }); render(); },
     onBackfill: (rows) => { view.replace(rows); render(); },
-    onReset: () => { view.reset(); render(); },
+    // Do not paint here. The backfill callback renders the replacement in the
+    // same turn, so the screen is not blank between the two.
+    onReset: () => { view.reset(); },
     onGap: () => { document.querySelector("#state").textContent = "補償窗口不足，只補到伺服器還留著的字幕"; },
   });
 }

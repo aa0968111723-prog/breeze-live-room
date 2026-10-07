@@ -393,10 +393,16 @@ async def test_replay_backfill_is_rate_limited_per_ip():
 
 
 def test_replay_per_minute_setting_defaults_and_rejects_zero():
-    assert Settings().replay_per_minute == 8
+    # Per-IP ceiling is classroom-sized. The old pure cap of 8 left a NAT blank.
+    assert Settings().replay_per_minute >= 120
+    assert Settings().replay_per_minute == 180
+    assert Settings().replay_client_per_minute == 8
     assert Settings.from_env({"BREEZE_REPLAY_PER_MINUTE": "3"}).replay_per_minute == 3
+    assert Settings.from_env({"BREEZE_REPLAY_CLIENT_PER_MINUTE": "4"}).replay_client_per_minute == 4
     with pytest.raises(ValueError, match="BREEZE_REPLAY_PER_MINUTE"):
         Settings(replay_per_minute=0)
+    with pytest.raises(ValueError, match="BREEZE_REPLAY_CLIENT_PER_MINUTE"):
+        Settings(replay_client_per_minute=0)
 
 
 @pytest.mark.anyio

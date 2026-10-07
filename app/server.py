@@ -81,26 +81,53 @@ class Conn:
 
 
 class _ReplayGate:
-    """Caps full replay/backfill dumps per client IP. Live captions are not counted."""
+    """Caps full replay/backfill dumps. Live captions are not counted.
 
-    def __init__(self, limit: int, window_s: float = 60.0):
-        self.limit = max(1, int(limit))
-        self.window_s = window_s
-        self._hits: dict[str, list[float]] = {}
+    One bucket is the public IP (a whole classroom behind NAT). The other is
+    that IP plus the audience client id, so one phone cannot use the room's ceiling.
+    A refused hello is explicit: the caller sends backfill_deferred instead of
+    an empty screen.
+    """
 
-    def allow(self, ip: str) -> bool:
-        now = time.monotonic()
-        bucket = self._hits.get(ip)
-        if bucket is None:
-            bucket = []
-            self._hits[ip] = bucket
+    def __init__(self, ip_limit: int, client_limit: int | None = None, window_s: float = 60.0):
+        self.ip_limit = max(1, int(ip_limit))
+        self.limit = self.ip_limit
+        self.client_limit = max(1, int(self.ip_limit if client_limit is None else client_limit))
+        self.window_s = float(window_s)
+        self._ip_hits: dict[str, list[float]] = {}
+        self._client_hits: dict[tuple[str, str], list[float]] = {}
+
+    def _prune(self, bucket: list[float], now: float) -> None:
         cutoff = now - self.window_s
         if bucket and bucket[0] <= cutoff:
             bucket[:] = [item for item in bucket if item > cutoff]
-        if len(bucket) >= self.limit:
-            return False
-        bucket.append(now)
-        return True
+
+    def _retry_ms(self, bucket: list[float], now: float) -> int:
+        if not bucket:
+            return 1000
+        wait = self.window_s - (now - bucket[0])
+        if wait < 0.25:
+            wait = 0.25
+        return int(wait * 1000) + 1
+
+    def allow(self, ip: str, client_id: str = "") -> tuple[bool, int]:
+        now = time.monotonic()
+        ip_key = ip or ""
+        who = client_id or ""
+        ip_bucket = self._ip_hits.setdefault(ip_key, [])
+        client_bucket = self._client_hits.setdefault((ip_key, who), [])
+        self._prune(ip_bucket, now)
+        self._prune(client_bucket, now)
+        blocked = None
+        if len(ip_bucket) >= self.ip_limit:
+            blocked = ip_bucket
+        elif len(client_bucket) >= self.client_limit:
+            blocked = client_bucket
+        if blocked is not None:
+            return False, self._retry_ms(blocked, now)
+        ip_bucket.append(now)
+        client_bucket.append(now)
+        return True, 0
 
 
 def _content_too_large(request: Request, settings: Settings) -> bool:
@@ -524,7 +551,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
     share_override = {"host": settings.share_host}
     tasks: list[asyncio.Task] = []
     replay_floors: dict[str, float] = {}
-    replay_gate = _ReplayGate(settings.replay_per_minute)
+    replay_gate = _ReplayGate(settings.replay_per_minute, settings.replay_client_per_minute)
     share_cache: dict[str, object] = {"at": 0.0, "hosts": []}
 
     def current_host() -> str | None:
@@ -1253,8 +1280,15 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             if form is not None:
                 await form.close()
 
+    def _audience_client_id(ws: WebSocket, cid: str) -> str:
+        text = (cid or "").strip()
+        if text and len(text) <= 64 and all(ch.isascii() and (ch.isalnum() or ch in "_-") for ch in text):
+            return text
+        port = ws.client.port if ws.client is not None else 0
+        return f"conn-{port}-{id(ws)}"
+
     @app.websocket("/ws/listen")
-    async def listen(ws: WebSocket, room_id: str = "class", cursor: int = 0, replay: int = 0, k: str = "") -> None:
+    async def listen(ws: WebSocket, room_id: str = "class", cursor: int = 0, replay: int = 0, k: str = "", cid: str = "") -> None:
         try:
             room_id = validate_room_id(room_id)
         except RoomIdError:
@@ -1276,11 +1310,23 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             return
         await ws.accept()
         if room is None:
-            await ws.send_json({"type": "room_unavailable", "room_id": room_id, "reason": "unknown_or_ended"})
+            # Accept is required to name the reason. The page must not treat this
+            # accept as "live": the room is still closed or not open yet.
+            stored = book.rooms.get(room_id)
+            reason = "ended" if stored is not None and stored.get("ended") else "unknown_or_ended"
+            note = {"type": "room_unavailable", "room_id": room_id, "reason": reason}
+            if reason == "unknown_or_ended":
+                note["retry_after_ms"] = 5000
+            await ws.send_json(note)
             await ws.close(code=4404)
             return
         if len(room["listeners"]) >= settings.max_listeners:
-            await ws.send_json({"type": "room_unavailable", "room_id": room_id, "reason": "full"})
+            await ws.send_json({
+                "type": "room_unavailable",
+                "room_id": room_id,
+                "reason": "full",
+                "retry_after_ms": 20000,
+            })
             await ws.close(code=1013)
             return
         conn = Conn(ws, settings.listener_queue)
@@ -1298,6 +1344,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             "oldest_cursor": resumed["oldest_cursor"],
             "room_id": room_id,
             "epoch": bus.epoch(room_id),
+            "host_live": bool(room.get("session_active")),
         }
         wants_backfill = int(replay or 0) == 1 or (cursor > 0 and bool(resumed.get("gap")))
         if wants_backfill:
@@ -1307,8 +1354,14 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 source = list(resumed.get("backfill") or [])
             visible = _captions_since_open(room_id, source)
             ip = ws.client.host if ws.client is not None else ""
-            if replay_gate.allow(ip):
+            allowed, retry_ms = replay_gate.allow(ip, _audience_client_id(ws, cid))
+            if allowed:
                 hello["backfill"] = _audience_captions(visible)
+            else:
+                # Say so. An omitted backfill used to look like an empty class.
+                hello["backfill_deferred"] = True
+                hello["retry_after"] = retry_ms
+                hello["retry_after_ms"] = retry_ms
         try:
             await ws.send_json(hello)
         except Exception:

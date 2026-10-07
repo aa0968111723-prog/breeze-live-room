@@ -264,7 +264,7 @@ rewindSockets[1].onmessage({
   }),
 });
 await tick();
-assert.ok(resetNotes.includes("rewind"));
+assert.equal(resetNotes.includes("rewind"), false);
 assert.match(rewindSockets.at(-1).address, /cursor=0/);
 const resumedSocket = rewindSockets.at(-1);
 resumedSocket.onopen();
@@ -275,6 +275,7 @@ resumedSocket.onmessage({
     history: [{ id: "class:s:1", session_id: "s", seq: 1, version: 1, cursor: 2, zh: "重來" }],
   }),
 });
+assert.ok(resetNotes.includes("rewind"));
 assert.equal(rewindEvents.filter((item) => item.zh === "重來").length, 1);
 assert.equal(rewindConn.cursor, 2);
 rewindConn.stop();
@@ -322,11 +323,13 @@ async function testEpochResetRequestsReplayAndGapBackfill() {
       history: [],
       events: [],
       gap: true,
-      backfill: [{ id: "class:s:1", session_id: "s", seq: 1, version: 2, zh: "舊" }],
+      backfill_deferred: true,
+      retry_after_ms: 1000,
     }),
   });
   await tick();
-  assert.ok(resets.includes("reset"));
+  assert.deepEqual(resets, []);
+  assert.equal(backfills.length, 0);
   assert.match(sockets.at(-1).address, /cursor=0/);
   assert.match(sockets.at(-1).address, /replay=1/);
   const replay = sockets.at(-1);
@@ -343,6 +346,7 @@ async function testEpochResetRequestsReplayAndGapBackfill() {
       history: [{ id: "class:s:1", session_id: "s", seq: 1, version: 2, cursor: 1, zh: "甲" }],
     }),
   });
+  assert.ok(resets.includes("reset"));
   assert.equal(backfills.at(-1).map((item) => item.zh).join(","), "甲,乙");
   assert.equal(events.filter((item) => item.zh === "甲").length, 1);
   replay.onmessage({

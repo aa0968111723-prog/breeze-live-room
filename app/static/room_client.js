@@ -77,12 +77,42 @@ export function createCaptionView(limit = 80) {
   };
 }
 
-export function connectRoom({ room, url, onState, onEvent, onGap, onDelete, onClear, onBackfill, onReset, openSocket, sleep, now, staleMs }) {
+export function audienceClientId(storage) {
+  const key = "breeze.audience.cid";
+  const valid = (value) => typeof value === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(value);
+  try {
+    const existing = storage && storage.getItem(key);
+    if (valid(existing)) return existing;
+    const bytes = new Uint8Array(16);
+    if (globalThis.crypto && typeof crypto.getRandomValues === "function") crypto.getRandomValues(bytes);
+    else for (let i = 0; i < bytes.length; i += 1) bytes[i] = Math.floor(Math.random() * 256);
+    const id = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    if (storage) storage.setItem(key, id);
+    return id;
+  } catch {
+    return "tab" + Math.floor(Math.random() * 1e9).toString(16);
+  }
+}
+
+// Wait at least retry_after, then add up to half of that as jitter so a classroom
+// does not retry on the same millisecond. unit is Math.random() in [0, 1].
+export function deferredRetryMs(retryAfterMs, unit) {
+  const rolled = Number(unit);
+  const span = Number.isFinite(rolled) ? Math.min(1, Math.max(0, rolled)) : 0;
+  const hinted = Number(retryAfterMs);
+  const base = Number.isFinite(hinted) && hinted > 0 ? hinted : 500;
+  const jitterBase = Number.isFinite(hinted) && hinted > 0 ? hinted : 1000;
+  return base + Math.round(jitterBase * 0.5 * span);
+}
+
+export function connectRoom({ room, url, onState, onEvent, onGap, onDelete, onClear, onBackfill, onReset, openSocket, sleep, now, staleMs, random }) {
   const versions = new Map();
   let cursor = 0;
   let seenEpoch = null;
-  let connectedCursor = 0;
-  let wantReplay = false;
+  // Set when this connection's captions must be replaced, but the replacement
+  // has not arrived. The screen stays up until then.
+  let replaceOnBackfill = false;
+  let pendingWait = 0;
   let attempt = 0;
   let stopped = false;
   let socket = null;
@@ -93,6 +123,7 @@ export function connectRoom({ room, url, onState, onEvent, onGap, onDelete, onCl
   const done = new Promise((resolve) => { resolveDone = resolve; });
   const opener = openSocket || ((address) => new WebSocket(address));
   const clock = typeof now === "function" ? now : () => Date.now();
+  const roll = typeof random === "function" ? random : () => Math.random();
   const staleAfter = Number(staleMs) > 0 ? Number(staleMs) : 35000;
 
   function markMessage() {
@@ -113,12 +144,11 @@ export function connectRoom({ room, url, onState, onEvent, onGap, onDelete, onCl
   function address() {
     const base = url();
     const join = base.includes("?") ? "&" : "?";
-    connectedCursor = cursor;
-    let query = "cursor=" + encodeURIComponent(String(cursor));
-    if (wantReplay) {
-      query += "&replay=1";
-      wantReplay = false;
-    }
+    // Ask for the saved captions, but do not drop the cursor we already have
+    // until that payload is applied.
+    const query = replaceOnBackfill
+      ? "cursor=0&replay=1"
+      : "cursor=" + encodeURIComponent(String(cursor));
     return base + join + query;
   }
 
@@ -220,22 +250,33 @@ export function connectRoom({ room, url, onState, onEvent, onGap, onDelete, onCl
             const epoch = data.epoch == null ? null : Number(data.epoch);
             const cursorBehind = Number.isFinite(latest) && latest < cursor;
             const epochChanged = epoch != null && seenEpoch != null && epoch !== seenEpoch;
-            if (cursorBehind || epochChanged) {
-              versions.clear();
-              cursor = 0;
-              if (epoch != null && Number.isFinite(epoch)) seenEpoch = epoch;
-              if (onReset) onReset(data);
-              // The hello we are about to drop may be the only copy of the backlog.
-              // The next connection asks for the full caption state.
-              wantReplay = true;
-              if (connectedCursor > 0) {
+            const replaying = replaceOnBackfill;
+            const needsReplace = cursorBehind || epochChanged || replaying;
+            if (needsReplace) {
+              const deferred = data.backfill_deferred === true;
+              const hasBackfill = Array.isArray(data.backfill);
+              // No payload yet: keep the current screen and ask again.
+              if (deferred || (!hasBackfill && !replaying)) {
+                replaceOnBackfill = true;
+                const hinted = Number(data.retry_after_ms != null ? data.retry_after_ms : data.retry_after);
+                pendingWait = deferredRetryMs(Number.isFinite(hinted) ? hinted : 1000, roll());
                 try { ws.close(); } catch { /* reconnect below */ }
                 return;
               }
-              wantReplay = false;
-            } else if (epoch != null && Number.isFinite(epoch)) {
-              seenEpoch = epoch;
+              versions.clear();
+              cursor = 0;
+              if (epoch != null && Number.isFinite(epoch)) seenEpoch = epoch;
+              replaceOnBackfill = false;
+              if (onReset) onReset(data);
+              if (hasBackfill && onBackfill) onBackfill(data.backfill);
+              else for (const item of data.backfill || []) deliver(item);
+              cursor = noteCursor(cursor, data.latest_cursor);
+              if (data.gap && onGap) onGap(data);
+              for (const item of data.history || []) deliver(item);
+              for (const item of data.events || []) deliver(item);
+              return;
             }
+            if (epoch != null && Number.isFinite(epoch)) seenEpoch = epoch;
             cursor = noteCursor(cursor, data.latest_cursor);
             if (data.gap && onGap) onGap(data);
             if (Array.isArray(data.backfill) && onBackfill) onBackfill(data.backfill);
@@ -253,6 +294,12 @@ export function connectRoom({ room, url, onState, onEvent, onGap, onDelete, onCl
       detach(ws);
       if (socket === ws) socket = null;
       if (stopped) break;
+      if (replaceOnBackfill) {
+        const wait = pendingWait > 0 ? pendingWait : deferredRetryMs(1000, roll());
+        pendingWait = 0;
+        await waitMs(wait);
+        continue;
+      }
       attempt += 1;
       onState("斷線，正在重連");
       await waitMs(Math.min(8000, 400 * 2 ** attempt));
