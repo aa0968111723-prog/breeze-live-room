@@ -5,6 +5,7 @@ import {
   PREFS_KEY,
   appearance,
   fullscreenAvailable,
+  focusAfterProjection,
   leaveProjection,
   readPrefs,
   refreshWakeLock,
@@ -126,6 +127,13 @@ assert.equal(leaveProjection(null, "Escape"), null);
 assert.equal(fullscreenAvailable({ fullscreenEnabled: false }), false);
 assert.equal(fullscreenAvailable({ fullscreenEnabled: true }), true);
 assert.equal(fullscreenAvailable(undefined), false);
+
+const opener = { focused: false, focus() { this.focused = true; } };
+assert.equal(focusAfterProjection(opener), true);
+assert.equal(opener.focused, true);
+assert.equal(focusAfterProjection(null), false);
+assert.equal(focusAfterProjection({}), false);
+assert.equal(focusAfterProjection({ focus() { throw new Error("hidden"); } }), false);
 
 assert.ok(contrast("#f6f1e7", "#16130f") >= 4.5);
 assert.ok(contrast("#d9d0c3", "#16130f") >= 4.5);

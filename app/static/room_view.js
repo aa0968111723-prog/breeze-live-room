@@ -37,6 +37,12 @@ export function stageNote(mode, hostLive) {
   return "";
 }
 
+// Waiting and offline already have their own line. Don't repeat it on the stage.
+export function stageNoteFor(kind, mode, hostLive) {
+  if (kind === "waiting_room" || kind === "device_offline") return "";
+  return stageNote(mode, hostLive);
+}
+
 export function gapCopy(reset) {
   return reset ? "已重新整理字幕" : "漏了一小段，已接回最新內容";
 }

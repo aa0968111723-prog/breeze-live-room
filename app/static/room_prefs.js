@@ -116,3 +116,14 @@ export function leaveProjection(prefs, key) {
 export function fullscreenAvailable(doc) {
   return !!(doc && doc.fullscreenEnabled);
 }
+
+// Projection is left from the header or Escape. Focus goes back to the button that opened it.
+export function focusAfterProjection(opener) {
+  if (!opener || typeof opener.focus !== "function") return false;
+  try {
+    opener.focus();
+    return true;
+  } catch {
+    return false;
+  }
+}

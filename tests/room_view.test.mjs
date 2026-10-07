@@ -8,6 +8,7 @@ import {
   historyStick,
   stageMode,
   stageNote,
+  stageNoteFor,
 } from "../app/static/room_view.js";
 
 assert.equal(CAPTION_IDLE_MS, 20000);
@@ -28,6 +29,11 @@ assert.equal(stageNote("stale", true), "連線中斷，這是最後收到的字�
 assert.equal(stageNote("ended", false), "這堂課已結束");
 assert.equal(stageNote("empty", false), "等待主持人開始");
 assert.equal(stageNote("empty", true), "等待主持人開始說話");
+assert.equal(stageNoteFor("waiting_room", "empty", false), "");
+assert.equal(stageNoteFor("waiting_room", "empty", true), "");
+assert.equal(stageNoteFor("device_offline", "stale", false), "");
+assert.equal(stageNoteFor("live", "empty", false), "等待主持人開始");
+assert.equal(stageNoteFor("ended", "ended", false), "這堂課已結束");
 assert.equal(gapCopy(false), "漏了一小段，已接回最新內容");
 assert.equal(gapCopy(true), "已重新整理字幕");
 assert.deepEqual(historyStick(0, 400, 100, true), { stick: true, restore: 0 });
