@@ -71,7 +71,9 @@ def _csv(env: dict[str, str], name: str) -> tuple[str, ...]:
 @dataclass(frozen=True)
 class Settings:
     port: int = 8780
-    max_audio_bytes: int = 8 * 1024 * 1024
+    # 16 kHz mono PCM is 32 KB/s. 2 MB covers a 30s slice (~960 KB) and the
+    # multipart wrapper; a 6–10s slice is far smaller. BREEZE_MAX_AUDIO_BYTES overrides this.
+    max_audio_bytes: int = 2 * 1024 * 1024
     max_audio_seconds: float = 30.0
     max_rooms: int = 8
     max_listeners: int = 40
@@ -117,6 +119,9 @@ class Settings:
     allowed_hosts: tuple[str, ...] = ()
     allowed_schemes: tuple[str, ...] = ("http",)
     segment_ms: int = 6000
+    # Slow or stalled uploads must not sit on the request forever. The body is
+    # read before an ASR slot is taken.
+    upload_read_timeout_s: float = 20.0
 
     def __post_init__(self) -> None:
         if not 1 <= int(self.port) <= 65535:
@@ -131,6 +136,8 @@ class Settings:
             raise ValueError("BREEZE_MAX_AUDIO_BYTES 至少為 1")
         if self.max_audio_seconds <= 0:
             raise ValueError("BREEZE_MAX_AUDIO_SECONDS 必須大於 0")
+        if self.upload_read_timeout_s <= 0:
+            raise ValueError("BREEZE_UPLOAD_READ_TIMEOUT 必須大於 0")
         if self.max_rooms < 1 or self.max_listeners < 1:
             raise ValueError("房間數與聽眾數至少為 1")
         if self.asr_workers < 1:
@@ -164,7 +171,7 @@ class Settings:
         schemes = _csv(env, "BREEZE_ALLOWED_SCHEMES") or ("http",)
         return cls(
             port=_raw_int(env, "BREEZE_PORT", 8780),
-            max_audio_bytes=_raw_int(env, "BREEZE_MAX_AUDIO_BYTES", 8 * 1024 * 1024),
+            max_audio_bytes=_raw_int(env, "BREEZE_MAX_AUDIO_BYTES", 2 * 1024 * 1024),
             max_audio_seconds=_raw_float(env, "BREEZE_MAX_AUDIO_SECONDS", 30.0),
             max_rooms=_raw_int(env, "BREEZE_MAX_ROOMS", 8),
             max_listeners=_raw_int(env, "BREEZE_MAX_LISTENERS", 40),
@@ -209,4 +216,5 @@ class Settings:
             allowed_hosts=_csv(env, "BREEZE_ALLOWED_HOSTS"),
             allowed_schemes=schemes,
             segment_ms=_raw_int(env, "BREEZE_SEGMENT_MS", 6000),
+            upload_read_timeout_s=_raw_float(env, "BREEZE_UPLOAD_READ_TIMEOUT", 20.0),
         )
