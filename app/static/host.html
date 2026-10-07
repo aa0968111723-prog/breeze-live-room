@@ -277,7 +277,10 @@ async function refreshMetrics() {
   const ram = data.rss_bytes ? Math.round(data.rss_bytes / 1048576) + " MB" : "尚未讀到";
   const tokens = data.tokens_used ? "，譯文 tokens " + data.tokens_used : "";
   const price = data.price ? "，金額只依 " + data.price.date + " 的來源" : "";
-  metrics.textContent = "待處理 " + data.pending + "，最久等待 " + data.oldest_wait_ms + " ms，上次辨識 " + (data.last_process_ms ?? "—") + " ms，拒絕 " + data.rejected + "，缺段 " + data.missing + "，聽眾 " + data.listeners + "，記憶體 " + ram + tokens + price;
+  const rtfBlock = data.rtf && data.rtf.window && data.rtf.window.rtf;
+  const rtfP50 = rtfBlock && rtfBlock.p50 != null ? Number(rtfBlock.p50).toFixed(2) : "—";
+  const rtfP95 = rtfBlock && rtfBlock.p95 != null ? Number(rtfBlock.p95).toFixed(2) : "—";
+  metrics.textContent = "待處理 " + data.pending + "，最久等待 " + data.oldest_wait_ms + " ms，上次辨識 " + (data.last_process_ms ?? "—") + " ms，拒絕 " + data.rejected + "，缺段 " + data.missing + "，聽眾 " + data.listeners + "，記憶體 " + ram + tokens + price + "，辨識即時率 p50 " + rtfP50 + "、p95 " + rtfP95;
 }
 const ctl = createCaptureController({
   periodMs: 6000,
