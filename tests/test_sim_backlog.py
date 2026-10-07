@@ -320,18 +320,132 @@ async def test_upload_latency_stays_inside_one_slice():
     assert not tracemalloc.is_tracing()
 
 
+def _boundary_mark() -> str:
+    return "\r\n--not-the-boundary\r\n"
+
+
+def _heavy_audio() -> bytes:
+    """900 KiB audio part, inside the 512–900 KB band the duration cap still accepts.
+
+    The boundary-like line sits in the part body. It is not the multipart boundary,
+    so the parser has to keep scanning. A 512 KB *field* is the wrong payload:
+    it is rejected at 64 KB and the clock would time a 400, not a parse.
+    The inserted line is padded to a multiple of 3 so the surrounding "句"
+    bytes stay valid UTF-8.
+    """
+    mark = _boundary_mark().encode()
+    pad = b" " * ((3 - (len(mark) % 3)) % 3)
+    blob = mark + pad
+    audio = ("句" * (900 * 1024 // 3)).encode()
+    cut = 300
+    audio = audio[:cut] + blob + audio[cut + len(blob):]
+    assert len(blob) % 3 == 0
+    assert len(audio) == 900 * 1024
+    assert 512 * 1024 <= len(audio) <= 900 * 1024
+    assert mark in audio
+    audio.decode()
+    return audio
+
+
+def _sixty_kb_field() -> str:
+    """Text field of 60 KiB, under the 64 KB part limit."""
+    mark = _boundary_mark()
+    pad = ("x" * (60 * 1024 - len(mark))) + mark
+    raw = pad.encode()
+    assert len(raw) == 60 * 1024
+    assert len(raw) < 64 * 1024
+    assert mark in pad
+    return pad
+
+
+async def _post_heavy(client, token, seq: int, audio: bytes, pad: str):
+    from tests.test_round2 import auth
+
+    headers = {**auth(token), "x-breeze-async-translation": "1"}
+    return await client.post(
+        "/api/push",
+        params={"room_id": "class", "session_id": "s", "seq": str(seq)},
+        data={
+            "room_id": "class",
+            "session_id": "s",
+            "seq": str(seq),
+            "t0_ms": str((seq - 1) * 6000),
+            "t1_ms": str(seq * 6000),
+            "wait_translation": "0",
+            "pad": pad,
+        },
+        files={"audio": ("a.webm", audio, "audio/webm")},
+        headers=headers,
+    )
+
+
+@pytest.mark.anyio
+async def test_heavy_multipart_upload_does_not_stall_the_loop():
+    """A real-sized upload finishes inside 60 ms, and does not freeze the loop.
+
+    Tracing stays off. The body is a 900 KiB audio part plus a 60 KiB text field
+    (under the 64 KB field cap) and boundary-like bytes inside both. The clock
+    is perf_counter around the post, strictly under 60 ms. A 1 ms timer task
+    records the longest stretch the loop did not run; that gap is also under
+    60 ms. Automatic GC is off for the measured post so a collection is not
+    booked as parse time.
+    """
+    import asyncio
+    import time
+    import tracemalloc
+
+    from tests.sim import TextAsr, no_gc_pause, open_room, post_segment, serving, sim_settings
+
+    assert not tracemalloc.is_tracing()
+    async with serving(asr=TextAsr(0), settings=sim_settings(translate=False)) as (app, client, token):
+        del app
+        await open_room(client, token, "class")
+        warm = await post_segment(client, token, "class", "s", 1, b"warm", 0, 6000)
+        assert warm.status_code == 200, warm.text
+        audio = _heavy_audio()
+        pad = _sixty_kb_field()
+        gaps: list[float] = []
+        stop = asyncio.Event()
+
+        async def tick():
+            last = time.perf_counter()
+            while not stop.is_set():
+                await asyncio.sleep(0.001)
+                now = time.perf_counter()
+                gaps.append(now - last)
+                last = now
+
+        with no_gc_pause():
+            beater = asyncio.create_task(tick())
+            await asyncio.sleep(0.005)
+            try:
+                started = time.perf_counter()
+                resp = await _post_heavy(client, token, 2, audio, pad)
+                elapsed = time.perf_counter() - started
+            finally:
+                stop.set()
+                await beater
+    assert resp.status_code == 200, resp.text
+    assert resp.json().get("zh") == audio.decode()
+    assert elapsed < 0.06, elapsed
+    assert gaps, "the 1 ms timer did not run"
+    assert max(gaps) < 0.06, max(gaps)
+    assert not tracemalloc.is_tracing()
+
+
 @pytest.mark.anyio
 async def test_traced_upload_stays_inside_one_slice():
     """A boundary-like slice still parses through Starlette while tracing.
 
     The upload uses Request.form. Bytes that look like a multipart boundary
     stay inside the audio part, and a slice-sized file comes back as Chinese.
-    This traced path does not assert upload latency. That 60 ms bound is on
-    test_upload_latency_stays_inside_one_slice, which does not trace.
+    The same 900 KiB audio plus 60 KiB field is timed here too. The slowest
+    traced request of that size measured 21.4 ms, so the bound stays 0.06 s.
     """
+    import time
     import tracemalloc
 
-    from tests.sim import TextAsr, open_room, post_segment, serving, sim_settings
+    from tests.sim import TextAsr, no_gc_pause, open_room, post_segment, serving, sim_settings
 
     weird = "甲\r\n--not-the-boundary\r\n乙".encode()
     bulky = ("句" * 20000).encode()
@@ -346,6 +460,15 @@ async def test_traced_upload_stays_inside_one_slice():
             resp = await post_segment(client, token, "class", "s", 2, bulky, 6000, 12000)
             assert resp.status_code == 200, resp.text
             assert resp.json().get("zh") == bulky.decode()
+            audio = _heavy_audio()
+            pad = _sixty_kb_field()
+            with no_gc_pause():
+                started = time.perf_counter()
+                heavy = await _post_heavy(client, token, 3, audio, pad)
+                elapsed = time.perf_counter() - started
+            assert heavy.status_code == 200, heavy.text
+            assert heavy.json().get("zh") == audio.decode()
+            assert elapsed < 0.06, elapsed
             assert tracemalloc.is_tracing()
     finally:
         tracemalloc.stop()
