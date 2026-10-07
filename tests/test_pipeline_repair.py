@@ -846,11 +846,19 @@ async def test_srt_100_minute_session_formats_hours(tmp_path):
                     assert hello["gap"] is True
                     assert "backfill" in hello
                     backfill = hello["backfill"]
-                    assert len(backfill) == half * 2
-                    assert len({item["id"] for item in backfill}) == half * 2
-                    assert [(item["session_id"], item["seq"]) for item in backfill] == (
-                        [("s1", seq) for seq in range(1, half + 1)] + [("s2", seq) for seq in range(1, half + 1)]
+                    # The class is still 1000 rows (export and caption_state above).
+                    # An audience replay is only the last 200, under the byte budget.
+                    full = (
+                        [("s1", seq) for seq in range(1, half + 1)]
+                        + [("s2", seq) for seq in range(1, half + 1)]
                     )
+                    assert len(full) == half * 2
+                    assert len(backfill) == 200
+                    assert len({item["id"] for item in backfill}) == 200
+                    assert [(item["session_id"], item["seq"]) for item in backfill] == full[-200:]
+                    assert (backfill[0]["session_id"], backfill[0]["seq"]) != ("s1", 1)
+                    encoded = json.dumps(backfill, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                    assert len(encoded) <= 100 * 1024
                     calls = asr.calls
                     again = await push(
                         client, token, "class", "s1", 3, "s1-3".encode(),
