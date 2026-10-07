@@ -24,6 +24,7 @@ SUITES = (
     "room_prefs.test.mjs",
     "room_dom.test.mjs",
     "host_caption.test.mjs",
+    "host_glossary.test.mjs",
 )
 
 

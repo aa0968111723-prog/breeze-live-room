@@ -23,13 +23,73 @@ from app.asr import CliAsr, ResidentAsr
 from app.audio import AudioError, convert_to_wav, ffmpeg_bin, wav_duration_seconds
 from app.auth import audience_origin_allowed, new_host_token, require_host, require_local_host, same_secret
 from app.dispatch import ListenerSlot, RoomBus, for_listener
+from app.glossary import (
+    GLOSSARY_MAX_BODY,
+    LEGACY_BOX_LIMIT,
+    SCHEMA_VERSION,
+    legacy_box_block,
+    legacy_omitted_count,
+    legacy_terms,
+    validate_terms,
+)
 from app.pipeline import Pipeline, PipelineError, Segment
 from app.rooms import RoomBook, RoomIdError, validate_room_id, validate_session_id
 from app.settings import Settings, fill_process_environ
 from app.share import list_share_hosts, listen_url
 from app.store import CaptionStore
-from app.textutil import export_text, parse_glossary
+from app.textutil import export_text, scrub_caption, strict_legacy_rows, utf8_text
 from app.translate import Translator
+
+class GlossaryConflict(Exception):
+    """The room glossary changed before this write. `version` is the one still stored."""
+
+    def __init__(self, version: int) -> None:
+        self.version = int(version)
+
+
+class GlossaryRejected(Exception):
+    """The textarea must not replace this glossary, or the new rows are invalid. Nothing was written."""
+
+    def __init__(self, accepted: list, rejected: list) -> None:
+        self.accepted = accepted
+        self.rejected = rejected
+
+
+def _legacy_source_lines(rows: list[dict], rejected: list[dict]) -> list[dict]:
+    """validate_terms counts terms. The textarea also counts comments and blank lines."""
+    mapped = []
+    for item in rejected:
+        if not isinstance(item, dict):
+            mapped.append(item)
+            continue
+        line = item.get("line")
+        source = None
+        if isinstance(line, int) and not isinstance(line, bool) and 1 <= line <= len(rows):
+            candidate = rows[line - 1].get("line")
+            if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate > 0:
+                source = candidate
+        if source is None:
+            mapped.append(item)
+        else:
+            mapped.append({**item, "line": source})
+    return mapped
+
+
+def _glossary_conflict(version: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "ok": False,
+            "version": int(version),
+            "accepted": [],
+            "rejected": [{"line": 0, "reason": "術語表版本不符"}],
+        },
+    )
+
+
+# Retranslate runs glossary normalize on the submitted Chinese. Past this, that
+# walk is slow enough to matter and the caption is no longer a spoken line.
+_RETRANSLATE_ZH_MAX = 500
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = Path(__file__).resolve().parent / "static"
@@ -725,10 +785,18 @@ def _public_result(done: Segment) -> JSONResponse:
         code = 422
     else:
         code = 200
-    body = done.public()
+    body = scrub_caption(done.public())
     body["ok"] = code == 200
-    body["detail"] = done.error
+    detail = utf8_text(done.error) if isinstance(done.error, str) else ""
+    body["detail"] = detail or body.get("error") or ""
     return JSONResponse(status_code=code, content=body)
+
+
+def host_segment_payload(segment: Segment, *, ok: bool) -> dict:
+    """Scrub a host segment response. A lone surrogate in zh must not become a 500."""
+    body = scrub_caption(segment.public())
+    body["ok"] = bool(ok)
+    return body
 
 
 class _ReferrerPolicy:
@@ -795,7 +863,16 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             asr = CliAsr(whisper, model, threads=settings.asr_threads, timeout_s=settings.asr_timeout_s, audio_context=settings.asr_audio_context, beam_size=settings.asr_beam_size, best_of=settings.asr_best_of)
     share_override = {"host": settings.share_host}
     tasks: list[asyncio.Task] = []
+    # One lock per room covers version check, the database write, and the memory swap.
+    glossary_locks: dict[str, asyncio.Lock] = {}
     close_jobs: set[asyncio.Task] = set()
+
+    def _glossary_lock(room_id: str) -> asyncio.Lock:
+        lock = glossary_locks.get(room_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            glossary_locks[room_id] = lock
+        return lock
     replay_floors: dict[str, float] = {}
     replay_gate = _ReplayGate(settings.replay_per_minute, settings.replay_client_per_minute)
     share_cache: dict[str, object] = {"at": 0.0, "hosts": []}
@@ -1117,6 +1194,18 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         # Replaying starts here, before the first request is served.
         if store.enabled:
             try:
+                glossaries = await asyncio.to_thread(store.load_glossaries)
+            except Exception:
+                logging.getLogger("breeze.server").exception("glossary load failed")
+                glossaries = []
+            for row in glossaries:
+                loaded_room = str(row.get("room_id") or "")
+                try:
+                    validate_room_id(loaded_room)
+                except RoomIdError:
+                    continue
+                pipeline.install_room_glossary(row)
+            try:
                 room_ids = await asyncio.to_thread(store.room_ids)
             except Exception:
                 logging.getLogger("breeze.server").exception("caption room list failed")
@@ -1339,7 +1428,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         if book.get(room_id) is None:
             ensure_room(room_id)
         segment = pipeline.mark_missing(room_id, session_id, seq, str(body.get("reason") or "主持端放棄這段"))
-        return {"ok": True, **segment.public()}
+        return host_segment_payload(segment, ok=True)
 
     @app.post("/api/segment/cancel")
     async def segment_cancel(request: Request) -> dict:
@@ -1354,7 +1443,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             segment = pipeline.request_cancel(room_id, session_id, seq)
         except PipelineError as exc:
             raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
-        return {"ok": segment.status == "cancelled", **segment.public()}
+        return host_segment_payload(segment, ok=segment.status == "cancelled")
 
     @app.post("/api/segment/retranslate")
     async def retranslate(request: Request) -> dict:
@@ -1364,21 +1453,234 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         session_id = validate_session_id(str(body.get("session_id") or ""))
         seq = int(body.get("seq") or 0)
         zh = body.get("zh")
+        # A long zh is normalized against every glossary span. Cap it before that work.
+        if isinstance(zh, str) and len(zh.strip()) > _RETRANSLATE_ZH_MAX:
+            raise HTTPException(status_code=413, detail=f"中文超過 {_RETRANSLATE_ZH_MAX} 字，已拒絕")
         try:
             segment = await pipeline.retranslate(room_id, session_id, seq, zh if isinstance(zh, str) else None)
         except PipelineError as exc:
             raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
-        return {"ok": segment.status != "error", **segment.public()}
+        return host_segment_payload(segment, ok=segment.status != "error")
+
+    def _glossary_body(view: dict, *, accepted=None, rejected=None) -> dict:
+        payload = {
+            "ok": True,
+            "schema_version": SCHEMA_VERSION,
+            "room_id": view["room_id"],
+            "version": int(view["version"]),
+            "updated_at": view["updated_at"],
+            "terms": view["terms"],
+        }
+        if accepted is not None:
+            payload["accepted"] = accepted
+        if rejected is not None:
+            payload["rejected"] = rejected
+        return payload
+
+    async def _save_room_glossary(
+        room_id: str,
+        terms: list,
+        expected_version: int | None = None,
+        preserve_rich: bool = False,
+    ) -> tuple[dict, int]:
+        """Persist first. Memory changes only after the database accepts this version.
+
+        `expected_version=None` means the legacy client, which does not send if_version:
+        the version read under the lock is the one written against.
+        `preserve_rich` is the textarea path. Under this lock, a stored glossary
+        the textarea cannot round-trip is refused and nothing is written. That is
+        more than LEGACY_BOX_LIMIT rows, lock off, a note, a category, or text the
+        `zh|alias=en` line would change. Aliases the line can show are editable:
+        an omitted alias is removed, but `deleted` counts omitted canonical
+        terms only, not aliases.
+        """
+        async with _glossary_lock(room_id):
+            current = pipeline.room_glossary_version(room_id)
+            if expected_version is not None and int(expected_version) != current:
+                raise GlossaryConflict(current)
+            deleted = 0
+            if preserve_rich:
+                prior = pipeline.room_glossary_view(room_id)["terms"]
+                reason = legacy_box_block(prior, room_id)
+                if reason:
+                    raise GlossaryRejected([], [{"line": 0, "reason": reason}])
+                deleted = legacy_omitted_count(prior, terms)
+                accepted, rejected = validate_terms(terms)
+                if rejected or not accepted:
+                    if not rejected:
+                        rejected = [{"line": 0, "reason": "沒有有效的術語，不會清空這個房間的詞表"}]
+                    raise GlossaryRejected(accepted, rejected)
+                terms = accepted
+            new_version = current + 1
+            updated_at = time.time()
+            if store.enabled:
+                try:
+                    wrote = await asyncio.to_thread(
+                        store.save_glossary,
+                        room_id,
+                        new_version,
+                        terms,
+                        updated_at,
+                        current,
+                    )
+                except Exception as exc:
+                    logging.getLogger("breeze.server").exception("glossary store failed")
+                    raise HTTPException(status_code=503, detail="術語表暫時無法儲存") from exc
+                if not wrote:
+                    fresh = await asyncio.to_thread(store.get_glossary, room_id)
+                    if fresh is None:
+                        pipeline.clear_room_glossary(room_id)
+                    else:
+                        pipeline.install_room_glossary(fresh)
+                    raise GlossaryConflict(pipeline.room_glossary_version(room_id))
+            pipeline.install_room_glossary({
+                "room_id": room_id,
+                "version": new_version,
+                "terms": terms,
+                "updated_at": updated_at,
+            })
+            return pipeline.room_glossary_view(room_id), deleted
+
+    @app.get("/api/rooms/{room_id}/glossary")
+    async def get_room_glossary(room_id: str, request: Request) -> dict:
+        require_host(request, token, settings)
+        try:
+            room_id = validate_room_id(room_id)
+        except RoomIdError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _glossary_body(pipeline.room_glossary_view(room_id))
+
+    @app.put("/api/rooms/{room_id}/glossary")
+    async def put_room_glossary(room_id: str, request: Request):
+        require_host(request, token, settings)
+        try:
+            room_id = validate_room_id(room_id)
+        except RoomIdError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raw = await _read_capped(request, GLOSSARY_MAX_BODY)
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+            # An integer past the conversion limit is ValueError, not JSONDecodeError.
+            raise HTTPException(status_code=400, detail="需要 JSON") from exc
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="需要 JSON 物件")
+        if "if_version" not in body or isinstance(body.get("if_version"), bool) or not isinstance(body.get("if_version"), int):
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "accepted": [], "rejected": [{"line": 0, "reason": "if_version 必須是整數"}]},
+            )
+        current = pipeline.room_glossary_version(room_id)
+        # Stale version wins over a bad term list, so a retry can reload before fixing rows.
+        if int(body["if_version"]) != current:
+            return _glossary_conflict(current)
+        if "terms" not in body:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "accepted": [], "rejected": [{"line": 0, "reason": "缺少 terms"}]},
+            )
+        accepted, rejected = validate_terms(body.get("terms"))
+        if rejected:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "accepted": accepted, "rejected": rejected},
+            )
+        try:
+            view, _deleted = await _save_room_glossary(room_id, accepted, expected_version=int(body["if_version"]))
+        except GlossaryConflict as exc:
+            return _glossary_conflict(exc.version)
+        return _glossary_body(view, accepted=accepted, rejected=[])
 
     @app.post("/api/glossary")
     async def set_glossary(request: Request) -> dict:
         require_host(request, token, settings)
-        body = await _json(request)
-        room_id = validate_room_id(str(body.get("room_id") or ""))
-        session_id = validate_session_id(str(body.get("session_id") or "default"))
-        rows = parse_glossary(str(body.get("text") or ""))
-        pipeline.glossary[(room_id, session_id)] = rows
-        return {"ok": True, "count": len(rows)}
+        raw = await _read_capped(request, GLOSSARY_MAX_BODY)
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+            # An integer past the conversion limit is ValueError, not JSONDecodeError.
+            raise HTTPException(status_code=400, detail="需要 JSON") from exc
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="需要 JSON 物件")
+        try:
+            room_id = validate_room_id(str(body.get("room_id") or ""))
+            # The old client still sends session_id. The glossary is per room, so it is ignored.
+            validate_session_id(str(body.get("session_id") or "default"))
+        except RoomIdError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        expected: int | None = None
+        if "if_version" in body:
+            raw_version = body.get("if_version")
+            if isinstance(raw_version, bool) or not isinstance(raw_version, int):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "ok": False,
+                        "count": 0,
+                        "accepted": [],
+                        "rejected": [{"line": 0, "reason": "if_version 必須是整數"}],
+                    },
+                )
+            expected = int(raw_version)
+            current = pipeline.room_glossary_version(room_id)
+            if expected != current:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "ok": False,
+                        "count": 0,
+                        "version": current,
+                        "rejected": [{"line": 0, "reason": "術語表版本不符"}],
+                    },
+                )
+        text = body.get("text")
+        if not isinstance(text, str):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "count": 0,
+                    "accepted": [],
+                    "rejected": [{"line": 0, "reason": "text 必須是文字"}],
+                },
+            )
+        rows, problems = strict_legacy_rows(text, limit=LEGACY_BOX_LIMIT)
+        if problems:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "count": 0, "accepted": [], "rejected": problems},
+            )
+        accepted, rejected = validate_terms(legacy_terms(rows))
+        if rejected or not accepted:
+            if not rejected:
+                rejected = [{"line": 0, "reason": "沒有有效的術語，不會清空這個房間的詞表"}]
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "count": 0, "accepted": accepted, "rejected": _legacy_source_lines(rows, rejected)},
+            )
+        try:
+            _view, deleted = await _save_room_glossary(room_id, accepted, expected_version=expected, preserve_rich=True)
+        except GlossaryRejected as exc:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "count": 0,
+                    "accepted": exc.accepted,
+                    "rejected": _legacy_source_lines(rows, exc.rejected),
+                },
+            )
+        except GlossaryConflict as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "count": 0,
+                    "version": exc.version,
+                    "rejected": [{"line": 0, "reason": "術語表版本不符"}],
+                },
+            )
+        return {"ok": True, "count": len(_view["terms"]), "deleted": deleted}
 
     @app.post("/api/share-host")
     async def set_share_host(request: Request) -> dict:
@@ -1457,19 +1759,22 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             event = bus.delete_caption(room_id, segment_id, parsed_session, parsed_seq)
             _fanout(event)
             return {"ok": True, "deleted": int(removed or 0), "id": segment_id}
-        pipeline.mute_room(room_id)
-        pending = store.enqueue_delete_room(room_id)
-        try:
-            removed = await asyncio.wrap_future(pending)
-        except Exception:
-            pipeline.unmute_room(room_id, abort=True)
-            logging.getLogger("breeze.server").exception("caption store delete failed")
-            return JSONResponse(
-                status_code=503,
-                content={"ok": False, "detail": "字幕儲存暫時無法刪除，畫面上的字幕還留著"},
-            )
-        pipeline.unmute_room(room_id)
-        pipeline.invalidate_room(room_id)
+        # The same lock as a glossary PUT, held until memory is cleared, so a
+        # write that read the old version cannot land after this reset.
+        async with _glossary_lock(room_id):
+            pipeline.mute_room(room_id)
+            pending = store.enqueue_delete_room(room_id)
+            try:
+                removed = await asyncio.wrap_future(pending)
+            except Exception:
+                pipeline.unmute_room(room_id, abort=True)
+                logging.getLogger("breeze.server").exception("caption store delete failed")
+                return JSONResponse(
+                    status_code=503,
+                    content={"ok": False, "detail": "字幕儲存暫時無法刪除，畫面上的字幕還留著"},
+                )
+            pipeline.unmute_room(room_id)
+            pipeline.invalidate_room(room_id)
         event = bus.clear_room(room_id)
         _fanout(event)
         room = book.get(room_id)
@@ -1760,6 +2065,28 @@ def _caption_target(room_id: str, caption_id: str, session_id: str, seq: int) ->
         session = validate_session_id(session_id)
         return f"{room_id}:{session}:{seq}", session, seq
     raise HTTPException(status_code=400, detail="刪除單段需要 id 或 session_id 與 seq")
+
+
+async def _read_capped(request: Request, limit: int) -> bytes:
+    """Refuse a glossary body before it is parsed. Content-Length and the stream are both capped."""
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            size = int(declared)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="需要 JSON") from exc
+        if size > limit:
+            raise HTTPException(status_code=413, detail="術語表內容過大")
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(status_code=413, detail="術語表內容過大")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 async def _json(request: Request) -> dict:
