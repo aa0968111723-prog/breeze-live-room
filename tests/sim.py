@@ -136,9 +136,11 @@ def sim_settings(**over) -> Settings:
         gap_wait_s=3 * SCALE,
         heartbeat_s=0.05,
         idle_timeout_s=5,
-        # 2 virtual seconds, not the product's 8s. A wider sim budget hides a stop
-        # that sits out the flush window instead of returning once audio has settled.
-        stop_flush_s=2 * SCALE,
+        # 8 virtual seconds, the product default (BREEZE_STOP_FLUSH=8). B-f1's cap
+        # stays vlimit(3.5). A 2v flush does not catch a stop that sits out the
+        # window: on the Windows scale that stop was measured under 4.2, so it
+        # passed; at 8v the same stop is about 10v and fails. Stricter, not looser.
+        stop_flush_s=8 * SCALE,
         shutdown_flush_s=0.2,
     )
     base.update(over)
@@ -459,8 +461,10 @@ class VirtualHost:
         # segment_end is taken after that so the sample is not latency.
         await self._release_slice.wait()
         payload = text.encode()
+        # Same clock as _recv_mono. Do not switch this one to perf_counter.
         self.segment_end_mono[seq] = time.monotonic()
-        started = time.monotonic()
+        # perf_counter, not monotonic: Windows 3.11 monotonic steps by ~15.6 ms.
+        started = time.perf_counter()
         self._active_posts += 1
         self.max_posts = max(self.max_posts, self._active_posts)
         try:
@@ -488,7 +492,7 @@ class VirtualHost:
                         self._retry_tasks.discard(current)
         finally:
             self._active_posts -= 1
-        elapsed_v = (time.monotonic() - started) / self.scale
+        elapsed_v = (time.perf_counter() - started) / self.scale
         self.responses.append({
             "seq": seq,
             "status": resp.status_code,

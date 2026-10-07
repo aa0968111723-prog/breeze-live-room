@@ -1,8 +1,9 @@
 """B-f. Stopping the session waits for audio already in ASR, not for English.
 
 VirtualHost.stop posts /api/session/end the way host.html does: after uploads drain,
-with no flush=0. sim_settings sets stop_flush_s to 2 virtual seconds so a 40s translation
-does not hold the stop button. B-f2 raises that budget so the gated ASR can finish.
+with no flush=0. sim_settings sets stop_flush_s to 8 virtual seconds, the product
+default, so a 40s translation does not hold the stop button. B-f1 still caps the
+stop at vlimit(3.5). B-f2 pins its own flush so the gated ASR can finish.
 """
 
 import threading
@@ -51,7 +52,13 @@ async def test_stop_latency_not_bound_by_translation():
             "a full GC ran during stop; stop_elapsed_v includes that pause, not ASR or flush "
             f"(stop_elapsed_v={host.stop_elapsed_v})"
         )
+        # Flush budget is 8 virtual seconds (BREEZE_STOP_FLUSH). This cap did not
+        # move. 2v misses a stop that waits out the window on the Windows scale
+        # (under 4.2); 8v fails that stop. The last slice must still be kept.
         assert host.stop_elapsed_v <= vlimit(3.5)
+        last = next(row for row in caption_rows(app, "class") if row.get("seq") == 5)
+        assert last.get("status") not in {"missing", "error"}
+        assert last.get("zh") == "第5句"
 
 
 @pytest.mark.anyio
