@@ -1,7 +1,8 @@
-// J4: eight failed opens, then the offline state. J5: 1000 captions × 2 versions stay ordered.
+// J4: failed opens keep retrying past eight, with jitter, and never freeze on 服務離線.
+// J5: 1000 captions × 2 versions stay ordered.
 
 import assert from "node:assert/strict";
-import { connectRoom, liveTail, orderedCaptions } from "../app/static/room_client.js";
+import { connectRoom, liveTail, orderedCaptions, reconnectDelayMs } from "../app/static/room_client.js";
 
 function tick() {
   return new Promise((resolve) => setImmediate(resolve));
@@ -17,23 +18,42 @@ function fakeSocket(address) {
   };
 }
 
-async function testGivesUpAfterEight() {
+async function testKeepsRetryingPastEight() {
   const states = [];
+  const waits = [];
   let opens = 0;
-  const conn = connectRoom({
+  let conn;
+  conn = connectRoom({
     room: "class",
     url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
     openSocket() {
       opens += 1;
       throw new Error("offline");
     },
-    sleep: () => Promise.resolve(),
-    onState: (text) => states.push(text),
+    sleep(ms) {
+      waits.push(ms);
+      if (opens >= 10) conn.stop();
+      return Promise.resolve();
+    },
+    random: () => 0,
+    onState: (detail) => states.push(detail),
     onEvent: () => {},
   });
   await conn.done;
-  assert.equal(opens, 8);
-  assert.ok(states.includes("服務離線。可按重新連線。"), states.join(" | "));
+  assert.ok(opens > 8, `opens=${opens}`);
+  assert.equal(opens, 10);
+  const joined = states.map((detail) => (detail && detail.text) || "").join(" | ");
+  assert.equal(joined.includes("服務離線"), false, joined);
+  assert.ok(states.some((detail) => detail && detail.kind === "unreachable"), joined);
+  assert.ok(states.some((detail) => detail && String(detail.text).includes("暫時連不上")), joined);
+  assert.ok(states.some((detail) => detail && String(detail.subtitle).includes("再試一次")), joined);
+  waits.forEach((ms, index) => {
+    assert.equal(ms, reconnectDelayMs(index + 1, 0, false));
+    const full = reconnectDelayMs(index + 1, 1, false);
+    assert.ok(ms >= reconnectDelayMs(index + 1, 0, false) && ms <= full);
+  });
+  assert.equal(waits[0], 500);
+  assert.equal(waits[5], 30000);
 }
 
 async function testThousandCaptionsStayOrdered() {
@@ -81,6 +101,6 @@ async function testThousandCaptionsStayOrdered() {
   await conn.done;
 }
 
-await testGivesUpAfterEight();
+await testKeepsRetryingPastEight();
 await testThousandCaptionsStayOrdered();
 console.log("room client long ok");

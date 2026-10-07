@@ -374,7 +374,8 @@ async function testRoomUnavailableDoesNotResetBackoff() {
       waits.push(ms);
       return Promise.resolve();
     },
-    onState: (text) => states.push(text),
+    random: () => 0,
+    onState: (detail) => states.push(detail),
     onEvent: () => {},
   });
   await tick();
@@ -385,8 +386,13 @@ async function testRoomUnavailableDoesNotResetBackoff() {
     ws.onmessage({ data: JSON.stringify({ type: "room_unavailable", reason: "unknown_or_ended" }) });
     await tick();
   }
-  assert.deepEqual(waits.slice(0, 3), [800, 1600, 3200]);
-  assert.ok(states.includes("房間已結束"));
+  assert.deepEqual(waits.slice(0, 3), [3500, 3500, 3500]);
+  const rendered = states.map((detail) => (detail && detail.text) || String(detail)).join(" | ");
+  assert.ok(states.some((detail) => detail && detail.kind === "waiting_room"), rendered);
+  assert.ok(rendered.includes("等待主持人"), rendered);
+  assert.equal(rendered.includes("斷線"), false, rendered);
+  assert.equal(rendered.includes("服務離線"), false, rendered);
+  assert.equal(rendered.includes("房間已結束"), false, rendered);
   conn.stop();
   await conn.done;
 }

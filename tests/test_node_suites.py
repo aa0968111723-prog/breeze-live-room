@@ -19,6 +19,7 @@ SUITES = (
     "room_client_reset.test.mjs",
     "room_client_long.test.mjs",
     "room_client_backfill.test.mjs",
+    "room_client_state.test.mjs",
     "host_caption.test.mjs",
 )
 

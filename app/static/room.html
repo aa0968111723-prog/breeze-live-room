@@ -13,6 +13,8 @@ header { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; g
 button, select { font-size: 16px; min-height: 44px; padding: 8px 12px; border-radius: 10px; border: 0; background: #8a5424; color: white; }
 button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px solid #c47a32; outline-offset: 2px; }
 #state { color: var(--fg); font-weight: 750; }
+.sub { margin: 0; padding: 0 16px 8px; color: var(--muted); font-size: 16px; min-height: 0; }
+.banner { margin: 0; padding: 10px 16px; background: #8a5424; color: #fff; font-size: 16px; }
 .stage { flex: 1; display: flex; flex-direction: column; justify-content: center; min-height: 42vh; padding: 8px 8px 12px; }
 .en { font-size: var(--size); font-weight: 700; padding: 12px 20px 8px; line-height: 1.35; }
 .zh { font-size: calc(var(--size) * .62); color: var(--muted); padding: 0 20px 20px; line-height: 1.45; }
@@ -23,8 +25,8 @@ li { padding: 8px 0; border-top: 1px solid var(--line); font-size: 16px; }
 </head>
 <body>
 <header>
-<span id="state">連線中…</span>
-<button id="retry" type="button">重新連線</button>
+<span id="state">連線中</span>
+<button id="retry" type="button" hidden>再試一次</button>
 <button id="theme" type="button">暗色</button>
 <button id="full" type="button">全螢幕</button>
 <label>顯示 <select id="mode"><option value="both">中英</option><option value="zh">中文</option><option value="en">英文</option></select></label>
@@ -32,6 +34,8 @@ li { padding: 8px 0; border-top: 1px solid var(--line); font-size: 16px; }
 <label><input id="pause" type="checkbox"> 暫停跟隨</label>
 <button id="live" type="button">回到即時</button>
 </header>
+<p id="sub" class="sub"></p>
+<p id="offline" class="banner" hidden>手機沒網路。恢復網路後會自動接回。</p>
 <div class="stage">
 <div class="en" id="en">等待主持端</div>
 <div class="zh" id="zh"></div>
@@ -78,7 +82,24 @@ function connect() {
       if (clientId) address += "&cid=" + encodeURIComponent(clientId);
       return address;
     },
-    onState: (text) => { document.querySelector("#state").textContent = text; },
+    onState: (detail) => {
+      const text = detail && typeof detail === "object" ? (detail.text || "") : String(detail || "");
+      const subtitle = detail && typeof detail === "object" ? (detail.subtitle || "") : "";
+      const kind = detail && typeof detail === "object" ? (detail.kind || "") : "";
+      document.querySelector("#state").textContent = text;
+      const sub = document.querySelector("#sub");
+      if (sub) sub.textContent = subtitle;
+      const offline = document.querySelector("#offline");
+      if (offline) offline.hidden = kind !== "device_offline";
+      const retry = document.querySelector("#retry");
+      if (retry) {
+        const show = !!(detail && typeof detail === "object" && (
+          detail.manual || kind === "link_invalid" || kind === "unreachable" ||
+          kind === "room_full" || kind === "ended" || kind === "rejected"
+        ));
+        retry.hidden = !show;
+      }
+    },
     onEvent: show,
     onDelete: show,
     onClear: (data) => { view.apply(data && data.type ? data : { type: "captions_cleared" }); render(); },
@@ -89,7 +110,7 @@ function connect() {
     onGap: () => { document.querySelector("#state").textContent = "補償窗口不足，只補到伺服器還留著的字幕"; },
   });
 }
-document.querySelector("#retry").onclick = () => { conn.stop(); conn = connect(); conn.nudge(); };
+document.querySelector("#retry").onclick = () => { conn.restart(); };
 document.querySelector("#theme").onclick = () => {
   document.body.classList.toggle("dark");
   document.querySelector("#theme").textContent = document.body.classList.contains("dark") ? "亮色" : "暗色";
