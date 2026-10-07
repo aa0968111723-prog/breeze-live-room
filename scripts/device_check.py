@@ -9,6 +9,11 @@ token). It never prints that token.
   python scripts/device_check.py --base http://127.0.0.1:8780 listen --room class --seconds 30 --out data/device-listen.jsonl
 
 ``websockets`` is optional. ``listen`` says so and exits 0 when it is missing.
+
+``watch`` records ``backlog_audio_s`` for the "peak backlog under 12 seconds"
+check: decoded audio still queued or currently being recognized. ``backlog_s``
+is the separate upload estimate and is not that gate. ``asr_active_s`` is how
+long the oldest in-flight recognition has already run.
 """
 from __future__ import annotations
 
@@ -242,8 +247,12 @@ def _sample(client: HostClient, room: str) -> dict:
         "translate_configured": setup.get("translate_configured"),
         "asr_rtf_p50": metrics.get("asr_rtf_p50"),
         "asr_rtf_p95": metrics.get("asr_rtf_p95"),
-        "backlog_s": metrics.get("backlog_s", metrics.get("backlog_audio_s")),
+        "backlog_audio_s": metrics.get("backlog_audio_s"),
+        "backlog_s": metrics.get("backlog_s"),
         "backlog_estimated": metrics.get("backlog_estimated"),
+        "asr_active_s": metrics.get("asr_active_s"),
+        "process_ms": metrics.get("process_ms"),
+        "last_process_ms": metrics.get("last_process_ms"),
         "asr_wait_ms_p95": metrics.get("asr_wait_ms_p95"),
         "decode_ms_p95": metrics.get("decode_ms_p95"),
         "silent_skipped": metrics.get("silent_skipped"),
@@ -264,7 +273,8 @@ def cmd_watch(client: HostClient, args) -> int:
         "time", "pending", "oldest_wait_ms", "rejected", "missing", "rss_bytes",
         "translate_queued", "translate_skipped", "held", "listeners", "storage",
         "storage_recovered", "asr_mode", "asr_ready", "translate_configured",
-        "asr_rtf_p50", "asr_rtf_p95", "backlog_s", "backlog_estimated",
+        "asr_rtf_p50", "asr_rtf_p95", "backlog_audio_s", "backlog_s", "backlog_estimated",
+        "asr_active_s", "process_ms", "last_process_ms",
         "asr_wait_ms_p95", "decode_ms_p95", "silent_skipped", "asr_empty", "asr_timeouts",
         "asr_errors",
     ]
@@ -281,7 +291,8 @@ def cmd_watch(client: HostClient, args) -> int:
             print(
                 f"{row['time']}  pending={row['pending']} rejected={row['rejected']} "
                 f"missing={row['missing']} rss={row['rss_bytes']} translate_queued={row['translate_queued']} "
-                f"rtf_p95={row.get('asr_rtf_p95')} backlog_s={row.get('backlog_s')} "
+                f"rtf_p95={row.get('asr_rtf_p95')} backlog_audio_s={row.get('backlog_audio_s')} "
+                f"backlog_s={row.get('backlog_s')} asr_active_s={row.get('asr_active_s')} "
                 f"asr_errors={row.get('asr_errors')}"
             )
             if deadline is not None and time.monotonic() >= deadline:

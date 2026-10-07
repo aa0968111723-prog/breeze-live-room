@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.asr import AsrResult
+from app.asr import AsrResult, ResidentAsr
 from app.audio import riff_duration_seconds
 from app.rtf import SESSION_LIMIT, SESSION_ROOM_CAP, RtfMeter, percentile
 from app.server import create_app
@@ -141,16 +141,28 @@ def test_rtf_meter_percentiles_window_and_session_cap():
     assert meter.snapshot()["rtf"]["session"]["count"] == 0
     meter.note_waiting(("room", "class", 1), 1.25)
     meter.note_waiting(("room", "class", 2), 2.5)
+    meter.note_decoded(("room", "class", 1), 1.25)
+    meter.note_decoded(("room", "class", 2), 2.5)
     waiting = meter.snapshot()
     assert waiting["backlog_audio_s"] == 3.75
     assert waiting["backlog_s"] == 3.75
     assert waiting["backlog_estimated"] is False
+    assert waiting["asr_active_s"] == 0
     meter.clear_waiting(("room", "class", 1))
+    # Recognition starting drops only the not-yet-started queue. Decoded audio stays.
+    started = meter.snapshot()
+    assert started["backlog_s"] == 2.5
+    assert started["backlog_audio_s"] == 3.75
+    meter.clear_decoded(("room", "class", 1))
     assert meter.snapshot()["backlog_audio_s"] == 2.5
     assert meter.snapshot()["backlog_s"] == 2.5
     meter.clear_waiting(("room", "class", 2))
-    assert meter.snapshot()["backlog_audio_s"] == 0
-    assert meter.snapshot()["backlog_s"] == 0
+    meter.clear_decoded(("room", "class", 2))
+    idle = meter.snapshot()
+    assert idle["backlog_audio_s"] == 0
+    assert idle["backlog_s"] == 0
+    assert isinstance(idle["backlog_audio_s"], int)
+    assert isinstance(idle["asr_active_s"], int)
 
     for value in (100, 200, 300, 400, 500):
         meter.record_ms(value, 1000, ("room", "class"))
@@ -200,6 +212,10 @@ def test_host_metrics_line_keeps_existing_labels_and_adds_rtf():
     assert "辨識即時率" not in line
     assert "辨識速度" not in line
     assert 'data.last_process_ms ?? "—"' in line
+    assert 'data.process_ms ?? "—"' in line
+    assert 'data.asr_active_s ?? "—"' in line
+    assert "純辨識 " in line
+    assert "正在辨識 " in line
     phase = text.index('id="phase"')
     speed = text.index('id="rtf-speed"')
     captions = text.index('id="caption-en"')
@@ -237,6 +253,8 @@ async def test_metrics_rtf_uses_wave_duration_and_known_asr_speed(tmp_path):
             before = (await client.get("/api/metrics", headers=auth(token))).json()
             assert EXISTING <= set(before)
             assert before["last_process_ms"] is None
+            assert before["process_ms"] is None
+            assert before["asr_active_s"] == 0
             assert before["pending"] == 0 and before["rejected"] == 0 and before["missing"] == 0
             assert before["rtf"]["window"]["count"] == 0
             assert before["rtf"]["session"]["count"] == 0
@@ -280,8 +298,13 @@ async def test_metrics_rtf_uses_wave_duration_and_known_asr_speed(tmp_path):
             assert body["asr_timeouts"] == 0
             assert body["silent_skipped"] == 0
             assert body["asr_empty"] == 0
-            # last_process_ms is decode plus recognition, not the RTF numerator and not slot wait.
+            # last_process_ms covers the whole slice, including the queue.
+            # process_ms is decode plus recognition and is at least the RTF numerator.
+            assert isinstance(body["process_ms"], int)
+            assert body["process_ms"] + 50 >= asr_ms
+            assert body["last_process_ms"] + 50 >= body["process_ms"]
             assert body["last_process_ms"] + 50 >= asr_ms
+            assert body["asr_active_s"] == 0
             assert asr.calls == 1
     finally:
         await app.state.shutdown()
@@ -302,16 +325,22 @@ async def test_metrics_backlog_is_decoded_audio_still_waiting():
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline:
                 seen = (await client.get("/api/metrics", headers=auth(token))).json()
-                # The slice already inside ASR is not backlog. Only the decoded slice still waiting for a slot is.
-                if asr.calls == 1 and seen["pending"] == 2 and seen["backlog_audio_s"] <= 1.01:
+                # One slice is inside ASR and one decoded slice is still waiting for the slot.
+                if (
+                    asr.calls == 1
+                    and seen["pending"] == 2
+                    and seen["backlog_audio_s"] >= 1.5
+                    and 0.5 <= seen["backlog_s"] <= 1.01
+                ):
                     break
                 await asyncio.sleep(0.02)
             assert seen is not None
             assert asr.calls == 1
-            assert seen["backlog_audio_s"] == pytest.approx(1.0, abs=0.001)
+            assert seen["backlog_audio_s"] == pytest.approx(2.0, abs=0.001)
             assert seen["backlog_s"] == pytest.approx(1.0, abs=0.001)
             assert seen["backlog_estimated"] is False
             assert seen["backlog_by_room"] == {"class": pytest.approx(1.0, abs=0.001)}
+            assert seen["asr_active_s"] > 0
             assert seen["pending"] == 2
             assert seen["rejected"] == 0
             assert seen["missing"] == 0
@@ -411,6 +440,7 @@ async def test_silence_skip_does_not_record_rtf():
             assert body["silent_skipped"] == 1
             assert body["asr_empty"] == 0
             assert body["last_process_ms"] is None
+            assert body["process_ms"] is None
             assert asr.calls == 0
     finally:
         await app.state.shutdown()
@@ -564,6 +594,7 @@ def test_host_speed_line_wording_for_each_band():
     node = _node_bin()
     source = Path("app/static/host.html").read_text(encoding="utf-8")
     function = _extract_function(source, "recognitionSpeedView")
+    session_key = _extract_function(source, "sessionKey")
     failure = _extract_function(source, "noteMetricsFailure")
     listening = {"roomId": "class", "sessionId": "live"}
     empty = "辨識速度：開始聽之後才有數字"
@@ -615,7 +646,7 @@ def test_host_speed_line_wording_for_each_band():
         {"data": sample(1.20, 1.40), "listening": listening, "text": line(1.20, 1.40, "跟不上，字幕會延遲"), "tone": "speed-bad"},
         {"data": sample(0.40, 0.55, count=200), "listening": listening, "text": line(0.40, 0.55, "跟得上", 200), "tone": "speed-ok"},
     ]
-    script = function + failure + """
+    script = function + session_key + failure + """
 const cases = JSON.parse(process.argv[1]);
 let failed = 0;
 for (const item of cases) {
@@ -633,6 +664,7 @@ for (const item of cases) {
     failed++;
   }
 }
+var ctl = null;
 const speed = {
   textContent: "跟得上｜辨識速度：一般 0.42、最慢 0.50（低於 0.9 才跟得上）。最近 5 段",
   classList: { added: [], add(name) { if (!this.added.includes(name)) this.added.push(name); } },
@@ -654,6 +686,57 @@ noteMetricsFailure(speed);
 const marks = speed.textContent.split("（數字暫停更新）").length - 1;
 if (marks !== 1) {
   console.log("stale mark repeated " + marks);
+  failed++;
+}
+ctl = { session: { roomId: "class", id: "aaa" } };
+const kept = {
+  textContent: "跟得上｜辨識速度：一般 0.42、最慢 0.50（低於 0.9 才跟得上）。最近 5 段",
+  title: "old",
+  metricsSession: "class\\naaa",
+  classList: {
+    added: ["speed-ok"],
+    add(name) { if (!this.added.includes(name)) this.added.push(name); },
+    remove(...names) { this.added = this.added.filter((name) => !names.includes(name)); },
+  },
+};
+noteMetricsFailure(kept);
+if (!kept.textContent.startsWith("跟得上")) {
+  console.log("same session dropped the speed line " + kept.textContent);
+  failed++;
+}
+if (!kept.textContent.includes("（數字暫停更新）")) {
+  console.log("same session missing stale mark");
+  failed++;
+}
+if ((kept.textContent.split("（數字暫停更新）").length - 1) !== 1) {
+  console.log("same session repeated the mark");
+  failed++;
+}
+ctl.session = { roomId: "class", id: "bbb" };
+noteMetricsFailure(kept);
+const reset = "辨識速度：開始聽之後才有數字（數字暫停更新）";
+if (kept.textContent !== reset) {
+  console.log("session change kept old text " + kept.textContent);
+  failed++;
+}
+if (kept.textContent.includes("跟得上") || kept.textContent.includes("0.42")) {
+  console.log("session change kept the previous speed");
+  failed++;
+}
+if (kept.metricsSession !== "class\\nbbb") {
+  console.log("metrics session not reset " + kept.metricsSession);
+  failed++;
+}
+if (!kept.classList.added.includes("speed-empty") || !kept.classList.added.includes("speed-stale")) {
+  console.log("session change classes " + kept.classList.added.join(","));
+  failed++;
+}
+if (kept.classList.added.includes("speed-ok")) {
+  console.log("old tone survived the session change");
+  failed++;
+}
+if (!String(kept.title).includes("最近 200 段")) {
+  console.log("title dropped");
   failed++;
 }
 if (failed) process.exit(1);
@@ -697,6 +780,8 @@ async def test_asr_timeout_is_not_an_rtf_sample():
             assert body["silent_skipped"] == 0
             assert body["asr_empty"] == 0
             assert body["last_process_ms"] is None
+            assert body["process_ms"] is None
+            assert body["asr_active_s"] == 0
             assert body["rtf"]["session"]["count"] == 0
             assert body["rtf"]["window"]["count"] == 0
             assert body["rtf"]["session"]["rtf"]["p95"] is None
@@ -765,7 +850,11 @@ def test_skip_counters_stay_out_of_rtf_and_do_not_share_a_tally():
     assert snap["rtf"]["window"]["count"] == 0
     assert snap["asr_rtf_p95"] is None
     rows = _rows(snap)
-    assert ("east", "a") not in rows
+    east = rows[("east", "a")]
+    assert east["count"] == 0
+    assert east["silent_skipped"] == 1
+    assert east["rtf"]["p95"] is None
+    assert east["asr_empty"] == 0
     assert rows[("west", "b")]["count"] == 0
     assert rows[("west", "b")]["asr_timeouts"] == 1
     assert rows[("west", "b")]["asr_empty"] == 1
@@ -800,21 +889,32 @@ def test_backlog_is_per_room_and_an_estimate_until_the_duration_is_known():
     meter.note_waiting(("east", "s", 1), 1.5)
     meter.note_waiting(("west", "s", 1), 2.5, estimated=True)
     snap = meter.snapshot()
-    assert snap["backlog_audio_s"] == 4.0
+    assert snap["backlog_audio_s"] == 0
+    assert isinstance(snap["backlog_audio_s"], int)
     assert snap["backlog_s"] == 4.0
     assert snap["backlog_estimated"] is True
     assert snap["backlog_by_room"] == {"east": 1.5, "west": 2.5}
+    meter.note_decoded(("east", "s", 1), 1.5)
+    meter.note_decoded(("west", "s", 1), 2.5)
+    decoded = meter.snapshot()
+    assert decoded["backlog_audio_s"] == 4.0
+    assert decoded["backlog_s"] == 4.0
     meter.clear_waiting(("east", "s", 1))
     cleared = meter.snapshot()
-    assert cleared["backlog_audio_s"] == 2.5
+    assert cleared["backlog_s"] == 2.5
     assert cleared["backlog_by_room"] == {"west": 2.5}
     assert cleared["backlog_estimated"] is True
+    assert cleared["backlog_audio_s"] == 4.0
+    meter.clear_decoded(("east", "s", 1))
+    meter.note_asr_active(("west", "s", 1), "west")
     meter.drop_room("west")
     gone = meter.snapshot()
     assert gone["backlog_audio_s"] == 0
     assert gone["backlog_s"] == 0
     assert gone["backlog_estimated"] is False
     assert gone["backlog_by_room"] == {}
+    assert gone["asr_active_s"] == 0
+    assert gone["asr_active_by_room"] == {}
 
 
 def test_percentile_cache_recomputes_only_when_a_sample_arrives(monkeypatch):
@@ -914,7 +1014,7 @@ async def test_backlog_is_counted_from_upload_and_cleared_when_asr_starts():
             task = asyncio.create_task(push(client, token, 1, blob))
             assert await asyncio.to_thread(entered.wait, 2)
             during = (await client.get("/api/metrics", headers=auth(token))).json()
-            assert during["backlog_audio_s"] == pytest.approx(6.0)
+            assert during["backlog_audio_s"] == 0
             assert during["backlog_s"] == pytest.approx(6.0)
             assert during["backlog_estimated"] is True
             assert during["backlog_by_room"].get("class") == pytest.approx(6.0)
@@ -923,9 +1023,10 @@ async def test_backlog_is_counted_from_upload_and_cleared_when_asr_starts():
             assert await asyncio.to_thread(asr.started.wait, 2)
             await asyncio.sleep(0.05)
             started = (await client.get("/api/metrics", headers=auth(token))).json()
-            assert started["backlog_audio_s"] == 0
+            assert started["backlog_audio_s"] == pytest.approx(1.0)
             assert started["backlog_s"] == 0
             assert started["backlog_estimated"] is False
+            assert started["asr_active_s"] > 0
             assert asr.calls == 1
             asr.release.set()
             done = await asyncio.wait_for(task, 3)
@@ -941,8 +1042,19 @@ async def test_backlog_is_counted_from_upload_and_cleared_when_asr_starts():
 
 @pytest.mark.anyio
 async def test_last_process_excludes_asr_slot_wait():
+    """last_process_ms includes the slot wait. asr_ms, RTF, and process_ms do not."""
     asr = HoldAsr()
-    app = app_for(asr, asr_workers=1)
+
+    def slow_decoder(src: Path, work: Path) -> Path:
+        time.sleep(0.06)
+        return copy_decoder(src, work)
+
+    app = create_app(
+        Settings(allow_testclient=True, max_audio_bytes=2_000_000, asr_workers=1),
+        asr=asr,
+        translator=Translator(enabled=True, key=""),
+        decoder=slow_decoder,
+    )
     blob = wave_bytes(1.0)
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
@@ -954,7 +1066,7 @@ async def test_last_process_excludes_asr_slot_wait():
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline:
                 waiting = (await client.get("/api/metrics", headers=auth(token))).json()
-                if asr.calls == 1 and waiting["pending"] == 2 and waiting["backlog_s"] <= 1.01:
+                if asr.calls == 1 and waiting["pending"] == 2 and 0.5 <= waiting["backlog_s"] <= 1.01:
                     break
                 await asyncio.sleep(0.02)
             assert waiting is not None
@@ -964,12 +1076,28 @@ async def test_last_process_excludes_asr_slot_wait():
             done = await asyncio.wait_for(asyncio.gather(first, second), 3)
             assert [item.status_code for item in done] == [200, 200]
             after = (await client.get("/api/metrics", headers=auth(token))).json()
+            samples = list(app.state.pipeline._rtf._window)
+            assert len(samples) == 2
+            waited = max(samples, key=lambda row: row[4])
+            holder = min(samples, key=lambda row: row[4])
+            waited_asr, waited_audio, waited_rtf, waited_decode, waited_wait = waited
+            assert holder[0] >= 400
+            assert waited_wait >= 400
+            assert waited_asr < 200
+            assert waited_asr < waited_wait / 2
+            assert waited_decode >= 40
+            assert waited_decode < waited_wait
+            assert waited_audio == 1000
+            assert waited_rtf == pytest.approx(waited_asr / waited_audio)
+            assert waited_decode + waited_wait + waited_asr <= after["last_process_ms"] + 30
+            assert after["last_process_ms"] + 50 >= waited_wait
+            assert after["process_ms"] < waited_wait
+            assert abs(after["process_ms"] - (waited_decode + waited_asr)) <= 50
             assert after["asr_wait_ms_p95"] >= 400
-            assert after["last_process_ms"] < after["asr_wait_ms_p95"] - 200
             assert after["decode_ms_p95"] is not None
             assert after["rtf"]["session"]["count"] == 2
             assert after["asr_rtf_p95"] == after["rtf"]["window"]["rtf"]["p95"]
-            waits = [row[4] for row in app.state.pipeline._rtf._window]
+            waits = [row[4] for row in samples]
             assert max(waits) >= 400
             assert min(waits) < 200
     finally:
@@ -1064,6 +1192,11 @@ def test_asr_errors_are_counted_apart_from_samples():
     text = Path("scripts/device_check.py").read_text(encoding="utf-8")
     assert '"asr_errors"' in text
     assert "asr_errors={row.get('asr_errors')}" in text
+    assert '"backlog_audio_s": metrics.get("backlog_audio_s")' in text
+    assert "backlog_audio_s={row.get('backlog_audio_s')}" in text
+    assert "asr_active_s={row.get('asr_active_s')}" in text
+    assert 'metrics.get("backlog_s", metrics.get("backlog_audio_s"))' not in text
+    assert 'metrics.get("backlog_audio_s", metrics.get("backlog_s"))' not in text
 
 
 @pytest.mark.anyio
@@ -1204,5 +1337,256 @@ async def test_asr_exception_is_counted_and_not_a_sample():
             assert after["asr_rtf_p95"] is not None
             assert _rows(after)[("class", "s")]["asr_errors"] == 1
             assert _rows(after)[("class", "s")]["count"] == 1
+    finally:
+        await app.state.shutdown()
+
+
+def test_asr_active_age_grows_until_recognition_ends():
+    meter = RtfMeter()
+    idle = meter.snapshot()
+    assert idle["asr_active_s"] == 0
+    assert isinstance(idle["asr_active_s"], int)
+    assert idle["asr_active_by_room"] == {}
+    meter.note_asr_active(("room", "s", 1), "room")
+    first = meter.snapshot()["asr_active_s"]
+    time.sleep(0.05)
+    second = meter.snapshot()
+    assert second["asr_active_s"] > first
+    assert second["asr_active_by_room"]["room"] == pytest.approx(second["asr_active_s"], abs=0.02)
+    meter.clear_asr_active(("room", "s", 1))
+    cleared = meter.snapshot()
+    assert cleared["asr_active_s"] == 0
+    assert isinstance(cleared["asr_active_s"], int)
+    assert cleared["asr_active_by_room"] == {}
+
+
+def test_silence_only_session_replaces_the_previous_room_and_stays_capped():
+    meter = RtfMeter()
+    meter.record_ms(1200, 1000, ("east", "old"))
+    assert meter.snapshot()["rtf"]["session"]["rtf"]["p95"] == pytest.approx(1.2)
+    meter.note_silent_skip(("east", "new"))
+    snap = meter.snapshot()
+    rows = _rows(snap)
+    assert ("east", "old") not in rows
+    assert rows[("east", "new")]["count"] == 0
+    assert rows[("east", "new")]["silent_skipped"] == 1
+    assert rows[("east", "new")]["rtf"]["p95"] is None
+    checker = _rtf_check()
+    assert checker.verdict_p95(snap) is None
+    text, code = checker.render(snap, "靜音換場")
+    assert code == 1
+    assert "沒有 RTF 樣本" in text
+    detail = text.split("本場以來", 1)[1].split("辨識逾時", 1)[0]
+    assert "1.200" not in detail
+    assert "1.200" not in text.split("結果：", 1)[1]
+
+    same = RtfMeter()
+    for index in range(10):
+        same.note_silent_skip(("east", f"s{index}"))
+    only = same.snapshot()["rtf"]["sessions"]
+    assert len(only) == 1
+    assert only[0]["session_id"] == "s9"
+    assert only[0]["count"] == 0
+    assert only[0]["silent_skipped"] == 1
+
+    total = SESSION_ROOM_CAP + 5
+    capped = RtfMeter()
+    for index in range(total):
+        capped.note_silent_skip((f"room{index}", "s"))
+    held = capped.snapshot()["rtf"]["sessions"]
+    assert len(held) == SESSION_ROOM_CAP
+    assert len(capped._silent) <= SESSION_ROOM_CAP
+    assert "room0" not in {row["room_id"] for row in held}
+    assert f"room{total - 1}" in {row["room_id"] for row in held}
+
+    emptied = RtfMeter()
+    for index in range(total):
+        emptied.note_empty((f"empty{index}", "s"))
+    empty_rows = emptied.snapshot()["rtf"]["sessions"]
+    assert len(empty_rows) == SESSION_ROOM_CAP
+    assert len(emptied._empty) <= SESSION_ROOM_CAP
+
+
+class _StuckAsr:
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def transcribe(self, wav: Path, prompt: str) -> AsrResult:
+        del wav, prompt
+        self.calls += 1
+        self.started.set()
+        self.release.wait(5)
+        return AsrResult(ok=True, text="不該被採用")
+
+
+@pytest.mark.anyio
+async def test_stuck_recognition_grows_decoded_backlog_then_timeout_clears_it():
+    asr = _StuckAsr()
+    app = app_for(asr, asr_workers=1, asr_timeout_s=1.0)
+    blob = wave_bytes(20.0)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            task = asyncio.create_task(push(client, token, 1, blob))
+            assert await asyncio.to_thread(asr.started.wait, 2)
+            first = (await client.get("/api/metrics", headers=auth(token))).json()
+            await asyncio.sleep(0.2)
+            second = (await client.get("/api/metrics", headers=auth(token))).json()
+            assert first["backlog_audio_s"] == pytest.approx(20.0, abs=0.001)
+            assert second["backlog_audio_s"] == pytest.approx(20.0, abs=0.001)
+            assert first["backlog_s"] == 0 and second["backlog_s"] == 0
+            assert first["inflight"] == 1 and second["inflight"] == 1
+            assert second["oldest_wait_ms"] > first["oldest_wait_ms"]
+            assert second["asr_active_s"] > first["asr_active_s"]
+            assert first["asr_active_s"] > 0
+            assert second["asr_active_by_room"]["class"] == pytest.approx(second["asr_active_s"], abs=0.05)
+            done = await asyncio.wait_for(task, 3)
+            assert done.status_code == 408, done.text
+            assert done.json()["status"] == "timeout"
+            body = (await client.get("/api/metrics", headers=auth(token))).json()
+            assert body["asr_timeouts"] == 1
+            assert body["asr_errors"] == 0
+            assert body["asr_samples"] == 0
+            assert body["inflight"] == 0
+            assert body["backlog_audio_s"] == 0
+            assert body["backlog_s"] == 0
+            assert body["asr_active_s"] == 0
+            assert isinstance(body["backlog_audio_s"], int)
+            assert isinstance(body["asr_active_s"], int)
+            assert body["last_process_ms"] is None
+            assert body["process_ms"] is None
+            assert body["rtf"]["window"]["count"] == 0
+            assert body["rtf"]["session"]["count"] == 0
+            assert _rows(body)[("class", "s")]["count"] == 0
+            assert _rows(body)[("class", "s")]["asr_timeouts"] == 1
+    finally:
+        asr.release.set()
+        await app.state.shutdown()
+
+
+@pytest.mark.anyio
+async def test_upload_estimate_clears_after_decode_failure_or_cancel():
+    entered = threading.Event()
+    release_decode = threading.Event()
+
+    def failing_decoder(src: Path, work: Path) -> Path:
+        del src, work
+        entered.set()
+        assert release_decode.wait(3), "decode was not released"
+        raise RuntimeError("解碼失敗了")
+
+    app = create_app(
+        Settings(allow_testclient=True, max_audio_bytes=2_000_000, segment_ms=6000),
+        asr=TimedAsr(0),
+        translator=Translator(enabled=True, key=""),
+        decoder=failing_decoder,
+    )
+    blob = wave_bytes(1.0)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            task = asyncio.create_task(push(client, token, 1, blob))
+            assert await asyncio.to_thread(entered.wait, 2)
+            during = (await client.get("/api/metrics", headers=auth(token))).json()
+            assert during["backlog_audio_s"] == 0
+            assert during["backlog_s"] == pytest.approx(6.0)
+            assert during["backlog_estimated"] is True
+            release_decode.set()
+            failed = await asyncio.wait_for(task, 3)
+            assert failed.status_code == 422, failed.text
+            after = (await client.get("/api/metrics", headers=auth(token))).json()
+            assert after["backlog_s"] == 0
+            assert after["backlog_audio_s"] == 0
+            assert after["backlog_estimated"] is False
+            assert isinstance(after["backlog_s"], int)
+    finally:
+        release_decode.set()
+        await app.state.shutdown()
+
+    entered_cancel = threading.Event()
+    release_cancel = threading.Event()
+    asr = TimedAsr(0)
+
+    def held_decoder(src: Path, work: Path) -> Path:
+        entered_cancel.set()
+        assert release_cancel.wait(3), "cancel decode was not released"
+        return copy_decoder(src, work)
+
+    app = create_app(
+        Settings(allow_testclient=True, max_audio_bytes=2_000_000, segment_ms=6000),
+        asr=asr,
+        translator=Translator(enabled=True, key=""),
+        decoder=held_decoder,
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            task = asyncio.create_task(push(client, token, 1, blob))
+            assert await asyncio.to_thread(entered_cancel.wait, 2)
+            during = (await client.get("/api/metrics", headers=auth(token))).json()
+            assert during["backlog_audio_s"] == 0
+            assert during["backlog_s"] == pytest.approx(6.0)
+            assert during["backlog_estimated"] is True
+            cancelled = await client.post(
+                "/api/segment/cancel",
+                json={"room_id": "class", "session_id": "s", "seq": 1},
+                headers=auth(token),
+            )
+            assert cancelled.status_code == 200, cancelled.text
+            release_cancel.set()
+            done = await asyncio.wait_for(task, 3)
+            assert done.status_code == 409, done.text
+            assert done.json()["status"] == "cancelled"
+            after = (await client.get("/api/metrics", headers=auth(token))).json()
+            assert after["backlog_s"] == 0
+            assert after["backlog_audio_s"] == 0
+            assert after["backlog_estimated"] is False
+            assert asr.calls == 0
+    finally:
+        release_cancel.set()
+        await app.state.shutdown()
+
+
+def test_resident_blank_result_is_not_an_error(tmp_path):
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"not-read")
+    asr = ResidentAsr("http://127.0.0.1:9", transport=lambda path, prompt: " \n ", server_bin=None)
+    assert asr.start().ok is True
+    result = asr.transcribe(wav, "提示")
+    assert result.ok is True
+    assert result.blank is True
+    assert result.text == ""
+    assert result.error == ""
+    assert AsrResult(ok=True, text="").blank is False
+
+
+@pytest.mark.anyio
+async def test_resident_blank_counts_as_empty_and_not_a_speed_sample():
+    asr = ResidentAsr("http://127.0.0.1:9", transport=lambda path, prompt: "   ", server_bin=None)
+    assert asr.start().ok is True
+    app = app_for(asr)
+    blob = wave_bytes(1.0)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            resp = await push(client, token, 1, blob)
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["status"] == "silent"
+            body = (await client.get("/api/metrics", headers=auth(token))).json()
+            assert asr.calls == 1
+            assert body["asr_empty"] == 1
+            assert body["asr_errors"] == 0
+            assert body["asr_timeouts"] == 0
+            assert body["silent_skipped"] == 0
+            assert body["asr_samples"] == 0
+            assert body["rtf"]["window"]["count"] == 0
+            assert body["rtf"]["session"]["count"] == 0
+            assert body["asr_rtf_p95"] is None
+            row = _rows(body)[("class", "s")]
+            assert row["count"] == 0
+            assert row["asr_empty"] == 1
+            assert row["asr_errors"] == 0
     finally:
         await app.state.shutdown()

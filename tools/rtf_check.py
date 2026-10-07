@@ -273,8 +273,19 @@ def render(snapshot: dict, source: str, room: str | None = None) -> tuple[str, i
     backlog = snapshot.get("backlog_audio_s")
     if backlog is not None:
         lines.append(f"等待辨識的音訊：{float(backlog):.3f} 秒")
+    queued = snapshot.get("backlog_s")
+    if queued is not None:
+        lines.append(f"尚未開始辨識的音訊：{float(queued):.3f} 秒")
+    active = snapshot.get("asr_active_s")
+    if active is not None:
+        lines.append(f"正在辨識：{float(active):.3f} 秒")
     lines.extend(_scope_lines("近期", window))
-    lines.extend(_scope_lines("本場以來", session))
+    # --room must not print another room's latest session next to this room's verdict.
+    detail = session
+    if room:
+        matched = _session_rows(snapshot, room)
+        detail = matched[0] if matched else {"count": 0, "limit": int(session.get("limit") or 0)}
+    lines.extend(_scope_lines("本場以來", detail))
     timeouts = snapshot.get("asr_timeouts")
     if timeouts is not None:
         lines.append(f"辨識逾時（不計入 RTF）：{int(timeouts)}")
@@ -308,8 +319,23 @@ def render(snapshot: dict, source: str, room: str | None = None) -> tuple[str, i
     return "\n".join(lines), code
 
 
+_PCM_SUBTYPE = bytes.fromhex("0100000000001000800000aa00389b71")
+
+
+def _is_pcm_wave(fmt: bytes) -> bool:
+    """PCM, including WAVE_FORMAT_EXTENSIBLE whose subtype is PCM. Float and ADPCM are not."""
+    if len(fmt) < 16:
+        return False
+    tag = int.from_bytes(fmt[0:2], "little")
+    if tag == 1:
+        return True
+    if tag != 0xFFFE or len(fmt) < 40:
+        return False
+    return fmt[24:40] == _PCM_SUBTYPE
+
+
 def _wave_spec(path: Path) -> tuple[int, int, int, int, int] | None:
-    """PCM span as (offset, size, rate, channels, width). None when this is not WAVE."""
+    """PCM span as (offset, size, rate, channels, width). None when this is not PCM WAVE."""
     try:
         handle = path.open("rb")
     except OSError:
@@ -327,11 +353,14 @@ def _wave_spec(path: Path) -> tuple[int, int, int, int, int] | None:
             chunk_size = int.from_bytes(chunk[4:8], "little")
             pos = handle.tell()
             if chunk_id == b"fmt " and chunk_size >= 16:
-                fmt = handle.read(16)
-                if len(fmt) >= 16:
-                    channels = int.from_bytes(fmt[2:4], "little")
-                    rate = int.from_bytes(fmt[4:8], "little")
-                    width = int.from_bytes(fmt[14:16], "little") // 8
+                fmt = handle.read(min(chunk_size, 128))
+                if not _is_pcm_wave(fmt):
+                    return None
+                channels = int.from_bytes(fmt[2:4], "little")
+                rate = int.from_bytes(fmt[4:8], "little")
+                width = int.from_bytes(fmt[14:16], "little") // 8
+                if width not in (1, 2, 3, 4) or channels <= 0 or rate <= 0:
+                    return None
             elif chunk_id == b"data" and rate > 0 and channels > 0 and width > 0:
                 return pos, chunk_size, rate, channels, width
             step = chunk_size + (chunk_size & 1)
@@ -354,8 +383,19 @@ def _write_pcm_wav(path: Path, pcm: bytes, rate: int, channels: int, width: int)
         handle.writeframes(pcm)
 
 
-def cut_wav_segments(path: Path, segment_s: float, dest: Path) -> list[tuple[Path, float]]:
-    """Split a PCM WAVE into ``segment_s`` pieces. Each row is (path, duration_seconds)."""
+def slice_limit(segment_s: float, minutes: float | None) -> int | None:
+    """How many slices ``minutes`` allows. None means the whole file."""
+    if minutes is None or minutes <= 0 or segment_s <= 0:
+        return None
+    return max(1, int(float(minutes) * 60 / float(segment_s)))
+
+
+def cut_wav_segments(path: Path, segment_s: float, dest: Path, max_slices: int | None = None) -> list[tuple[Path, float]]:
+    """Split a PCM WAVE into ``segment_s`` pieces. Each row is (path, duration_seconds).
+
+    ``max_slices`` stops reading and writing once that many pieces exist, so a
+    multi-hour file with ``--minutes 10`` is not loaded or sliced in full.
+    """
     if segment_s <= 0:
         raise SystemExit("段長必須大於 0。")
     spec = _wave_spec(path)
@@ -367,20 +407,31 @@ def cut_wav_segments(path: Path, segment_s: float, dest: Path) -> list[tuple[Pat
     if frames_per < 1 or frame < 1:
         raise SystemExit("段長太短，切不出樣本。")
     chunk_bytes = frames_per * frame
-    pcm = path.read_bytes()[offset:offset + size]
-    pcm = pcm[: len(pcm) - (len(pcm) % frame)]
+    cap = None if max_slices is None else max(0, int(max_slices))
     dest.mkdir(parents=True, exist_ok=True)
     slices: list[tuple[Path, float]] = []
+    remaining = size - (size % frame)
     index = 0
-    for start in range(0, len(pcm), chunk_bytes):
-        piece = pcm[start:start + chunk_bytes]
-        if len(piece) < frame:
-            break
-        out = dest / f"slice-{index:04d}.wav"
-        _write_pcm_wav(out, piece, rate, channels, width)
-        duration = (len(piece) // frame) / float(rate)
-        slices.append((out, duration))
-        index += 1
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        while remaining >= frame:
+            if cap is not None and index >= cap:
+                break
+            take = min(chunk_bytes, remaining)
+            take -= take % frame
+            piece = handle.read(take)
+            if len(piece) < frame:
+                break
+            if len(piece) < take:
+                piece = piece[: len(piece) - (len(piece) % frame)]
+            if len(piece) < frame:
+                break
+            out = dest / f"slice-{index:04d}.wav"
+            _write_pcm_wav(out, piece, rate, channels, width)
+            duration = (len(piece) // frame) / float(rate)
+            slices.append((out, duration))
+            remaining -= len(piece)
+            index += 1
     if not slices:
         raise SystemExit("音訊太短，沒有切出段落。")
     return slices
@@ -462,6 +513,45 @@ def _pace_serial(transcribe, slices, pace_s: float, sleep, now, prompt: str) -> 
     }
 
 
+class _PaceBook:
+    """Busy workers are counted when one of them takes a slice, not when it is queued.
+
+    Decrementing an idle count at enqueue lets a different worker steal that
+    slice. The reserved worker then stays asleep and uncounted, and the final
+    ``idle < workers`` wait never ends.
+    """
+
+    def __init__(self, workers: int) -> None:
+        self.workers = max(1, int(workers))
+        self.busy = 0
+        self.pending: list[tuple[Path, float, float, bool]] = []
+        self.backlog = 0.0
+        self.max_backlog = 0.0
+
+    def enqueue(self, path: Path, duration: float, release_at: float) -> None:
+        free = self.workers - self.busy - len(self.pending)
+        charged = free <= 0
+        if charged:
+            self.backlog += float(duration)
+            self.max_backlog = max(self.max_backlog, self.backlog)
+        self.pending.append((path, float(duration), float(release_at), charged))
+
+    def dequeue(self) -> tuple[Path, float, float] | None:
+        if not self.pending:
+            return None
+        path, duration, release_at, charged = self.pending.pop(0)
+        self.busy += 1
+        if charged:
+            self.backlog = max(0.0, self.backlog - float(duration))
+        return path, float(duration), float(release_at)
+
+    def finish(self) -> None:
+        self.busy = max(0, self.busy - 1)
+
+    def settled(self) -> bool:
+        return not self.pending and self.busy == 0
+
+
 def _pace_parallel(transcribe, slices, workers: int, pace_s: float, sleep, now, prompt: str) -> dict:
     """Several workers. The producer releases on ``sleep``/``now``; workers run concurrently.
 
@@ -471,12 +561,8 @@ def _pace_parallel(transcribe, slices, workers: int, pace_s: float, sleep, now, 
     """
     import threading
 
-    # path, duration, release_at, charged (True when it added to backlog)
-    pending: list[tuple[Path, float, float, bool]] = []
-    idle = int(workers)
+    book = _PaceBook(workers)
     stop = False
-    backlog = 0.0
-    max_backlog = 0.0
     pairs: list[tuple[float, float, float]] = []
     text_lens: list[int] = []
     errors: list[BaseException] = []
@@ -485,16 +571,17 @@ def _pace_parallel(transcribe, slices, workers: int, pace_s: float, sleep, now, 
     wakeup = threading.Condition()
 
     def worker() -> None:
-        nonlocal backlog, idle, last_done, stop
+        nonlocal last_done, stop
         while True:
             with wakeup:
-                while not pending and not stop:
+                while not book.pending and not stop:
                     wakeup.wait()
-                if not pending:
+                if not book.pending:
                     return
-                path, duration, release_at, charged = pending.pop(0)
-                if charged:
-                    backlog = max(0.0, backlog - duration)
+                taken = book.dequeue()
+            if taken is None:
+                continue
+            path, duration, release_at = taken
             started = time.monotonic()
             try:
                 text = _accept_result(transcribe(path, prompt), len(pairs))
@@ -502,6 +589,7 @@ def _pace_parallel(transcribe, slices, workers: int, pace_s: float, sleep, now, 
                 with wakeup:
                     errors.append(exc if isinstance(exc, SystemExit) else SystemExit(str(exc)[:180]))
                     stop = True
+                    book.finish()
                     wakeup.notify_all()
                 return
             finished = time.monotonic()
@@ -509,9 +597,7 @@ def _pace_parallel(transcribe, slices, workers: int, pace_s: float, sleep, now, 
                 pairs.append((max(0.0, finished - started), duration, max(0.0, started - release_at)))
                 text_lens.append(len(text))
                 last_done = finished if last_done is None else max(last_done, finished)
-                if pending or stop:
-                    continue
-                idle += 1
+                book.finish()
                 wakeup.notify_all()
 
     threads = [threading.Thread(target=worker, name=f"breeze-rtf-{index}", daemon=True) for index in range(workers)]
@@ -527,16 +613,10 @@ def _pace_parallel(transcribe, slices, workers: int, pace_s: float, sleep, now, 
             if errors:
                 break
             last_release = due
-            charged = idle <= 0
-            if charged:
-                backlog += float(duration)
-                max_backlog = max(max_backlog, backlog)
-            else:
-                idle -= 1
-            pending.append((path, float(duration), due, charged))
+            book.enqueue(path, float(duration), due)
             wakeup.notify()
     with wakeup:
-        while not errors and (pending or idle < workers):
+        while not errors and not book.settled():
             wakeup.wait()
         stop = True
         wakeup.notify_all()
@@ -547,7 +627,7 @@ def _pace_parallel(transcribe, slices, workers: int, pace_s: float, sleep, now, 
     final_lag = 0.0 if last_done is None or last_release is None else float(last_done) - float(last_release)
     return {
         "pairs": pairs,
-        "max_backlog_s": max_backlog,
+        "max_backlog_s": book.max_backlog,
         "final_lag_s": final_lag,
         "text_lens": text_lens,
     }
@@ -656,7 +736,11 @@ def run_matrix(audio: Path, *, threads: list[int], workers: list[int], segment_s
         dest = Path(temporary.name) if temporary is not None else Path(tempfile.mkdtemp(prefix="breeze-rtf-matrix-"))
         owned = temporary is None
         try:
-            slices = limit_slices(cut_wav_segments(wav, segment_s, dest / "slices"), segment_s, minutes)
+            slices = limit_slices(
+                cut_wav_segments(wav, segment_s, dest / "slices", max_slices=slice_limit(segment_s, minutes)),
+                segment_s,
+                minutes,
+            )
             rows = []
             for thread_count in threads:
                 for worker_count in workers:
@@ -813,7 +897,16 @@ def main(argv: list[str] | None = None) -> int:
             dest_parent = Path(temporary.name) if temporary is not None else Path(tempfile.mkdtemp(prefix="breeze-rtf-pace-"))
             owned = temporary is None
             try:
-                slices = limit_slices(cut_wav_segments(wav, float(args.segment_s), dest_parent / "slices"), float(args.segment_s), float(args.minutes))
+                slices = limit_slices(
+                    cut_wav_segments(
+                        wav,
+                        float(args.segment_s),
+                        dest_parent / "slices",
+                        max_slices=slice_limit(float(args.segment_s), float(args.minutes)),
+                    ),
+                    float(args.segment_s),
+                    float(args.minutes),
+                )
                 asr = build_asr()
                 report = pace_transcriptions(asr.transcribe, slices, workers=worker_count, pace_s=float(args.segment_s))
             finally:

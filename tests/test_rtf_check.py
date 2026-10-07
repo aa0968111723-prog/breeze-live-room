@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import socket
+import struct
 import threading
 import time
 from pathlib import Path
@@ -190,25 +191,50 @@ def test_metrics_command_against_test_server(capsys):
             thread.join(3)
 
 
+def _detail_since(text: str) -> str:
+    return text.split("本場以來", 1)[1].split("辨識逾時", 1)[0]
+
+
 def test_verdict_uses_the_slowest_room_not_the_latest_update():
     meter = RtfMeter()
-    meter.record(1.2, 1.0, ("west", "slow"))
     meter.record(0.2, 1.0, ("east", "live"))
+    meter.record(1.2, 1.0, ("west", "slow"))
+    meter.record(0.3, 1.0, ("north", "live"))
     snap = meter.snapshot()
-    assert snap["rtf"]["session"]["rtf"]["p95"] == pytest.approx(0.2)
+    assert snap["rtf"]["session"]["rtf"]["p95"] == pytest.approx(0.3)
     assert rtf_check.verdict_p95(snap) == pytest.approx(1.2)
-    text, code = rtf_check.render(snap, "兩房")
+    text, code = rtf_check.render(snap, "三房")
     assert code == 1
     assert "FAIL" in text
     assert "1.200" in text
     assert "最大值" in text
+    assert "尚未開始辨識的音訊：0.000 秒" in text
+    assert "正在辨識：0.000 秒" in text
+    slow_last = RtfMeter()
+    slow_last.record(0.2, 1.0, ("east", "live"))
+    slow_last.record(0.3, 1.0, ("north", "live"))
+    slow_last.record(1.2, 1.0, ("west", "slow"))
+    assert slow_last.snapshot()["rtf"]["session"]["rtf"]["p95"] == pytest.approx(1.2)
+    assert rtf_check.verdict_p95(slow_last.snapshot()) == pytest.approx(1.2)
     east, east_code = rtf_check.render(snap, "東", room="east")
     assert east_code == 0
     assert "PASS" in east
     assert "0.200" in east
-    missing, missing_code = rtf_check.render(snap, "無", room="north")
+    east_detail = _detail_since(east)
+    assert "0.200" in east_detail
+    assert "1.200" not in east_detail
+    assert "0.300" not in east_detail
+    west, west_code = rtf_check.render(snap, "西", room="west")
+    assert west_code == 1
+    west_detail = _detail_since(west)
+    assert "1.200" in west_detail
+    assert "0.200" not in west_detail
+    assert "0.300" not in west_detail
+    missing, missing_code = rtf_check.render(snap, "無", room="missing-room")
     assert missing_code == 1
-    assert "沒有房間 north" in missing
+    assert "沒有房間 missing-room" in missing
+    assert "0.300" not in _detail_since(missing)
+    assert "1.200" not in _detail_since(missing)
 
 
 class _Clock:
@@ -413,3 +439,131 @@ def test_two_workers_start_together_instead_of_waiting_out_each_slice():
     assert starts[1] - starts[0] < 0.15
     assert report["max_backlog_s"] > 0
     assert report["cpu_source"] == "UNKNOWN"
+
+
+def _fmt_wav(fmt_body: bytes, seconds: float = 0.2) -> bytes:
+    rate = 16000
+    frames = int(round(seconds * rate))
+    pcm = b"\x00\x00" * frames
+    payload = fmt_body + (b"\x00" if len(fmt_body) % 2 else b"")
+    chunks = b"fmt " + struct.pack("<I", len(payload)) + payload
+    chunks += b"data" + struct.pack("<I", len(pcm)) + pcm
+    return b"RIFF" + struct.pack("<I", 4 + len(chunks)) + b"WAVE" + chunks
+
+
+def test_non_pcm_wave_is_rejected_and_extensible_pcm_is_kept(tmp_path):
+    pcm_subtype = bytes.fromhex("0100000000001000800000aa00389b71")
+    float_subtype = bytes.fromhex("0300000000001000800000aa00389b71")
+    float_fmt = struct.pack("<HHIIHH", 3, 1, 16000, 32000, 2, 32)
+    adpcm = struct.pack("<HHIIHH", 2, 1, 16000, 8000, 2, 4)
+    extensible_pcm = struct.pack("<HHIIHHHHI", 0xFFFE, 1, 16000, 32000, 2, 16, 22, 16, 0) + pcm_subtype
+    extensible_float = struct.pack("<HHIIHHHHI", 0xFFFE, 1, 16000, 32000, 2, 32, 22, 32, 0) + float_subtype
+    short_ext = struct.pack("<HHIIHH", 0xFFFE, 1, 16000, 32000, 2, 16)
+    for label, body in (
+        ("float", float_fmt),
+        ("adpcm", adpcm),
+        ("ext-float", extensible_float),
+        ("short-ext", short_ext),
+    ):
+        path = tmp_path / f"{label}.wav"
+        path.write_bytes(_fmt_wav(body))
+        dest = tmp_path / label
+        with pytest.raises(SystemExit):
+            rtf_check.cut_wav_segments(path, 6.0, dest)
+        assert list(dest.glob("*.wav")) == []
+        assert rtf_check._wave_spec(path) is None
+    kept = tmp_path / "pcm-ext.wav"
+    kept.write_bytes(_fmt_wav(extensible_pcm))
+    rows = rtf_check.cut_wav_segments(kept, 6.0, tmp_path / "kept")
+    assert len(rows) == 1
+    assert rows[0][0].is_file()
+    assert rtf_check._wave_spec(rows[0][0]) is not None
+    assert rtf_check._is_pcm_wave(extensible_pcm) is True
+    assert rtf_check._is_pcm_wave(float_fmt) is False
+
+
+def test_minutes_stops_before_the_rest_of_a_long_wav_is_read(monkeypatch, tmp_path):
+    src = tmp_path / "talk.wav"
+    src.write_bytes(wave_bytes(30.0))
+    size = src.stat().st_size
+    read_bytes = {"n": 0}
+    real_open = Path.open
+
+    def tracking(self, mode="r", *args, **kwargs):
+        handle = real_open(self, mode, *args, **kwargs)
+        if Path(self) == src and "b" in str(mode):
+            original = handle.read
+
+            def read(n=-1, _original=original):
+                data = _original(n)
+                read_bytes["n"] += len(data)
+                return data
+
+            handle.read = read
+        return handle
+
+    monkeypatch.setattr(Path, "open", tracking)
+    cap = rtf_check.slice_limit(6.0, 0.1)
+    assert cap == 1
+    dest = tmp_path / "out"
+    rows = rtf_check.cut_wav_segments(src, 6.0, dest, max_slices=cap)
+    assert len(rows) == 1
+    assert len(list(dest.glob("*.wav"))) == 1
+    assert read_bytes["n"] < size / 2
+    assert len(rtf_check.limit_slices(rows, 6.0, 0.1)) == 1
+    source = (ROOT / "tools" / "rtf_check.py").read_text(encoding="utf-8")
+    assert source.count("max_slices=slice_limit(") >= 2
+    assert source.count("limit_slices(") >= 2
+
+
+def test_pace_book_charges_only_when_every_worker_is_busy():
+    book = rtf_check._PaceBook(2)
+    book.enqueue(Path("a.wav"), 6.0, 0.0)
+    assert book.backlog == 0
+    assert book.max_backlog == 0
+    assert book.dequeue()[0] == Path("a.wav")
+    assert book.busy == 1
+    book.enqueue(Path("b.wav"), 6.0, 1.0)
+    assert book.backlog == 0
+    book.finish()
+    stolen = book.dequeue()
+    assert stolen[0] == Path("b.wav")
+    assert book.backlog == 0
+    assert book.busy == 1
+    book.finish()
+    assert book.settled()
+
+    full = rtf_check._PaceBook(2)
+    full.enqueue(Path("a.wav"), 6.0, 0.0)
+    full.dequeue()
+    full.enqueue(Path("b.wav"), 6.0, 1.0)
+    full.dequeue()
+    full.enqueue(Path("c.wav"), 6.0, 2.0)
+    assert full.backlog == pytest.approx(6.0)
+    assert full.max_backlog == pytest.approx(6.0)
+    full.dequeue()
+    assert full.backlog == 0
+    assert full.busy == 3
+
+
+def test_parallel_pace_does_not_hang_when_a_worker_steals_the_queue():
+    slices = [(Path(f"slice-{index}.wav"), 6.0) for index in range(12)]
+
+    def transcribe(path, prompt):
+        del path, prompt
+        time.sleep(0.01)
+        return AsrResult(ok=True, text="ok")
+
+    for _ in range(10):
+        holder: dict = {}
+
+        def run() -> None:
+            holder["report"] = rtf_check.pace_transcriptions(
+                transcribe, slices, workers=2, pace_s=0
+            )
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(5)
+        assert not thread.is_alive()
+        assert len(holder["report"]["pairs"]) == 12
