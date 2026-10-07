@@ -1177,18 +1177,16 @@ class Pipeline:
             if seconds is not None and seconds > self.settings.max_audio_seconds:
                 self.fail_received(segment, f"音訊長於 {self.settings.max_audio_seconds} 秒，已拒絕")
                 raise AudioError(413, segment.error)
-            rms = wav_rms(wav)
-            if (
-                self.settings.silence_rms > 0
-                and rms is not None
-                and rms < self.settings.silence_rms
-                and (seconds or 0) >= 0.3
-            ):
-                segment.status = "silent"
-                segment.error = "這段太安靜，沒有送去辨識"
-                segment.zh = ""
-                self._release(segment)
-                return segment
+            # First recognition and a retry both come through _process. The scan is
+            # the whole file; skip it when the gate is off, and never run it on the loop.
+            if self.settings.silence_rms > 0:
+                rms = await asyncio.to_thread(wav_rms, wav)
+                if rms is not None and rms < self.settings.silence_rms and (seconds or 0) >= 0.3:
+                    segment.status = "silent"
+                    segment.error = "這段太安靜，沒有送去辨識"
+                    segment.zh = ""
+                    self._release(segment)
+                    return segment
             segment.status = "transcribing"
             try:
                 async with self._asr_slots:
