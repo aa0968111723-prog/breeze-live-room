@@ -33,6 +33,25 @@ from app.store import CaptionStore
 from app.textutil import export_text, parse_glossary
 from app.translate import Translator
 
+class GlossaryConflict(Exception):
+    """The room glossary changed before this write. `version` is the one still stored."""
+
+    def __init__(self, version: int) -> None:
+        self.version = int(version)
+
+
+def _glossary_conflict(version: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "ok": False,
+            "version": int(version),
+            "accepted": [],
+            "rejected": [{"line": 0, "reason": "術語表版本不符"}],
+        },
+    )
+
+
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = Path(__file__).resolve().parent / "static"
 DEFAULT_MODEL = ROOT / "models" / "ggml-breeze-asr-25-q5_0.bin"
@@ -664,6 +683,15 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             asr = CliAsr(whisper, model, threads=settings.asr_threads, timeout_s=settings.asr_timeout_s, audio_context=settings.asr_audio_context, beam_size=settings.asr_beam_size, best_of=settings.asr_best_of)
     share_override = {"host": settings.share_host}
     tasks: list[asyncio.Task] = []
+    # One lock per room covers version check, the database write, and the memory swap.
+    glossary_locks: dict[str, asyncio.Lock] = {}
+
+    def _glossary_lock(room_id: str) -> asyncio.Lock:
+        lock = glossary_locks.get(room_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            glossary_locks[room_id] = lock
+        return lock
     replay_floors: dict[str, float] = {}
     replay_gate = _ReplayGate(settings.replay_per_minute)
     share_cache: dict[str, object] = {"at": 0.0, "hosts": []}
@@ -1210,23 +1238,45 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             payload["rejected"] = rejected
         return payload
 
-    async def _save_room_glossary(room_id: str, terms: list) -> dict:
-        previous = pipeline.export_room_glossary(room_id)
-        record = pipeline.replace_room_glossary(room_id, terms)
-        if store.enabled:
-            try:
-                await asyncio.to_thread(
-                    store.save_glossary,
-                    room_id,
-                    int(record["version"]),
-                    record["terms"],
-                    float(record["updated_at"]),
-                )
-            except Exception as exc:
-                pipeline.restore_room_glossary(room_id, previous)
-                logging.getLogger("breeze.server").exception("glossary store failed")
-                raise HTTPException(status_code=503, detail="術語表暫時無法儲存") from exc
-        return pipeline.room_glossary_view(room_id)
+    async def _save_room_glossary(room_id: str, terms: list, expected_version: int | None = None) -> dict:
+        """Persist first. Memory changes only after the database accepts this version.
+
+        `expected_version=None` means the legacy client, which does not send if_version:
+        the version read under the lock is the one written against.
+        """
+        async with _glossary_lock(room_id):
+            current = pipeline.room_glossary_version(room_id)
+            if expected_version is not None and int(expected_version) != current:
+                raise GlossaryConflict(current)
+            new_version = current + 1
+            updated_at = time.time()
+            if store.enabled:
+                try:
+                    wrote = await asyncio.to_thread(
+                        store.save_glossary,
+                        room_id,
+                        new_version,
+                        terms,
+                        updated_at,
+                        current,
+                    )
+                except Exception as exc:
+                    logging.getLogger("breeze.server").exception("glossary store failed")
+                    raise HTTPException(status_code=503, detail="術語表暫時無法儲存") from exc
+                if not wrote:
+                    fresh = await asyncio.to_thread(store.get_glossary, room_id)
+                    if fresh is None:
+                        pipeline.clear_room_glossary(room_id)
+                    else:
+                        pipeline.install_room_glossary(fresh)
+                    raise GlossaryConflict(pipeline.room_glossary_version(room_id))
+            pipeline.install_room_glossary({
+                "room_id": room_id,
+                "version": new_version,
+                "terms": terms,
+                "updated_at": updated_at,
+            })
+            return pipeline.room_glossary_view(room_id)
 
     @app.get("/api/rooms/{room_id}/glossary")
     async def get_room_glossary(room_id: str, request: Request) -> dict:
@@ -1259,15 +1309,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         current = pipeline.room_glossary_version(room_id)
         # Stale version wins over a bad term list, so a retry can reload before fixing rows.
         if int(body["if_version"]) != current:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "ok": False,
-                    "version": current,
-                    "accepted": [],
-                    "rejected": [{"line": 0, "reason": "術語表版本不符"}],
-                },
-            )
+            return _glossary_conflict(current)
         if "terms" not in body:
             return JSONResponse(
                 status_code=400,
@@ -1279,7 +1321,10 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 status_code=400,
                 content={"ok": False, "accepted": accepted, "rejected": rejected},
             )
-        view = await _save_room_glossary(room_id, accepted)
+        try:
+            view = await _save_room_glossary(room_id, accepted, expected_version=int(body["if_version"]))
+        except GlossaryConflict as exc:
+            return _glossary_conflict(exc.version)
         return _glossary_body(view, accepted=accepted, rejected=[])
 
     @app.post("/api/glossary")
@@ -1298,8 +1343,25 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         except RoomIdError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         rows = parse_glossary(str(body.get("text") or ""))
-        await _save_room_glossary(room_id, legacy_terms(rows))
-        return {"ok": True, "count": len(rows)}
+        accepted, rejected = validate_terms(legacy_terms(rows))
+        if rejected:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "count": 0, "accepted": accepted, "rejected": rejected},
+            )
+        try:
+            await _save_room_glossary(room_id, accepted)
+        except GlossaryConflict as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "count": 0,
+                    "version": exc.version,
+                    "rejected": [{"line": 0, "reason": "術語表版本不符"}],
+                },
+            )
+        return {"ok": True, "count": len(accepted)}
 
     @app.post("/api/share-host")
     async def set_share_host(request: Request) -> dict:
@@ -1378,19 +1440,22 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             event = bus.delete_caption(room_id, segment_id, parsed_session, parsed_seq)
             _fanout(event)
             return {"ok": True, "deleted": int(removed or 0), "id": segment_id}
-        pipeline.mute_room(room_id)
-        pending = store.enqueue_delete_room(room_id)
-        try:
-            removed = await asyncio.wrap_future(pending)
-        except Exception:
-            pipeline.unmute_room(room_id, abort=True)
-            logging.getLogger("breeze.server").exception("caption store delete failed")
-            return JSONResponse(
-                status_code=503,
-                content={"ok": False, "detail": "字幕儲存暫時無法刪除，畫面上的字幕還留著"},
-            )
-        pipeline.unmute_room(room_id)
-        pipeline.invalidate_room(room_id)
+        # The same lock as a glossary PUT, held until memory is cleared, so a
+        # write that read the old version cannot land after this reset.
+        async with _glossary_lock(room_id):
+            pipeline.mute_room(room_id)
+            pending = store.enqueue_delete_room(room_id)
+            try:
+                removed = await asyncio.wrap_future(pending)
+            except Exception:
+                pipeline.unmute_room(room_id, abort=True)
+                logging.getLogger("breeze.server").exception("caption store delete failed")
+                return JSONResponse(
+                    status_code=503,
+                    content={"ok": False, "detail": "字幕儲存暫時無法刪除，畫面上的字幕還留著"},
+                )
+            pipeline.unmute_room(room_id)
+            pipeline.invalidate_room(room_id)
         event = bus.clear_room(room_id)
         _fanout(event)
         room = book.get(room_id)

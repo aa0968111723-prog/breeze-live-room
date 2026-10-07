@@ -472,20 +472,47 @@ class CaptionStore:
         except (TypeError, ValueError):
             return None
 
-    def save_glossary(self, room_id: str, version: int, terms: list, updated_at: float) -> None:
-        if not self.enabled:
-            return
-        payload = json.dumps(list(terms or []), ensure_ascii=False, separators=(",", ":"))
-        if self._on_writer():
-            self._write_glossary(room_id, int(version), payload, float(updated_at))
-            return
-        self._submit(self._write_glossary, room_id, int(version), payload, float(updated_at)).result()
+    def save_glossary(
+        self,
+        room_id: str,
+        version: int,
+        terms: list,
+        updated_at: float,
+        expected_version: int | None = None,
+    ) -> bool:
+        """Write one glossary version. Return False when `expected_version` is not the stored one.
 
-    def _write_glossary(self, room_id: str, version: int, payload: str, updated_at: float) -> None:
+        Callers that omit `expected_version` mean "the version just before this one".
+        A missing row is version 0, so the first save still inserts. A disabled store
+        writes nothing and returns False; it is not a version conflict.
+        """
+        if not self.enabled:
+            return False
+        payload = json.dumps(list(terms or []), ensure_ascii=False, separators=(",", ":"))
+        expected = int(version) - 1 if expected_version is None else int(expected_version)
+        if self._on_writer():
+            return self._write_glossary(room_id, int(version), payload, float(updated_at), expected)
+        wrote = self._submit(
+            self._write_glossary, room_id, int(version), payload, float(updated_at), expected
+        ).result()
+        return bool(wrote)
+
+    def _write_glossary(
+        self, room_id: str, version: int, payload: str, updated_at: float, expected_version: int
+    ) -> bool:
         conn = self._conn
         if conn is None:
-            return
+            raise RuntimeError("caption store is not open")
         with conn:
+            row = conn.execute(
+                "select version from room_glossary where room_id = ?",
+                (room_id,),
+            ).fetchone()
+            # A deleted row is not version N. Inserting it again would bring the glossary back.
+            current = int(row[0]) if row else 0
+            if current != int(expected_version):
+                return False
+            before = conn.total_changes
             conn.execute(
                 """
                 insert into room_glossary (room_id, version, terms_json, updated_at)
@@ -494,9 +521,12 @@ class CaptionStore:
                     version=excluded.version,
                     terms_json=excluded.terms_json,
                     updated_at=excluded.updated_at
+                where room_glossary.version = ?
                 """,
-                (room_id, int(version), payload, float(updated_at)),
+                (room_id, int(version), payload, float(updated_at), int(expected_version)),
             )
+            # total_changes stays put when the WHERE clause refuses the update.
+            return conn.total_changes > before
 
     def delete_glossary(self, room_id: str) -> None:
         if not self.enabled:
