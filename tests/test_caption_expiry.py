@@ -71,3 +71,57 @@ async def test_expiring_captions_are_announced_only_in_that_room():
             assert old_id not in app.state.bus._tomb.get("class", ())
     finally:
         await stop(app)
+
+
+@pytest.mark.anyio
+async def test_reconnect_still_receives_captions_expired_when_a_floor_is_set():
+    """The session floor keeps old captions out. It must not swallow expiry.
+
+    A listener who missed the live notice otherwise keeps the line: it is
+    already gone from history, and the event is the only copy of the ids.
+    """
+    app = app_for(
+        settings=Settings(allow_testclient=True, translate=False, caption_ttl_s=30),
+        translator=Translator(enabled=False),
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await open_room(client, token, "class")
+            await open_room(client, token, "other")
+            first = await push(client, token, "class", "s", 1, "甲".encode(), t0_ms=0, t1_ms=1000)
+            second = await push(client, token, "class", "s", 2, "乙".encode(), t0_ms=1000, t1_ms=2000)
+            foreign = await push(client, token, "other", "s", 1, "別班".encode(), t0_ms=0, t1_ms=1000)
+            assert first.status_code == 200, first.text
+            assert second.status_code == 200, second.text
+            assert foreign.status_code == 200, foreign.text
+            old_id = first.json()["id"]
+            room = app.state.rooms["class"]
+            room["replay_not_before"] = time.time() - 10
+            async with Socket(app, "/ws/listen?room_id=class", client=("127.0.0.1", 5111)) as live:
+                hello = await live.recv()
+                assert hello["type"] == "hello"
+                cursor = int(hello["latest_cursor"])
+            app.state.bus._caption_at["class"][old_id] = time.time() - 120
+            await app.state.sweep_once()
+            async with Socket(
+                app, f"/ws/listen?room_id=class&cursor={cursor}", client=("127.0.0.1", 5112),
+            ) as again:
+                resumed = await again.recv()
+            notes = [item for item in resumed.get("events") or [] if item.get("type") == "captions_expired"]
+            assert notes, resumed
+            assert notes[0]["room_id"] == "class"
+            assert notes[0]["ids"] == [old_id]
+            assert "別班" not in str(notes)
+            async with Socket(
+                app, f"/ws/listen?room_id=other&cursor=1", client=("127.0.0.1", 5113),
+            ) as other:
+                foreign_hello = await other.recv()
+            foreign_notes = [
+                item for item in (foreign_hello.get("events") or []) + (foreign_hello.get("history") or [])
+                if item.get("type") == "captions_expired"
+            ]
+            assert foreign_notes == []
+            assert old_id not in {item.get("id") for item in app.state.bus.history("class")}
+    finally:
+        await stop(app)

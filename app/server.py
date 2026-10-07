@@ -219,9 +219,145 @@ class Conn:
 
 
 # Audience replay is the newest screenful, never the whole class. Export stays
-# complete. 200 rows is about 100 KB; a fatter JSON body drops the oldest rows.
+# complete. The whole replay hello, not only the backfill field, stays within
+# 100 KiB so 180 replays a minute stay near 18 MB. A fatter body drops the oldest rows.
 AUDIENCE_BACKFILL_ROWS = 200
 AUDIENCE_BACKFILL_BYTES = 100 * 1024
+_REPLAY_CONTROL = frozenset({"caption_deleted", "captions_cleared", "captions_expired"})
+
+
+def _json_bytes(obj) -> int:
+    """Starlette send_json: compact separators, UTF-8, non-ASCII left as-is."""
+    return len(json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _trim_audience_rows(rows: list[dict], budget: int = AUDIENCE_BACKFILL_BYTES) -> list[dict]:
+    """Newest captions whose JSON array fits in `budget`. Each row is encoded once.
+
+    Re-encoding the whole tail after every dropped row was quadratic. A long
+    class then stalled the event loop for the whole replay burst.
+    """
+    if budget < 2 or not rows:
+        return []
+    tail = [for_listener(item) for item in rows[-AUDIENCE_BACKFILL_ROWS:]]
+    sizes = [_json_bytes(item) for item in tail]
+    used = 2
+    count = 0
+    for size in reversed(sizes):
+        cost = size if count == 0 else size + 1
+        if used + cost > budget:
+            break
+        used += cost
+        count += 1
+    if count:
+        return tail[-count:]
+    item = dict(tail[-1])
+    for key in ("zh", "en", "error"):
+        text = item.get(key)
+        if isinstance(text, str) and len(text) > 80:
+            item[key] = text[:80]
+    return [item] if _json_bytes([item]) <= budget else []
+
+
+def _cap_replay_hello(hello: dict, budget: int = AUDIENCE_BACKFILL_BYTES) -> dict:
+    """Keep one replay hello within `budget` wire bytes.
+
+    Newest backfill rows win. Captions already in that backfill are dropped
+    from history and events first, then older captions, and only then the
+    oldest backfill rows. A hello that already fits is left unchanged, so a
+    short class still receives its live window and its backfill.
+    """
+    list_keys = [key for key in ("history", "events", "backfill") if isinstance(hello.get(key), list)]
+    lists = {key: list(hello[key]) for key in list_keys}
+    sizes = {key: [_json_bytes(row) for row in lists[key]] for key in list_keys}
+    covered: dict[str, int] = {}
+    for row in lists.get("backfill", ()):
+        if not isinstance(row, dict):
+            continue
+        ident = row.get("id")
+        if ident:
+            covered[str(ident)] = int(row.get("version") or 1)
+
+    def is_control(row: dict) -> bool:
+        return str(row.get("type") or "") in _REPLAY_CONTROL
+
+    def is_redundant(row: dict) -> bool:
+        if not isinstance(row, dict) or is_control(row):
+            return False
+        ident = row.get("id")
+        if not ident or str(ident) not in covered:
+            return False
+        return int(row.get("version") or 1) <= covered[str(ident)]
+
+    def is_caption(row: dict) -> bool:
+        return isinstance(row, dict) and not is_control(row) and bool(row.get("id"))
+
+    drop_order: list[tuple[str, int]] = []
+
+    def add_class(key: str, predicate) -> None:
+        for index, row in enumerate(lists.get(key) or []):
+            if predicate(row):
+                drop_order.append((key, index))
+
+    for key in ("history", "events"):
+        add_class(key, is_redundant)
+    for key in ("history", "events"):
+        add_class(key, lambda row: is_caption(row) and not is_redundant(row))
+    add_class("backfill", lambda row: True)
+    for key in ("history", "events"):
+        add_class(key, lambda row: isinstance(row, dict) and is_control(row))
+
+    probe = dict(hello)
+    for key in list_keys:
+        probe[key] = []
+    total = _json_bytes(probe)
+    for key in list_keys:
+        row_sizes = sizes[key]
+        if row_sizes:
+            total += sum(row_sizes) + len(row_sizes) - 1
+    kept = {key: [True] * len(lists[key]) for key in list_keys}
+    remaining = {key: len(lists[key]) for key in list_keys}
+    last_backfill = len(lists["backfill"]) - 1 if lists.get("backfill") else -1
+
+    def saving(key: str, index: int) -> int:
+        size = sizes[key][index]
+        if remaining[key] <= 1:
+            return size
+        return size + 1
+
+    if total > budget:
+        for key, index in drop_order:
+            if total <= budget:
+                break
+            if not kept[key][index]:
+                continue
+            if key == "backfill" and index == last_backfill:
+                continue
+            total -= saving(key, index)
+            kept[key][index] = False
+            remaining[key] -= 1
+    for key in list_keys:
+        hello[key] = [row for row, flag in zip(lists[key], kept[key]) if flag]
+    if _json_bytes(hello) <= budget:
+        return hello
+    # The newest row alone can still be fatter than the hello once the envelope
+    # is counted. Shorten its text once; if that is not enough, send no row.
+    backfill = [row for row in hello.get("backfill") or [] if isinstance(row, dict)]
+    if backfill:
+        item = dict(backfill[-1])
+        for key in ("zh", "en", "error"):
+            text = item.get(key)
+            if isinstance(text, str) and len(text) > 80:
+                item[key] = text[:80]
+        hello["backfill"] = [item]
+        if _json_bytes(hello) <= budget:
+            return hello
+        hello["backfill"] = []
+    if _json_bytes(hello) <= budget:
+        return hello
+    hello["history"] = []
+    hello["events"] = []
+    return hello
 
 
 # Replay buckets are keyed by the TCP peer, not by whatever id the client sends.
@@ -610,7 +746,9 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         kept: list[dict] = []
         for row in rows:
             kind = str(row.get("type") or "")
-            if kind in {"captions_cleared", "caption_deleted", "ping", "pong"}:
+            # Expiry has no caption timestamp. Dropping it here hid the notice
+            # from a listener who reconnected after the line had already aged out.
+            if kind in {"captions_cleared", "caption_deleted", "captions_expired", "ping", "pong"}:
                 kept.append(row)
                 continue
             stamp = stamps.get(str(row.get("id") or ""))
@@ -626,22 +764,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
 
         The wire encoding matches Starlette's send_json (compact separators).
         """
-        visible = _audience_captions(rows)
-        tail = visible[-AUDIENCE_BACKFILL_ROWS:]
-
-        def encoded(items: list[dict]) -> int:
-            return len(json.dumps(items, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-
-        while len(tail) > 1 and encoded(tail) > AUDIENCE_BACKFILL_BYTES:
-            del tail[0]
-        if len(tail) == 1 and encoded(tail) > AUDIENCE_BACKFILL_BYTES:
-            item = dict(tail[0])
-            for key in ("zh", "en", "error"):
-                text = item.get(key)
-                if isinstance(text, str) and len(text) > 80:
-                    item[key] = text[:80]
-            tail = [item] if encoded([item]) <= AUDIENCE_BACKFILL_BYTES else []
-        return tail
+        return _trim_audience_rows(rows, AUDIENCE_BACKFILL_BYTES)
 
     def _fanout(snap: dict) -> None:
         room = book.get(str(snap.get("room_id") or ""))
@@ -1364,21 +1487,24 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         }
         wants_backfill = int(replay or 0) == 1 or (cursor > 0 and bool(resumed.get("gap")))
         if wants_backfill:
-            if int(replay or 0) == 1:
-                source = bus.caption_state(room_id)
-            else:
-                source = list(resumed.get("backfill") or [])
-            visible = _captions_since_open(room_id, source)
             # TCP peer only. X-Forwarded-For, X-Real-IP, and Forwarded are not an address.
+            # Decide before copying caption state so a refused replay does not pay for it.
             ip = ws.client.host if ws.client is not None else ""
             allowed, retry_ms = replay_gate.allow(ip, _audience_client_id(cid))
-            if allowed:
-                hello["backfill"] = _audience_backfill(visible)
-            else:
+            if not allowed:
                 # Say so. An omitted backfill used to look like an empty class.
                 hello["backfill_deferred"] = True
                 hello["retry_after"] = retry_ms
                 hello["retry_after_ms"] = retry_ms
+            else:
+                if int(replay or 0) == 1:
+                    source = bus.caption_state(room_id)
+                else:
+                    source = list(resumed.get("backfill") or [])
+                visible = _captions_since_open(room_id, source)
+                hello["backfill"] = _audience_backfill(visible)
+            # history and events used to repeat the backfill. One hello stays within 100 KiB.
+            _cap_replay_hello(hello)
         try:
             await ws.send_json(hello)
         except Exception:

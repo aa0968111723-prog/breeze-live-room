@@ -16,7 +16,8 @@ from pathlib import Path
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.server import _ReplayGate
+from app.dispatch import for_listener
+from app.server import _ReplayGate, _cap_replay_hello, _json_bytes, _trim_audience_rows
 from app.settings import Settings
 from app.translate import Translator
 from tests.test_round2 import Socket, app_for, auth, open_room, push, stop, token_of
@@ -429,6 +430,285 @@ def test_replay_per_minute_setting_defaults_and_rejects_zero():
         Settings(replay_per_minute=0)
     with pytest.raises(ValueError, match="BREEZE_REPLAY_CLIENT_PER_MINUTE"):
         Settings(replay_client_per_minute=0)
+
+
+def _long_caption(seq: int, zh: str, en: str) -> dict:
+    return {
+        "type": "caption",
+        "id": f"class:s:{seq}",
+        "room_id": "class",
+        "session_id": "s",
+        "session_ord": 1,
+        "seq": seq,
+        "version": 1,
+        "zh": zh,
+        "en": en,
+        "status": "ready",
+        "translate_status": "ok",
+        "error": "",
+        "t0_ms": (seq - 1) * 1000,
+        "t1_ms": seq * 1000,
+    }
+
+
+def _reference_trim(rows: list[dict], budget: int) -> list[dict]:
+    """The old quadratic trim, kept so a linear rewrite cannot change who is kept."""
+    visible = [for_listener(item) for item in rows][-200:]
+
+    def encoded(items: list[dict]) -> int:
+        return _json_bytes(items)
+
+    while len(visible) > 1 and encoded(visible) > budget:
+        del visible[0]
+    if len(visible) == 1 and encoded(visible) > budget:
+        item = dict(visible[0])
+        for key in ("zh", "en", "error"):
+            text = item.get(key)
+            if isinstance(text, str) and len(text) > 80:
+                item[key] = text[:80]
+        visible = [item] if encoded([item]) <= budget else []
+    return visible
+
+
+def test_backfill_trim_matches_the_old_rows_and_stays_linear(monkeypatch):
+    """Dropping oldest rows must encode each caption once, not the whole tail again.
+
+    The quadratic loop re-encoded about n²/2 caption bytes. A byte budget a few
+    times the input catches that; a wall-clock cap catches a slow rewrite that
+    still walks the tail one row at a time.
+    """
+    small = [_long_caption(seq, f"第{seq}句", "ok") for seq in range(1, 31)]
+    assert _trim_audience_rows(small, 100 * 1024) == _reference_trim(small, 100 * 1024)
+    huge = _long_caption(2, "字" * 100_000, "e" * 100_000)
+    huge["zh_raw"] = "密" * 1000
+    trimmed = _trim_audience_rows([_long_caption(1, "舊", "old"), huge], 100 * 1024)
+    assert [item["seq"] for item in trimmed] == [2]
+    assert len(trimmed[0]["zh"]) == 80
+    assert "zh_raw" not in trimmed[0]
+    assert trimmed == _reference_trim([_long_caption(1, "舊", "old"), huge], 100 * 1024)
+    assert _trim_audience_rows([_long_caption(1, "字" * 500, "e" * 500)], 10) == []
+
+    zh = "字" * 1500
+    en = "e" * 1500
+    rows = [_long_caption(seq, zh, en) for seq in range(1, 201)]
+    input_bytes = sum(_json_bytes(for_listener(row)) for row in rows)
+    real = json.dumps
+    dumped = {"bytes": 0}
+
+    def counting(obj, *args, **kwargs):
+        text = real(obj, *args, **kwargs)
+        dumped["bytes"] += len(text.encode("utf-8"))
+        return text
+
+    monkeypatch.setattr("app.server.json.dumps", counting)
+    started = time.perf_counter()
+    kept = _trim_audience_rows(rows, 100 * 1024)
+    elapsed = time.perf_counter() - started
+    assert kept[-1]["seq"] == 200
+    assert kept[0]["seq"] != 1
+    assert _json_bytes(kept) <= 100 * 1024
+    # One encode per row, plus the single-row check that does not run here.
+    # The quadratic tail rewrite moves tens of times this many bytes.
+    assert dumped["bytes"] < input_bytes * 4
+    assert elapsed < 0.2, elapsed
+
+
+def test_replay_hello_keeps_newest_captions_inside_100kib():
+    """history used to repeat the backfill. The whole hello is the budget."""
+    zh = "測" * 92
+    en = "e" * 296
+    rows = [_long_caption(seq, zh, en) for seq in range(1, 221)]
+    backfill = _trim_audience_rows(rows, 100 * 1024)
+    history = [for_listener(row) for row in rows[-200:]]
+    hello = {
+        "type": "hello",
+        "history": history,
+        "events": list(history[-50:]),
+        "gap": False,
+        "latest_cursor": 220,
+        "oldest_cursor": 21,
+        "room_id": "class",
+        "epoch": 7,
+        "host_live": False,
+        "backfill": backfill,
+    }
+    before = _json_bytes(hello)
+    assert before > 100 * 1024
+    _cap_replay_hello(hello)
+    wire = _json_bytes(hello)
+    assert wire <= 100 * 1024
+    assert hello["backfill"][-1]["id"] == "class:s:220"
+    assert hello["backfill"][-1]["zh"] == zh
+    assert all(item.get("id") != "class:s:1" for item in hello["backfill"])
+    assert all(item.get("id") != "class:s:1" for item in hello["history"])
+    assert all(item.get("id") != "class:s:1" for item in hello["events"])
+    short = {
+        "type": "hello",
+        "history": [_long_caption(1, "甲", "a")],
+        "events": [_long_caption(1, "甲", "a")],
+        "gap": True,
+        "latest_cursor": 1,
+        "oldest_cursor": 1,
+        "room_id": "class",
+        "epoch": 1,
+        "host_live": True,
+        "backfill": [_long_caption(1, "甲", "a"), _long_caption(2, "乙", "b")],
+    }
+    snapshot = json.loads(json.dumps(short))
+    _cap_replay_hello(short)
+    assert short == snapshot
+
+
+def _hello_wire(messages) -> int:
+    for msg in messages:
+        if msg.get("type") != "websocket.send":
+            continue
+        text = msg.get("text") or ""
+        if text.startswith('{"type":"hello"'):
+            return len(text.encode("utf-8"))
+    raise AssertionError(messages)
+
+
+@pytest.mark.anyio
+async def test_default_cap_rejects_181st_cid_and_bounds_the_replay_hello():
+    """Default settings, one TCP address, 181 well-formed client ids.
+
+    The 181st replay is deferred. X-Forwarded-For does not open a new bucket
+    or move the cost onto another address. Every replay hello, including the
+    deferred one, is at most 100 KiB, and the newest caption is the one kept.
+    """
+    cap = Settings().replay_per_minute
+    client_cap = Settings().replay_client_per_minute
+    assert cap == 180
+    assert client_cap == 8
+    zh = "測" * 92
+    en = "e" * 296
+    app = app_for(
+        settings=Settings(allow_testclient=True, translate=False, max_listeners=40),
+        translator=Translator(enabled=False),
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await open_room(client, token, "class")
+            await open_room(client, token, "other")
+            bus = app.state.bus
+            for seq in range(1, 221):
+                bus.publish(_long_caption(seq, zh, en))
+            bus.publish({
+                "type": "caption",
+                "id": "other:s:1",
+                "room_id": "other",
+                "session_id": "s",
+                "session_ord": 1,
+                "seq": 1,
+                "version": 1,
+                "zh": "別班",
+                "en": "other",
+                "status": "ready",
+            })
+            ip = "203.0.113.181"
+            full = 0
+            wires = []
+            for index in range(cap + 1):
+                headers = _spoofed(index) if index in {0, cap} else None
+                messages = await drive(
+                    app,
+                    f"/ws/listen?room_id=class&cursor=0&replay=1&cid=phone-{index}",
+                    client=(ip, 9000 + index),
+                    headers=headers,
+                )
+                hello = _hello(messages)
+                wire = _hello_wire(messages)
+                wires.append(wire)
+                assert wire <= 100 * 1024
+                blob = json.dumps(hello, ensure_ascii=False)
+                assert "別班" not in blob
+                if index < cap:
+                    assert _full_replay(hello)
+                    assert hello["backfill"][-1]["id"] == "class:s:220"
+                    assert hello["backfill"][-1]["zh"] == zh
+                    assert all(item.get("id") != "class:s:1" for item in hello["backfill"])
+                    full += 1
+                else:
+                    assert hello.get("backfill_deferred") is True
+                    assert "backfill" not in hello
+            assert full == cap
+            assert max(wires) <= 100 * 1024
+            # 180 * 100 KiB = 18.4 MB. The measured hellos have to land under that.
+            assert cap * max(wires) <= cap * 100 * 1024
+            still = _hello(await drive(
+                app,
+                "/ws/listen?room_id=class&cursor=0&replay=1&cid=phone-extra",
+                client=(ip, 9999),
+                headers=_spoofed(7),
+            ))
+            assert still.get("backfill_deferred") is True
+            other = _hello(await drive(
+                app,
+                "/ws/listen?room_id=class&cursor=0&replay=1&cid=phone-0",
+                client=("198.51.100.181", 9100),
+                headers=_headers() + [
+                    (b"x-forwarded-for", ip.encode()),
+                    (b"x-real-ip", ip.encode()),
+                    (b"forwarded", f"for={ip}".encode()),
+                ],
+            ))
+            assert _full_replay(other)
+            assert other["backfill"][-1]["zh"] == zh
+
+            anon_ip = "198.51.100.182"
+            anon_full = 0
+            for index in range(client_cap + 1):
+                hello = _hello(await drive(
+                    app,
+                    "/ws/listen?room_id=class&cursor=0&replay=1",
+                    client=(anon_ip, 9200 + index),
+                ))
+                if index < client_cap:
+                    assert _full_replay(hello)
+                    anon_full += 1
+                else:
+                    assert hello.get("backfill_deferred") is True
+            assert anon_full == client_cap
+            for query in ("&cid=", "&cid=bad.cid", "&cid=" + ("a" * 80), "&cid=anon"):
+                hello = _hello(await drive(
+                    app,
+                    "/ws/listen?room_id=class&cursor=0&replay=1" + query,
+                    client=(anon_ip, 9300),
+                ))
+                assert hello.get("backfill_deferred") is True
+                assert "backfill" not in hello
+            fresh = _hello(await drive(
+                app,
+                "/ws/listen?room_id=class&cursor=0&replay=1&cid=real-phone",
+                client=(anon_ip, 9400),
+            ))
+            assert _full_replay(fresh)
+            assert fresh["backfill"][-1]["zh"] == zh
+    finally:
+        await stop(app)
+
+
+def test_run_does_not_trust_proxy_headers(monkeypatch):
+    """Loopback X-Forwarded-For must not rewrite ws.client. The cap is the TCP peer."""
+    import app.run as run_mod
+
+    monkeypatch.setattr(run_mod.os, "chdir", lambda path: None)
+    monkeypatch.setattr(run_mod, "inspect", lambda settings: {"ok": True, "checks": []})
+    monkeypatch.setattr(run_mod.Settings, "from_env", classmethod(lambda cls: Settings()))
+    monkeypatch.setenv("BREEZE_OPEN_BROWSER", "0")
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(run_mod.uvicorn, "run", fake_run)
+    run_mod.main()
+    assert captured["args"] == ("app.server:app",)
+    assert captured["kwargs"]["host"] == "0.0.0.0"
+    assert captured["kwargs"]["proxy_headers"] is False
 
 
 def _wire_bytes(rows) -> int:
