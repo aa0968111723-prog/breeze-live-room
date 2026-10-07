@@ -129,7 +129,7 @@ def _pcm_rms(pcm: bytes) -> float:
     count = len(samples)
     if count == 0:
         return 0.0
-    # Stride long windows. This runs on every segment, even when the gate is off.
+    # Stride long windows. The pipeline does not call this when the silence gate is off.
     step = 8 if count > 4000 else 1
     total = 0
     seen = 0
