@@ -1,0 +1,50 @@
+# 自擬範例資料，非真實逐字稿，參考譯文待使用者確認
+zh,aliases,en,lock,category,note
+領袖禪學社,領袖柴學社|領袖蟬學社|領袖纏學社,Leadership Zen Club,true,org,社團正式英文名待使用者／社團確認
+禪學社,柴學社|蟬學社|纏學社|柴学社|禪學設,Zen Club,true,org,ZB-010 實測 ASR 把「禪學社」聽成「柴学社」
+淡江大學,淡江大学,Tamkang University,true,place,校名官方英文
+淡水,,Tamsui,true,place,地名；官方拼法 Tamsui
+社課,設課|射課,club session,true,event,「社科」不列為別名（可能是「社會科學」）
+茶會,查會|茶匯,tea gathering,true,event,
+期初演講,期出演講|奇出演講,opening lecture,true,event,也可譯 semester opening talk，待確認
+社長,設長,club president,true,role,
+幹部,,club officers,false,role,依語境可能是 officer/staff，只提示不鎖
+學長姐,學長姊,senior members,false,role,口語；只提示不鎖
+法師,,Dharma Master,true,role,「法式」是常用詞，不可列為別名；稱呼個別法師時也可用 Venerable，待確認
+師父,,Shifu,false,role,「師傅」是常用詞，不可列為別名；譯法待確認（Shifu／Master）
+開示,開釋,Dharma talk,true,practice,「開始」是極常用詞，絕不可列為別名
+禪修,纏修|蟬修,Zen practice,true,practice,ZB-026：同場出現 Zen practice／meditation 不一致
+禪定,纏定|蟬定,meditative concentration,true,practice,ZB-026 建議 meditative concentration (dhyāna)；字幕用短版
+打坐,打做|大坐,sitting meditation,true,practice,
+靜坐,靜做|淨坐,sitting meditation,true,practice,與打坐同譯；若要區分可改 quiet sitting，待確認
+行禪,行纏|行蟬,walking meditation,true,practice,
+禪七,纏七|蟬七,seven-day Zen retreat,true,event,
+禪堂,纏堂|蟬堂,meditation hall,true,place,
+蒲團,葡團|菩團,meditation cushion,true,object,
+數息,數吸,counting the breath,true,practice,
+調身,,adjusting the body,true,practice,
+調息,,regulating the breath,true,practice,
+調心,,calming the mind,true,practice,
+覺察,覺查,awareness,true,practice,
+正念,,mindfulness,true,practice,
+開悟,,enlightenment,true,doctrine,
+無常,,impermanence,true,doctrine,
+空性,,emptiness,true,doctrine,
+因緣,因原,causes and conditions,true,doctrine,
+般若,波若,prajna,true,doctrine,沿用現有 host.html 範例（般若=prajna）；是否加注 wisdom 待確認
+菩提心,菩堤心,bodhicitta,true,doctrine,
+慈悲,,compassion,true,doctrine,
+公案,,koan,true,practice,「工案」等候選別名太容易誤換，先不列
+話頭,畫頭,huatou,true,practice,
+默照,莫照|默罩,silent illumination,true,practice,
+止觀,,calming and insight,true,practice,
+智慧,,wisdom,false,doctrine,常用詞，只提示不鎖
+煩惱,,afflictions,false,doctrine,職涯情境多半是 worries；只提示不鎖
+放下,,letting go,false,doctrine,
+當下,,the present moment,false,doctrine,
+職涯,職崖,career,false,career,
+職涯規劃,職崖規劃,career planning,true,career,
+抗壓,,stress resilience,false,career,口語多變（handle pressure 等），只提示不鎖
+抗壓性,,resilience under pressure,false,career,
+領導力,,leadership,false,career,
+法鼓山,法古山,Dharma Drum Mountain,true,org,公開機構名；是否與本社相關、要不要放進預設範本待使用者確認
