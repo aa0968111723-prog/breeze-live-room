@@ -22,6 +22,7 @@ SUITES = (
     "room_client_state.test.mjs",
     "room_view.test.mjs",
     "room_prefs.test.mjs",
+    "room_dom.test.mjs",
     "host_caption.test.mjs",
 )
 

@@ -23,6 +23,17 @@ export function sanitizePrefs(raw) {
   return { mode, size, theme, wake, project: mode === "project" };
 }
 
+// Reading window.localStorage itself throws when storage is blocked.
+// Callers pass a getter so the throw happens inside this try.
+export function safeStorage(read) {
+  try {
+    const value = typeof read === "function" ? read() : read;
+    return value == null ? null : value;
+  } catch {
+    return null;
+  }
+}
+
 export function readPrefs(storage) {
   if (!storage || typeof storage.getItem !== "function") return sanitizePrefs(null);
   try {

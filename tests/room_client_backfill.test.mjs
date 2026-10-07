@@ -117,4 +117,84 @@ assert.equal(shown.some((row) => row.endsWith(":")), false);
 assert.match(shown.at(-1), /甲,乙/);
 conn.stop();
 await conn.done;
+
+async function testSameEpochGapDeferredRetriesUntilBackfill() {
+  const sockets = [];
+  const resets = [];
+  const view = createCaptionView();
+  view.apply({ id: "class:s:9", session_id: "s", seq: 9, version: 1, zh: "還在" });
+  const conn = connectRoom({
+    room: "class",
+    url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
+    openSocket(address) {
+      const ws = fakeSocket(address);
+      sockets.push(ws);
+      return ws;
+    },
+    sleep: () => Promise.resolve(),
+    random: () => 0,
+    onState: () => {},
+    onEvent(item) { view.apply(item); },
+    onBackfill(rows) { view.replace(rows); },
+    onReset() {
+      resets.push("reset");
+      view.reset();
+    },
+  });
+  await tick();
+  sockets[0].onopen();
+  sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "hello",
+      epoch: 3,
+      latest_cursor: 10,
+      history: [{ id: "class:s:9", session_id: "s", seq: 9, version: 1, cursor: 10, zh: "還在" }],
+    }),
+  });
+  sockets[0].onclose();
+  await tick();
+  assert.equal(conn.cursor, 10);
+  const stalled = sockets.at(-1);
+  stalled.onopen();
+  stalled.onmessage({
+    data: JSON.stringify({
+      type: "hello",
+      epoch: 3,
+      latest_cursor: 400,
+      gap: true,
+      backfill_deferred: true,
+      retry_after_ms: 1000,
+      history: [],
+      events: [],
+    }),
+  });
+  await tick();
+  assert.deepEqual(resets, []);
+  assert.equal(view.items.get("class:s:9").zh, "還在");
+  assert.equal(conn.cursor, 10);
+  const replay = sockets.at(-1);
+  assert.notEqual(replay, stalled);
+  assert.match(replay.address, /replay=1/);
+  assert.match(replay.address, /cursor=0/);
+  replay.onopen();
+  const tail = [];
+  for (let seq = 1; seq <= 200; seq += 1) {
+    tail.push({ id: "class:s:" + seq, session_id: "s", seq, version: 1, cursor: seq, zh: "L" + seq });
+  }
+  replay.onmessage({
+    data: JSON.stringify({
+      type: "hello",
+      epoch: 3,
+      latest_cursor: 400,
+      backfill: tail,
+    }),
+  });
+  assert.ok(resets.length >= 1);
+  assert.equal(view.items.size, 80);
+  assert.equal(view.items.has("class:s:1"), false);
+  assert.equal(view.items.get("class:s:200").zh, "L200");
+  conn.stop();
+  await conn.done;
+}
+await testSameEpochGapDeferredRetriesUntilBackfill();
 console.log("room client backfill ok");

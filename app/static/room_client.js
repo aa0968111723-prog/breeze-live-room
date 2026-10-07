@@ -127,8 +127,10 @@ export function reconnectDelayMs(failures, unit, hidden) {
 }
 
 // Room not open yet: 5s ±30% for the first two minutes, then 15s ±30%. Never stops.
-export function waitingDelayMs(elapsedMs, unit) {
+// A hidden tab waits 30–60s so a locked phone is not opening a socket every few seconds.
+export function waitingDelayMs(elapsedMs, unit, hidden) {
   const span = unitSpan(unit);
+  if (hidden) return 30000 + Math.round(30000 * span);
   const elapsed = Number(elapsedMs) || 0;
   const base = elapsed < 120000 ? 5000 : 15000;
   return Math.round(base * (0.7 + 0.6 * span));
@@ -394,12 +396,22 @@ export function connectRoom({
     }
   }
 
+  function abandonSocket(ws) {
+    // A dead TCP connection may not fire onclose for a long time. Unbind and
+    // let this loop open the next socket itself.
+    if (!ws) return;
+    detach(ws);
+    if (socket === ws) socket = null;
+    try { ws.close(); } catch { /* already dead */ }
+    const finish = cancelWait;
+    if (finish) finish();
+  }
+
   function checkStale() {
     if (stopped || !socket || !lastMessageAt || pageHidden()) return;
     if (clock() - lastMessageAt <= staleAfter) return;
     emit("reconnecting", { text: "連線不穩，重新連線中", attempt: Math.max(1, failures + 1) });
-    const ws = socket;
-    try { ws.close(); } catch { /* onclose reconnects */ }
+    abandonSocket(socket);
   }
 
   function armWatch() {
@@ -448,11 +460,11 @@ export function connectRoom({
       skipAccounting = false;
       return;
     }
-    if (closeCode === 4401) {
+    if (closeCode === 4401 || closeReason === "link_invalid") {
       await holdFor("link_invalid");
       return;
     }
-    if (closeCode === 1008) {
+    if (closeCode === 1008 || closeReason === "rejected") {
       await holdFor("rejected");
       return;
     }
@@ -462,7 +474,7 @@ export function connectRoom({
     }
     if (closeReason === "unknown_or_ended" || closeReason === "not_open") {
       if (!waitingSince) waitingSince = clock();
-      const delay = waitingDelayMs(clock() - waitingSince, roll());
+      const delay = waitingDelayMs(clock() - waitingSince, roll(), pageHidden());
       emit("waiting_room", { nextRetryAt: clock() + delay });
       await waitMs(delay);
       return;
@@ -571,7 +583,9 @@ export function connectRoom({
               const cursorBehind = Number.isFinite(latest) && latest < cursor;
               const epochChanged = epoch != null && seenEpoch != null && epoch !== seenEpoch;
               const replaying = replaceOnBackfill;
-              const needsReplace = cursorBehind || epochChanged || replaying;
+              // A same-epoch gap can still be deferred. Without this, the cursor
+              // jumps to latest and that hole is never replayed.
+              const needsReplace = cursorBehind || epochChanged || replaying || data.backfill_deferred === true;
               if (onHost && Object.prototype.hasOwnProperty.call(data, "host_live")) {
                 onHost({ type: "room", room_id: data.room_id, live: !!data.host_live });
               }
@@ -668,8 +682,7 @@ export function connectRoom({
       }
       failures = 0;
       if (socket && lastMessageAt && clock() - lastMessageAt > staleAfter) {
-        const ws = socket;
-        try { ws.close(); } catch { /* onclose reconnects */ }
+        abandonSocket(socket);
         return;
       }
       // Backoff uses the timer. A live socket that is still receiving stays up.

@@ -220,13 +220,19 @@ class Conn:
         self.slot.last_pong = time.monotonic()
 
 
+# Audience replay is the newest screenful, never the whole class. Export stays
+# complete. 200 rows is about 100 KB; a fatter JSON body drops the oldest rows.
+AUDIENCE_BACKFILL_ROWS = 200
+AUDIENCE_BACKFILL_BYTES = 100 * 1024
+
+
 class _ReplayGate:
-    """Caps full replay/backfill dumps. Live captions are not counted.
+    """Caps replay/backfill hellos. Live captions are not counted.
 
     One bucket is the public IP (a whole classroom behind NAT). The other is
     that IP plus the audience client id, so one phone cannot use the room's ceiling.
-    A refused hello is explicit: the caller sends backfill_deferred instead of
-    an empty screen.
+    A missing or forged client id shares one bucket per address. A refused hello
+    is explicit: the caller sends backfill_deferred instead of an empty screen.
     """
 
     def __init__(self, ip_limit: int, client_limit: int | None = None, window_s: float = 60.0):
@@ -794,6 +800,28 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
 
     def _audience_captions(rows: list[dict]) -> list[dict]:
         return [for_listener(item) for item in rows]
+
+    def _audience_backfill(rows: list[dict]) -> list[dict]:
+        """Last rows a listener may see, and never a larger JSON body than the budget.
+
+        The wire encoding matches Starlette's send_json (compact separators).
+        """
+        visible = _audience_captions(rows)
+        tail = visible[-AUDIENCE_BACKFILL_ROWS:]
+
+        def encoded(items: list[dict]) -> int:
+            return len(json.dumps(items, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+        while len(tail) > 1 and encoded(tail) > AUDIENCE_BACKFILL_BYTES:
+            del tail[0]
+        if len(tail) == 1 and encoded(tail) > AUDIENCE_BACKFILL_BYTES:
+            item = dict(tail[0])
+            for key in ("zh", "en", "error"):
+                text = item.get(key)
+                if isinstance(text, str) and len(text) > 80:
+                    item[key] = text[:80]
+            tail = [item] if encoded([item]) <= AUDIENCE_BACKFILL_BYTES else []
+        return tail
 
     def _fanout(snap: dict) -> None:
         room = book.get(str(snap.get("room_id") or ""))
@@ -1441,33 +1469,51 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             if form is not None:
                 await form.close()
 
-    def _audience_client_id(ws: WebSocket, cid: str) -> str:
+    def _audience_client_id(cid: str) -> str:
         text = (cid or "").strip()
         if text and len(text) <= 64 and all(ch.isascii() and (ch.isalnum() or ch in "_-") for ch in text):
             return text
-        port = ws.client.port if ws.client is not None else 0
-        return f"conn-{port}-{id(ws)}"
+        # Omitted and forged ids used to get a fresh bucket per socket, which
+        # multiplied the per-client quota up to the per-address ceiling.
+        return "anon"
+
+    async def _refuse_listen(ws: WebSocket, code: int, reason: str, room_id: str = "") -> None:
+        """Accept, name the refusal, then close.
+
+        A close before accept is an HTTP 403. Browsers report that as 1006, so
+        the page cannot show 「連結已失效」 or 「無法開啟」. The message carries
+        no hello and no caption.
+        """
+        await ws.accept()
+        note: dict = {"type": "room_unavailable", "reason": reason}
+        if room_id:
+            note["room_id"] = room_id
+        try:
+            await ws.send_json(note)
+        except Exception:
+            pass
+        await ws.close(code=code)
 
     @app.websocket("/ws/listen")
     async def listen(ws: WebSocket, room_id: str = "class", cursor: int = 0, replay: int = 0, k: str = "", cid: str = "") -> None:
         try:
             room_id = validate_room_id(room_id)
         except RoomIdError:
-            await ws.close(code=1008)
+            await _refuse_listen(ws, 1008, "rejected")
             return
-        # Origin and the listen key are checked before accept, so a rejected
-        # socket never receives hello or a caption.
+        # Origin and the listen key are checked before any caption is read.
+        # Accept still happens so the browser can see the refusal instead of 1006.
         if not audience_origin_allowed(
             ws.headers.get("origin"),
             ws.headers.get("host", ""),
             settings,
             _audience_extra_hosts(),
         ):
-            await ws.close(code=1008)
+            await _refuse_listen(ws, 1008, "rejected", room_id)
             return
         room = book.get(room_id)
         if room is not None and not _listener_authorized(ws, room, k):
-            await ws.close(code=4401)
+            await _refuse_listen(ws, 4401, "link_invalid", room_id)
             return
         await ws.accept()
         if room is None:
@@ -1515,9 +1561,9 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
                 source = list(resumed.get("backfill") or [])
             visible = _captions_since_open(room_id, source)
             ip = ws.client.host if ws.client is not None else ""
-            allowed, retry_ms = replay_gate.allow(ip, _audience_client_id(ws, cid))
+            allowed, retry_ms = replay_gate.allow(ip, _audience_client_id(cid))
             if allowed:
-                hello["backfill"] = _audience_captions(visible)
+                hello["backfill"] = _audience_backfill(visible)
             else:
                 # Say so. An omitted backfill used to look like an empty class.
                 hello["backfill_deferred"] = True

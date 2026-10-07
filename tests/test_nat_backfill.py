@@ -7,6 +7,7 @@ another room's captions.
 """
 
 import asyncio
+import json
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -151,5 +152,154 @@ async def test_replay_limit_is_per_client_as_well_as_per_ip():
                 app, "/ws/listen?room_id=class&replay=1&cid=other-phone", client=("198.51.100.10", 5002),
             ))
             assert _zh(other.get("backfill")) == ["甲", "乙"]
+    finally:
+        await stop(app)
+
+
+def _wire_bytes(rows) -> int:
+    return len(json.dumps(list(rows), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _publish_lines(app, room, count, zh_for):
+    bus = app.state.bus
+    for seq in range(1, count + 1):
+        bus.publish({
+            "type": "caption",
+            "id": f"{room}:s:{seq}",
+            "room_id": room,
+            "session_id": "s",
+            "session_ord": 1,
+            "seq": seq,
+            "version": 1,
+            "zh": zh_for(seq),
+            "en": "",
+            "status": "ready",
+            "t0_ms": (seq - 1) * 1000,
+            "t1_ms": seq * 1000,
+        })
+
+
+@pytest.mark.anyio
+async def test_backfill_is_last_200_and_cid_cannot_raise_the_quota():
+    """One replay is the last 200 rows and at most 100 KB.
+
+    A same-epoch gap that is deferred does not include the older rows, and the
+    next allowed replay is still that 200-row tail. Omitting the client id, or
+    sending one that fails the id shape, shares one per-address bucket, so it
+    cannot multiply the per-client quota. Extra well-formed ids cannot pass
+    the per-address quota either.
+    """
+    app = app_for(
+        settings=Settings(
+            allow_testclient=True,
+            translate=False,
+            replay_per_minute=3,
+            replay_client_per_minute=1,
+            history_limit=50,
+        ),
+        translator=Translator(enabled=False),
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await open_room(client, token, "class")
+            await open_room(client, token, "wide")
+            _publish_lines(app, "class", 210, lambda seq: f"{seq:04d}")
+            _publish_lines(app, "wide", 30, lambda seq: ("W" if seq == 30 else "Q") + ("x" * 5000))
+
+            ip = ("203.0.113.40", 4100)
+            first = _hello(await drive(
+                app, "/ws/listen?room_id=class&replay=1&cid=phone", client=ip,
+            ))
+            backfill = first.get("backfill") or []
+            assert [item.get("seq") for item in backfill] == list(range(11, 211))
+            assert len(backfill) == 200
+            assert _wire_bytes(backfill) <= 100 * 1024
+            assert "0001" not in _zh(backfill)
+            assert backfill[-1]["zh"] == "0210"
+
+            # Same epoch, cursor ahead of the room: still only the tail, then deferred.
+            gapped = _hello(await drive(
+                app,
+                "/ws/listen?room_id=class&cursor=999999999&cid=gap-phone",
+                client=("203.0.113.40", 4101),
+            ))
+            assert gapped.get("gap") is True
+            assert gapped.get("backfill_deferred") is not True
+            assert [item.get("seq") for item in gapped.get("backfill") or []] == list(range(11, 211))
+            assert "0001" not in _zh(gapped.get("backfill"))
+            assert "0001" not in _zh(gapped.get("history"))
+            assert "0001" not in _zh(gapped.get("events"))
+
+            deferred = _hello(await drive(
+                app,
+                "/ws/listen?room_id=class&cursor=999999999&cid=gap-phone",
+                client=("203.0.113.40", 4102),
+            ))
+            assert deferred.get("backfill_deferred") is True
+            assert "backfill" not in deferred
+            assert "0001" not in _zh(deferred.get("history"))
+            assert "0001" not in _zh(deferred.get("events"))
+            assert int(deferred.get("retry_after_ms") or 0) >= 250
+
+            # Third id on this address spends the last per-address slot.
+            third = _hello(await drive(
+                app, "/ws/listen?room_id=class&replay=1&cid=forged-1", client=("203.0.113.40", 4103),
+            ))
+            assert [item.get("seq") for item in third.get("backfill") or []] == list(range(11, 211))
+            blocked = _hello(await drive(
+                app, "/ws/listen?room_id=class&replay=1&cid=forged-2", client=("203.0.113.40", 4104),
+            ))
+            assert blocked.get("backfill_deferred") is True
+            assert "backfill" not in blocked
+
+            # A different address: omitted and malformed ids share one client bucket.
+            anon_ip = "198.51.100.40"
+            omitted = _hello(await drive(
+                app, "/ws/listen?room_id=class&replay=1", client=(anon_ip, 4200),
+            ))
+            assert len(omitted.get("backfill") or []) == 200
+            again = _hello(await drive(
+                app, "/ws/listen?room_id=class&replay=1", client=(anon_ip, 4201),
+            ))
+            assert again.get("backfill_deferred") is True
+            forged = _hello(await drive(
+                app, "/ws/listen?room_id=class&replay=1&cid=bad%20cid", client=(anon_ip, 4202),
+            ))
+            assert forged.get("backfill_deferred") is True
+            long_cid = "a" * 80
+            too_long = _hello(await drive(
+                app, f"/ws/listen?room_id=class&replay=1&cid={long_cid}", client=(anon_ip, 4203),
+            ))
+            assert too_long.get("backfill_deferred") is True
+            # A real phone id is its own bucket and still cannot be blocked by the anon ones,
+            # but the address ceiling remains.
+            phone = _hello(await drive(
+                app, "/ws/listen?room_id=class&replay=1&cid=real-phone", client=(anon_ip, 4204),
+            ))
+            assert len(phone.get("backfill") or []) == 200
+            # Anon used one address slot. Two more well-formed ids fill the ceiling of 3.
+            phone2 = _hello(await drive(
+                app, "/ws/listen?room_id=class&replay=1&cid=real-phone-2", client=(anon_ip, 4205),
+            ))
+            assert len(phone2.get("backfill") or []) == 200
+            over = _hello(await drive(
+                app, "/ws/listen?room_id=class&replay=1&cid=real-phone-3", client=(anon_ip, 4206),
+            ))
+            assert over.get("backfill_deferred") is True
+
+            fat = _hello(await drive(
+                app, "/ws/listen?room_id=wide&replay=1&cid=fat", client=("203.0.113.77", 4300),
+            ))
+            fat_rows = fat.get("backfill") or []
+            assert fat.get("backfill_deferred") is not True
+            assert 1 <= len(fat_rows) < 30
+            assert len(fat_rows) <= 200
+            assert fat_rows[-1]["zh"].startswith("W")
+            assert all(not item["zh"].startswith("Q") or item["seq"] != 1 for item in fat_rows)
+            assert fat_rows[0]["seq"] != 1
+            assert _wire_bytes(fat_rows) <= 100 * 1024
+            one = _wire_bytes(fat_rows[-1:])
+            assert one * 30 > 100 * 1024
     finally:
         await stop(app)

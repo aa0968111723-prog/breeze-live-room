@@ -110,8 +110,9 @@ class Settings:
     silence_rms: float = 0.0
     caption_ttl_s: float = 86400.0
     room_caption_cap: int = 5000
-    # Full replay/backfill responses per public IP per minute. A classroom shares one
-    # NAT address, so this is a classroom-sized ceiling, not 8. Live captions are not counted.
+    # Replay/backfill hellos per public IP per minute. A classroom shares one NAT
+    # address, so this is a classroom-sized ceiling, not 8. Each hello carries only
+    # the last 200 captions, which is what makes 180 acceptable. Live captions are not counted.
     replay_per_minute: int = 180
     # Same budget counted per (IP, audience client id). One phone cannot spend the room's ceiling.
     replay_client_per_minute: int = 8

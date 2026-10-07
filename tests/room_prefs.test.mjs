@@ -10,6 +10,7 @@ import {
   refreshWakeLock,
   releaseWakeLock,
   requestWakeLock,
+  safeStorage,
   sanitizePrefs,
   themeIsDark,
   wakeLockSupported,
@@ -29,6 +30,10 @@ function memoryStorage(initial = {}) {
 }
 
 assert.equal(PREFS_KEY, "breeze.audience.prefs");
+assert.equal(safeStorage(() => { throw new Error("SecurityError"); }), null);
+assert.equal(safeStorage(() => null), null);
+const mem = safeStorage(() => memoryStorage({ kept: "1" }));
+assert.equal(mem.getItem("kept"), "1");
 assert.deepEqual(readPrefs(null), { ...DEFAULT_PREFS });
 assert.equal(sanitizePrefs({ wake: false }).wake, false);
 assert.equal(sanitizePrefs({}).wake, true);

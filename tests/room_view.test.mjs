@@ -16,6 +16,7 @@ assert.equal(HISTORY_DIVIDER, "— 這裡漏了一小段 —");
 assert.ok(contrast("#6b5644", "#fbf6ee") >= 4.5);
 assert.ok(contrast("#d9d0c3", "#16130f") >= 4.5);
 assert.ok(contrast("#2a2118", "#fbf6ee") >= 4.5);
+assert.ok(contrast("#16130f", "#c9843f") >= 4.5);
 assert.equal(stageMode({ kind: "live", ageMs: 20000, hasCaption: true }), "live");
 assert.equal(stageMode({ kind: "live", ageMs: 20001, hasCaption: true }), "idle");
 assert.equal(stageMode({ kind: "live", ageMs: 60000, hasCaption: false }), "live");

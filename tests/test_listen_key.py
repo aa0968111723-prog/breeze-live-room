@@ -4,7 +4,8 @@ A missing Origin is allowed on purpose: the pytest sockets and scripts/device_ch
 do not send one. Browsers always send Origin, and a present Origin must match the
 allowlist (loopback, allowed_hosts, or the share host printed on the QR code).
 The Host header is always checked, so a missing Origin is not a DNS-rebinding hole.
-Rejected sockets are closed before accept and never get hello or a caption.
+A refused listen is accepted, named, then closed, and never gets hello or a caption.
+Closing before accept is an HTTP 403, which a browser shows as 1006.
 """
 
 import json
@@ -111,10 +112,29 @@ def _close_code(messages):
 
 
 def _assert_rejected(messages, code):
-    assert not any(msg.get("type") == "websocket.accept" for msg in messages), messages
-    assert "hello" not in _sent_text(messages)
-    assert _sent_text(messages) == ""
+    """Accept, then the refusal, then the close. No hello and no caption."""
+    kinds = [msg.get("type") for msg in messages]
+    assert "websocket.accept" in kinds, messages
+    assert "websocket.send" in kinds, messages
+    assert "websocket.close" in kinds, messages
+    assert kinds.index("websocket.accept") < kinds.index("websocket.send") < kinds.index("websocket.close")
     assert _close_code(messages) == code
+    sent = []
+    for msg in messages:
+        if msg.get("type") != "websocket.send":
+            continue
+        sent.append(json.loads(msg.get("text") or "{}"))
+    assert len(sent) == 1, sent
+    note = sent[0]
+    assert note.get("type") == "room_unavailable"
+    assert "backfill" not in note and "history" not in note and "zh" not in note and "events" not in note
+    assert "hello" not in _sent_text(messages)
+    if code == 4401:
+        assert note.get("reason") == "link_invalid"
+    elif code == 1008:
+        assert note.get("reason") == "rejected"
+    else:
+        raise AssertionError(code)
 
 
 def _hello(messages) -> dict:
@@ -206,6 +226,9 @@ async def test_bad_origin_and_host_rejected_without_hello():
             assert _hello(blank)["type"] == "hello"
             missing = await drive(app, "/ws/listen?room_id=class&replay=1", with_key=True, headers=_headers())
             assert _hello(missing)["type"] == "hello"
+
+            illegal = await drive(app, "/ws/listen?room_id=bad%20room", with_key=False)
+            _assert_rejected(illegal, 1008)
     finally:
         await stop(app)
 

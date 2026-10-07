@@ -31,6 +31,9 @@ assert.equal(waitingDelayMs(0, 1), 6500);
 assert.equal(waitingDelayMs(119999, 0), 3500);
 assert.equal(waitingDelayMs(120000, 0), 10500);
 assert.equal(waitingDelayMs(120000, 1), 19500);
+assert.equal(waitingDelayMs(0, 0, true), 30000);
+assert.equal(waitingDelayMs(0, 1, true), 60000);
+assert.equal(waitingDelayMs(120000, 1, true), 60000);
 assert.equal(fullDelayMs(0), 14000);
 assert.equal(fullDelayMs(1), 26000);
 assert.equal(reconnectDelayMs(1, 0, false), 500);
@@ -134,6 +137,56 @@ async function testLinkInvalidDoesNotRetryUntilNudge() {
   assert.equal(sockets.length, 2);
   conn.stop();
   await conn.done;
+}
+
+async function testRefusalMessageShowsWhenTheBrowserOnlyHas1006() {
+  const states = [];
+  const sockets = [];
+  const conn = connectRoom({
+    room: "class",
+    url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
+    openSocket(address) {
+      const ws = fakeSocket(address);
+      sockets.push(ws);
+      return ws;
+    },
+    sleep: () => Promise.resolve(),
+    onState: (detail) => states.push(detail),
+    onEvent: () => {},
+  });
+  await tick();
+  sockets[0].onmessage({ data: JSON.stringify({ type: "room_unavailable", reason: "link_invalid" }) });
+  sockets[0].onclose({ code: 1006 });
+  await tick();
+  assert.equal(sockets.length, 1);
+  assert.equal(states.at(-1).kind, "link_invalid");
+  assert.equal(states.at(-1).text, "連結已失效，請重新掃描");
+  conn.stop();
+  await conn.done;
+
+  const states2 = [];
+  const sockets2 = [];
+  const conn2 = connectRoom({
+    room: "class",
+    url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
+    openSocket(address) {
+      const ws = fakeSocket(address);
+      sockets2.push(ws);
+      return ws;
+    },
+    sleep: () => Promise.resolve(),
+    onState: (detail) => states2.push(detail),
+    onEvent: () => {},
+  });
+  await tick();
+  sockets2[0].onmessage({ data: JSON.stringify({ type: "room_unavailable", reason: "rejected" }) });
+  sockets2[0].onclose({ code: 1006 });
+  await tick();
+  assert.equal(sockets2.length, 1);
+  assert.equal(states2.at(-1).kind, "rejected");
+  assert.ok(String(states2.at(-1).text).includes("無法開啟"));
+  conn2.stop();
+  await conn2.done;
 }
 
 async function testRejectedCloseStaysPut() {
@@ -336,6 +389,85 @@ async function testWatchdogClosesOnlyInForeground() {
   assert.equal(check, null);
 }
 
+async function testWatchdogReconnectsWithoutOnclose() {
+  let now = 1000;
+  let check = null;
+  const sockets = [];
+  const conn = connectRoom({
+    room: "class",
+    url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
+    now: () => now,
+    staleMs: 35000,
+    schedule(fn) {
+      check = fn;
+      return 7;
+    },
+    cancelSchedule() { check = null; },
+    isForeground: () => true,
+    openSocket(address) {
+      const ws = {
+        address,
+        readyState: 1,
+        sent: [],
+        close() { this.closed = true; },
+        send() {},
+      };
+      sockets.push(ws);
+      return ws;
+    },
+    sleep: () => Promise.resolve(),
+    onState: () => {},
+    onEvent: () => {},
+  });
+  await tick();
+  sockets[0].onopen();
+  now = 40000;
+  check();
+  await tick();
+  assert.equal(sockets[0].closed, true);
+  assert.equal(sockets[0].onclose, null);
+  assert.equal(sockets[0].onmessage, null);
+  assert.equal(sockets.length, 2);
+  conn.stop();
+  await conn.done;
+}
+
+async function testVisibleNudgeReconnectsAStaleSocketWithoutOnclose() {
+  let now = 1000;
+  const sockets = [];
+  const conn = connectRoom({
+    room: "class",
+    url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
+    now: () => now,
+    staleMs: 35000,
+    schedule() { return 1; },
+    cancelSchedule() {},
+    isForeground: () => true,
+    openSocket(address) {
+      const ws = {
+        address,
+        readyState: 1,
+        close() { this.closed = true; },
+        send() {},
+      };
+      sockets.push(ws);
+      return ws;
+    },
+    sleep: () => Promise.resolve(),
+    onState: () => {},
+    onEvent: () => {},
+  });
+  await tick();
+  sockets[0].onopen();
+  now = 40000;
+  conn.nudge();
+  await tick();
+  assert.equal(sockets.length, 2);
+  assert.equal(sockets[0].onclose, null);
+  conn.stop();
+  await conn.done;
+}
+
 async function testEndedRestartKeepsCursor() {
   const sockets = [];
   const states = [];
@@ -454,11 +586,14 @@ async function testReconnectJitterBoundsAfterHello() {
 
 await testWaitingRoomPollsWithoutEnding();
 await testLinkInvalidDoesNotRetryUntilNudge();
+await testRefusalMessageShowsWhenTheBrowserOnlyHas1006();
 await testRejectedCloseStaysPut();
 await testFullDoesNotLookLikeADrop();
 await testOfflinePausesThenOnlineReconnects();
 await testOfflineDuringBackoffDoesNotOpen();
 await testWatchdogClosesOnlyInForeground();
+await testWatchdogReconnectsWithoutOnclose();
+await testVisibleNudgeReconnectsAStaleSocketWithoutOnclose();
 await testEndedRestartKeepsCursor();
 await testNudgeAfterStopRestarts();
 await testHiddenUnreachableWaitsSixtySeconds();

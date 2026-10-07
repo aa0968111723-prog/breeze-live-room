@@ -156,41 +156,18 @@ async def test_default_window_exceeded_reports_gap():
             assert len(hello["history"]) == 160
 
 
-def _stamp_when_close_is_handled(client) -> dict:
-    """Monotonic time when POST /api/rooms/close enters the ASGI app.
-
-    httpx builds that request on the test task before the app is called. One
-    virtual second is 10 ms real here, and that gap is not the close notice.
-    """
-    import time
-
-    stamp: dict[str, float] = {}
-    transport = client._transport
-    inner = transport.app
-
-    async def app(scope, receive, send):
-        if (
-            not stamp
-            and scope.get("type") == "http"
-            and scope.get("method") == "POST"
-            and scope.get("path") == "/api/rooms/close"
-        ):
-            stamp["at"] = time.monotonic()
-        await inner(scope, receive, send)
-
-    transport.app = app
-    return stamp
-
-
 @pytest.mark.anyio
 async def test_room_close_closes_listener_socket():
-    """B-e4. Notice within 1 virtual second of handling close; socket closed within 2.
+    """B-e4. Notice within 1 virtual second; socket closed within 2.
 
-    The clock starts when the server enters the close request. Building the POST
-    can collect the suite heap first (a full collection of this process is tens
-    or hundreds of milliseconds and is not the close path). Limits are unchanged.
+    The clock starts immediately before client.post, which is the close request.
+    A full collection of the suite heap is paid before that, and GC stays off
+    for the window, so a collector pause is not the close notice. vlimit and
+    SCALE are unchanged. This branch has no watch_full_gc helper; the callback
+    below is the same check (zero generation-2 collections inside the window).
     """
     import gc
+    import time
 
     from tests.sim import SCALE, vlimit
 
@@ -198,13 +175,20 @@ async def test_room_close_closes_listener_socket():
         await open_room(client, token, "class")
         async with Listener(app, "class") as listener:
             assert await listener.wait_for(lambda: any(m.get("type") == "hello" for m in listener.messages), 5)
-            # Pay a pending collection of the suite heap before the budget, then
-            # keep a new one from starting inside the 10 ms real window.
             gc.collect()
-            handled = _stamp_when_close_is_handled(client)
+            full_gc = {"n": 0}
+            watching = False
+
+            def _count_full(phase, info):
+                if watching and phase == "stop" and int(info.get("generation", -1)) >= 2:
+                    full_gc["n"] += 1
+
+            gc.callbacks.append(_count_full)
             was_gc = gc.isenabled()
             gc.disable()
+            watching = True
             try:
+                started = time.monotonic()
                 resp = await client.post(
                     "/api/rooms/close",
                     json={"room_id": "class"},
@@ -214,13 +198,14 @@ async def test_room_close_closes_listener_socket():
                 assert await listener.wait_for(lambda: any(m.get("type") == "room_unavailable" for m in listener.messages), 5)
                 note = next(m for m in listener.messages if m.get("type") == "room_unavailable")
                 assert note["reason"] == "ended"
-                assert "at" in handled
-                started = handled["at"]
                 assert (note["_recv_mono"] - started) / SCALE <= vlimit(1)
                 assert await listener.wait_for(lambda: listener.closed, 5)
                 close = next(m for m in listener.messages if m.get("type") == "websocket.close")
                 assert (close["_recv_mono"] - started) / SCALE <= vlimit(2)
+                assert full_gc["n"] == 0
             finally:
+                watching = False
+                gc.callbacks.remove(_count_full)
                 if was_gc:
                     gc.enable()
 
