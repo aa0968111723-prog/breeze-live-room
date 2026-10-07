@@ -224,20 +224,37 @@ AUDIENCE_BACKFILL_ROWS = 200
 AUDIENCE_BACKFILL_BYTES = 100 * 1024
 
 
+# Replay buckets are keyed by the TCP peer, not by whatever id the client sends.
+# A full table drops expired keys, then the quietest one, instead of growing forever.
+_REPLAY_KEY_CAP = 4096
+
+
 class _ReplayGate:
     """Caps replay/backfill hellos. Live captions are not counted.
 
-    One bucket is the public IP (a whole classroom behind NAT). The other is
-    that IP plus the audience client id, so one phone cannot use the room's ceiling.
-    A missing or forged client id shares one bucket per address. A refused hello
-    is explicit: the caller sends backfill_deferred instead of an empty screen.
+    One bucket is the TCP peer address (a classroom behind NAT shares it).
+    The other is that address plus the audience client id, and it can only
+    tighten the address cap. A missing or forged client id shares one bucket
+    per address. A refused hello is explicit: the caller sends
+    backfill_deferred instead of an empty screen.
     """
 
-    def __init__(self, ip_limit: int, client_limit: int | None = None, window_s: float = 60.0):
+    def __init__(
+        self,
+        ip_limit: int,
+        client_limit: int | None = None,
+        window_s: float = 60.0,
+        *,
+        clock=None,
+        max_keys: int = _REPLAY_KEY_CAP,
+    ):
         self.ip_limit = max(1, int(ip_limit))
         self.limit = self.ip_limit
-        self.client_limit = max(1, int(self.ip_limit if client_limit is None else client_limit))
+        requested = self.ip_limit if client_limit is None else int(client_limit)
+        self.client_limit = max(1, min(self.ip_limit, requested))
         self.window_s = float(window_s)
+        self.max_keys = max(1, int(max_keys))
+        self._clock = clock or time.monotonic
         self._ip_hits: dict[str, list[float]] = {}
         self._client_hits: dict[tuple[str, str], list[float]] = {}
 
@@ -245,6 +262,37 @@ class _ReplayGate:
         cutoff = now - self.window_s
         if bucket and bucket[0] <= cutoff:
             bucket[:] = [item for item in bucket if item > cutoff]
+
+    def _drop_expired(self, store: dict, now: float) -> None:
+        cutoff = now - self.window_s
+        dead = [key for key, bucket in store.items() if not bucket or bucket[-1] <= cutoff]
+        for key in dead:
+            del store[key]
+
+    def _forget_expired(self, now: float) -> None:
+        self._drop_expired(self._ip_hits, now)
+        self._drop_expired(self._client_hits, now)
+
+    def _make_room(self, store: dict, now: float) -> None:
+        if len(store) < self.max_keys:
+            return
+        # This table only. The other one may hold an empty bucket not stamped yet.
+        self._drop_expired(store, now)
+        while len(store) >= self.max_keys:
+            oldest = min(store, key=lambda key: (store[key][-1] if store[key] else 0.0))
+            del store[oldest]
+
+    def _take(self, store: dict, key, now: float) -> list[float]:
+        bucket = store.get(key)
+        if bucket is not None:
+            self._prune(bucket, now)
+            if bucket:
+                return bucket
+            del store[key]
+        self._make_room(store, now)
+        fresh: list[float] = []
+        store[key] = fresh
+        return fresh
 
     def _retry_ms(self, bucket: list[float], now: float) -> int:
         if not bucket:
@@ -255,20 +303,17 @@ class _ReplayGate:
         return int(wait * 1000) + 1
 
     def allow(self, ip: str, client_id: str = "") -> tuple[bool, int]:
-        now = time.monotonic()
+        now = float(self._clock())
+        self._forget_expired(now)
         ip_key = ip or ""
         who = client_id or ""
-        ip_bucket = self._ip_hits.setdefault(ip_key, [])
-        client_bucket = self._client_hits.setdefault((ip_key, who), [])
-        self._prune(ip_bucket, now)
-        self._prune(client_bucket, now)
-        blocked = None
+        ip_bucket = self._take(self._ip_hits, ip_key, now)
         if len(ip_bucket) >= self.ip_limit:
-            blocked = ip_bucket
-        elif len(client_bucket) >= self.client_limit:
-            blocked = client_bucket
-        if blocked is not None:
-            return False, self._retry_ms(blocked, now)
+            # A refused address must not allocate a client bucket.
+            return False, self._retry_ms(ip_bucket, now)
+        client_bucket = self._take(self._client_hits, (ip_key, who), now)
+        if len(client_bucket) >= self.client_limit:
+            return False, self._retry_ms(client_bucket, now)
         ip_bucket.append(now)
         client_bucket.append(now)
         return True, 0
@@ -405,6 +450,31 @@ def _public_result(done: Segment) -> JSONResponse:
     body["ok"] = code == 200
     body["detail"] = done.error
     return JSONResponse(status_code=code, content=body)
+
+
+class _ReferrerPolicy:
+    """Set Referrer-Policy without buffering the body.
+
+    Starlette's http decorator middleware reads each response into memory.
+    The 1000-segment class is measured in RSS, so this stays a header stamp.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_policy(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers") or [])
+                headers.append((b"referrer-policy", b"no-referrer"))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_policy)
 
 
 def create_app(settings: Settings | None = None, asr=None, translator: Translator | None = None, decoder=None) -> FastAPI:
@@ -771,6 +841,9 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             await shutdown()
 
     app = FastAPI(title="breeze-live-room", lifespan=lifespan)
+    # Outer header only. The listen key is in the page query; do not send that URL onward.
+    app.add_middleware(_ReferrerPolicy)
+
     static_files = RevalidatingStaticFiles(directory=STATIC)
     app.mount("/static", static_files, name="static")
     app.state.settings = settings
@@ -1296,6 +1369,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             else:
                 source = list(resumed.get("backfill") or [])
             visible = _captions_since_open(room_id, source)
+            # TCP peer only. X-Forwarded-For, X-Real-IP, and Forwarded are not an address.
             ip = ws.client.host if ws.client is not None else ""
             allowed, retry_ms = replay_gate.allow(ip, _audience_client_id(cid))
             if allowed:

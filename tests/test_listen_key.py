@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.server import _ReplayGate
 from app.settings import Settings
 from app.translate import Translator
 from tests.test_round2 import Socket, app_for, auth, open_room, push, stop, token_of
@@ -416,16 +417,217 @@ async def test_replay_backfill_is_rate_limited_per_ip():
 
 
 def test_replay_per_minute_setting_defaults_and_rejects_zero():
-    # Per-IP ceiling is classroom-sized. The old pure cap of 8 left a NAT blank.
+    # Classroom floor stays. 180 is the highest accepted address cap; the
+    # behaviour tests below are what keep a rotating client id inside it.
     assert Settings().replay_per_minute >= 120
-    assert Settings().replay_per_minute == 180
+    assert Settings().replay_per_minute <= 180
     assert Settings().replay_client_per_minute == 8
+    assert Settings().replay_client_per_minute <= Settings().replay_per_minute
     assert Settings.from_env({"BREEZE_REPLAY_PER_MINUTE": "3"}).replay_per_minute == 3
     assert Settings.from_env({"BREEZE_REPLAY_CLIENT_PER_MINUTE": "4"}).replay_client_per_minute == 4
     with pytest.raises(ValueError, match="BREEZE_REPLAY_PER_MINUTE"):
         Settings(replay_per_minute=0)
     with pytest.raises(ValueError, match="BREEZE_REPLAY_CLIENT_PER_MINUTE"):
         Settings(replay_client_per_minute=0)
+
+
+def _wire_bytes(rows) -> int:
+    return len(json.dumps(list(rows or []), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _full_replay(hello: dict) -> bool:
+    """A full replay is a hello whose backfill list is present and not deferred."""
+    if hello.get("backfill_deferred") is True or "backfill" not in hello:
+        return False
+    rows = hello.get("backfill")
+    assert isinstance(rows, list) and rows, hello
+    assert len(rows) <= 200
+    assert _wire_bytes(rows) <= 100 * 1024
+    return True
+
+
+def _spoofed(index: int):
+    """Forwarded headers a proxy might add. The listen path must ignore them."""
+    return _headers() + [
+        (b"x-forwarded-for", f"198.51.100.{index % 200}, 203.0.113.9".encode()),
+        (b"x-real-ip", f"203.0.113.{index % 200}".encode()),
+        (b"forwarded", f'for=192.0.2.{index % 200};proto=http'.encode()),
+    ]
+
+
+@pytest.mark.anyio
+async def test_same_ip_rotating_cids_stay_inside_the_replay_cap():
+    """One TCP address, three bursts of 40 replay hellos.
+
+    Distinct well-formed client ids all succeed (40 is under the address cap,
+    and each id is used once). Omitting the id, or repeating one id, stops at
+    the per-client cap. The address total of the three bursts stays within the
+    address cap: a client id can only tighten it.
+    """
+    ip_cap = Settings().replay_per_minute
+    client_cap = Settings().replay_client_per_minute
+    assert 40 <= ip_cap <= 180
+    assert client_cap == 8
+    app = app_for(
+        settings=Settings(allow_testclient=True, translate=False, max_listeners=100, history_limit=8),
+        translator=Translator(enabled=False),
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await open_room(client, token, "class")
+            made = await push(client, token, "class", "s", 1, "甲".encode(), t0_ms=0, t1_ms=1000)
+            assert made.status_code == 200, made.text
+
+            async def burst(query_for, count, port_base):
+                full = 0
+                for index in range(count):
+                    hello = _hello(await drive(
+                        app,
+                        "/ws/listen?room_id=class&replay=1" + query_for(index),
+                        client=("203.0.113.40", port_base + index),
+                    ))
+                    if _full_replay(hello):
+                        full += 1
+                        assert "甲" in _zh(hello.get("backfill"))
+                    else:
+                        assert hello.get("backfill_deferred") is True
+                        assert "backfill" not in hello
+                return full
+
+            rotating = await burst(lambda index: f"&cid=phone-{index:02d}", 40, 5000)
+            missing = await burst(lambda index: "", 40, 6000)
+            fixed = await burst(lambda index: "&cid=same-phone", 40, 7000)
+            assert rotating == 40
+            assert missing == client_cap
+            assert fixed == client_cap
+            assert rotating + missing + fixed <= ip_cap
+            assert missing < rotating and fixed < rotating
+    finally:
+        await stop(app)
+
+
+@pytest.mark.anyio
+async def test_forwarded_headers_cannot_reset_the_tcp_replay_cap():
+    """X-Forwarded-For, X-Real-IP, and Forwarded are not the replay address."""
+    cap = 5
+    app = app_for(
+        settings=Settings(
+            allow_testclient=True,
+            translate=False,
+            replay_per_minute=cap,
+            replay_client_per_minute=8,
+            max_listeners=80,
+            history_limit=4,
+        ),
+        translator=Translator(enabled=False),
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            await open_room(client, token, "class")
+            made = await push(client, token, "class", "s", 1, "甲".encode(), t0_ms=0, t1_ms=1000)
+            assert made.status_code == 200, made.text
+            exhausted = "203.0.113.9"
+            full = 0
+            for index in range(40):
+                hello = _hello(await drive(
+                    app,
+                    f"/ws/listen?room_id=class&replay=1&cid=rot-{index:02d}",
+                    client=(exhausted, 8000 + index),
+                    headers=_spoofed(index),
+                ))
+                if _full_replay(hello):
+                    full += 1
+            assert full == cap
+            other = _hello(await drive(
+                app,
+                "/ws/listen?room_id=class&replay=1&cid=other-net",
+                client=("198.51.100.8", 8100),
+                headers=_headers() + [
+                    (b"x-forwarded-for", exhausted.encode()),
+                    (b"x-real-ip", exhausted.encode()),
+                    (b"forwarded", f"for={exhausted}".encode()),
+                ],
+            ))
+            assert _full_replay(other)
+            still = _hello(await drive(
+                app,
+                "/ws/listen?room_id=class&replay=1&cid=rot-extra",
+                client=(exhausted, 8101),
+                headers=_spoofed(99),
+            ))
+            assert still.get("backfill_deferred") is True
+            assert "backfill" not in still
+    finally:
+        await stop(app)
+
+
+def test_replay_gate_address_cap_bounds_rotating_cids_and_keys():
+    """Production limits: rotating ids stop at the address cap, and the tables stay bounded."""
+    cap = Settings().replay_per_minute
+    client_cap = Settings().replay_client_per_minute
+    now = {"t": 1000.0}
+    gate = _ReplayGate(cap, client_cap, clock=lambda: now["t"])
+    assert gate.ip_limit == cap
+    assert gate.limit == cap
+    assert gate.client_limit == client_cap
+    assert _ReplayGate(cap, cap + 50, clock=lambda: now["t"]).client_limit == cap
+    allowed = 0
+    for index in range(cap + 40):
+        ok, retry = gate.allow("203.0.113.9", f"cid-{index}")
+        if ok:
+            allowed += 1
+        else:
+            assert retry >= 250
+    assert allowed == cap
+    assert gate.allow("203.0.113.9", "cid-extra")[0] is False
+    assert len(gate._client_hits) == cap
+    assert ("203.0.113.9", "cid-extra") not in gate._client_hits
+    assert gate.allow("198.51.100.8", "cid-0")[0] is True
+
+    fixed = _ReplayGate(cap, client_cap, clock=lambda: now["t"])
+    assert sum(fixed.allow("203.0.113.9", "same")[0] for _ in range(40)) == client_cap
+    assert list(fixed._client_hits) == [("203.0.113.9", "same")]
+    missing = _ReplayGate(cap, client_cap, clock=lambda: now["t"])
+    assert sum(missing.allow("203.0.113.9", "")[0] for _ in range(40)) == client_cap
+    assert list(missing._client_hits) == [("203.0.113.9", "")]
+
+    now["t"] = 0.0
+    denied = _ReplayGate(1, 1, clock=lambda: now["t"], max_keys=4)
+    assert denied.allow("10.0.0.1", "kept")[0] is True
+    for index in range(30):
+        assert denied.allow("10.0.0.1", f"nope-{index}")[0] is False
+    assert list(denied._client_hits) == [("10.0.0.1", "kept")]
+    assert len(denied._ip_hits) == 1
+
+    now["t"] = 10.0
+    bounded = _ReplayGate(2, 2, window_s=60.0, clock=lambda: now["t"], max_keys=2)
+    assert bounded.allow("10.1.0.1", "a")[0] is True
+    now["t"] = 20.0
+    assert bounded.allow("10.1.0.2", "b")[0] is True
+    now["t"] = 30.0
+    assert bounded.allow("10.1.0.3", "c")[0] is True
+    assert "10.1.0.1" not in bounded._ip_hits
+    assert ("10.1.0.1", "a") not in bounded._client_hits
+    assert set(bounded._ip_hits) == {"10.1.0.2", "10.1.0.3"}
+    assert len(bounded._client_hits) == 2
+    now["t"] = 80.0
+    assert bounded.allow("10.1.0.9", "fresh")[0] is True
+    assert "10.1.0.2" not in bounded._ip_hits
+    assert ("10.1.0.2", "b") not in bounded._client_hits
+    assert "10.1.0.3" in bounded._ip_hits
+    assert len(bounded._ip_hits) <= 2
+    assert len(bounded._client_hits) <= 2
+
+    now["t"] = 0.0
+    again = _ReplayGate(1, 1, window_s=60.0, clock=lambda: now["t"])
+    assert again.allow("10.2.0.1", "a")[0] is True
+    assert again.allow("10.2.0.1", "a")[0] is False
+    now["t"] = 61.0
+    assert again.allow("10.2.0.1", "a")[0] is True
+    assert len(again._ip_hits["10.2.0.1"]) == 1
+    assert len(again._client_hits[("10.2.0.1", "a")]) == 1
 
 
 @pytest.mark.anyio

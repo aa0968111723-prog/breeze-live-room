@@ -74,6 +74,7 @@ async def assert_revalidates(client: AsyncClient, path: str) -> Response:
     resp = await client.get(path)
     assert resp.status_code == 200, path
     assert resp.headers["cache-control"] == "no-cache", path
+    assert resp.headers["referrer-policy"] == "no-referrer", path
     assert resp.headers["etag"], path
     assert resp.headers["last-modified"], path
     etag = resp.headers["etag"]
@@ -81,10 +82,12 @@ async def assert_revalidates(client: AsyncClient, path: str) -> Response:
     assert cached.status_code == 304, path
     assert cached.content == b"", path
     assert cached.headers["cache-control"] == "no-cache", path
+    assert cached.headers["referrer-policy"] == "no-referrer", path
     assert cached.headers["etag"] == etag, path
     mismatch = await client.get(path, headers={"if-none-match": '"not-the-file"'})
     assert mismatch.status_code == 200, path
     assert mismatch.headers["cache-control"] == "no-cache", path
+    assert mismatch.headers["referrer-policy"] == "no-referrer", path
     return resp
 
 
@@ -151,6 +154,7 @@ async def test_module_imports_carry_a_content_version():
             ranged = await client.get(url, headers={"range": "bytes=0-9"})
             assert ranged.status_code == 206, url
             assert ranged.headers["cache-control"] == "no-cache", url
+            assert ranged.headers["referrer-policy"] == "no-referrer", url
             assert ranged.content == served.content[:10]
             ignored = await client.get(f"/static/{name}?v=not-a-real-token")
             assert ignored.status_code == 200
