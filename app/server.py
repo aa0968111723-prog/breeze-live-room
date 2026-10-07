@@ -49,6 +49,8 @@ _MODULE_IMPORT_RE = re.compile(
     r"""(?P<lead>\bfrom\s+|\bimport(?:\s*\(\s*|\s+))(?P<quote>["'])"""
     r"""(?P<url>/static/(?P<name>[^"'\\?#]+?\.js))(?:\?[^"'\\]*)?(?P=quote)"""
 )
+# Embedded in a <script type="module"> URL. Anything else is not a version.
+_VERSION_RE = re.compile(r"^[0-9A-Za-z._+-]{1,32}$")
 
 
 def app_version() -> str:
@@ -56,8 +58,8 @@ def app_version() -> str:
         raw = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     except OSError:
         return "0"
-    token = raw.split()[0] if raw else "0"
-    if not token or any(ch in token for ch in " \"'#?&"):
+    token = raw.split()[0] if raw else ""
+    if _VERSION_RE.fullmatch(token) is None:
         return "0"
     return token
 
@@ -72,13 +74,14 @@ def static_asset_token(path: Path) -> str:
 def _static_import_target(name: str, static_dir: Path) -> Path | None:
     if not name or name.startswith(("/", "\\")) or "\\" in name or ".." in Path(name).parts:
         return None
-    root = static_dir.resolve()
-    target = (root / name).resolve()
+    # NUL raises ValueError from resolve(); a very long name raises OSError from is_file().
     try:
+        root = static_dir.resolve()
+        target = (root / name).resolve()
         target.relative_to(root)
-    except ValueError:
-        return None
-    if not target.is_file():
+        if not target.is_file():
+            return None
+    except (OSError, ValueError):
         return None
     return target
 
@@ -111,6 +114,14 @@ def stamp_static_imports(text: str, static_dir: Path) -> str:
 
 def _body_etag(body: bytes) -> str:
     return f'"{hashlib.sha256(body).hexdigest()}"'
+
+
+def _static_media_type(path: str | os.PathLike[str]) -> str:
+    """Serve scripts as text/javascript. Windows may map .js to text/plain."""
+
+    if Path(path).suffix.lower() in {".js", ".mjs"}:
+        return "text/javascript"
+    return guess_type(str(path))[0] or "application/octet-stream"
 
 
 def _stamped_static(path: Path, static_dir: Path, stat_result: os.stat_result) -> tuple[bytes, str] | None:
@@ -165,16 +176,17 @@ class RevalidatingStaticFiles(StaticFiles):
     ) -> Response:
         directory = Path(self.directory) if self.directory is not None else Path(full_path).parent
         stamped = _stamped_static(Path(full_path), directory, stat_result)
+        media_type = _static_media_type(full_path)
         if stamped is None:
             response: Response = FileResponse(
                 full_path,
                 status_code=status_code,
                 stat_result=stat_result,
+                media_type=media_type,
                 headers={"Cache-Control": "no-cache"},
             )
         else:
             body, last_modified = stamped
-            media_type = guess_type(str(full_path))[0] or "application/octet-stream"
             # ETag is the stamped bytes, not mtime-size: a script edit changes
             # the injected ?v= without touching the HTML file's stat.
             response = _RewrittenStaticResponse(

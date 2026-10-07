@@ -11,7 +11,15 @@ from pathlib import Path
 import pytest
 from httpx import ASGITransport, AsyncClient, Response
 
-from app.server import ROOT, STATIC, create_app, stamp_static_imports, static_asset_token
+from app.server import (
+    ROOT,
+    STATIC,
+    _static_import_target,
+    app_version,
+    create_app,
+    stamp_static_imports,
+    static_asset_token,
+)
 from app.settings import Settings
 from app.translate import Translator
 
@@ -40,6 +48,13 @@ def make_app():
 
 def auth(token: str) -> dict[str, str]:
     return {"authorization": f"Bearer {token}", "origin": "http://127.0.0.1:8780"}
+
+
+def stored_text(path: Path) -> str:
+    """File text as stored. read_text() would hide a Windows CRLF checkout."""
+
+    expected = path.read_bytes().decode("utf-8")
+    return expected
 
 
 def import_versions(text: str, static_dir: Path) -> dict[str, str]:
@@ -92,7 +107,8 @@ async def test_pages_and_static_files_revalidate():
             assert marker in resp.text, path
             assert int(resp.headers["content-length"]) == len(resp.content), path
             if path.startswith("/static/") and path.endswith(".js"):
-                assert resp.text == (STATIC / path.removeprefix("/static/")).read_text(encoding="utf-8")
+                expected = stored_text(STATIC / path.removeprefix("/static/"))
+                assert resp.text == expected
 
 
 @pytest.mark.anyio
@@ -103,13 +119,15 @@ async def test_module_imports_carry_a_content_version():
     async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8780") as client:
         host = await assert_revalidates(client, "/")
         assert host.headers["content-type"].startswith("text/html")
-        assert host.text == stamp_static_imports((STATIC / "host.html").read_text(encoding="utf-8"), STATIC)
+        expected = stored_text(STATIC / "host.html")
+        assert host.text == stamp_static_imports(expected, STATIC)
         host_versions = import_versions(host.text, STATIC)
         assert set(host_versions) == {"recorder_machine.js", "room_client.js", "host_caption.js"}
 
         room = await assert_revalidates(client, "/r/class")
         assert room.headers["content-type"].startswith("text/html")
-        assert room.text == stamp_static_imports((STATIC / "room.html").read_text(encoding="utf-8"), STATIC)
+        expected = stored_text(STATIC / "room.html")
+        assert room.text == stamp_static_imports(expected, STATIC)
         room_versions = import_versions(room.text, STATIC)
         assert set(room_versions) == {"room_client.js"}
         assert room_versions["room_client.js"] == host_versions["room_client.js"]
@@ -126,7 +144,8 @@ async def test_module_imports_carry_a_content_version():
             assert len(suffix) == 8 and all(ch in "0123456789abcdef" for ch in suffix)
             url = f"/static/{name}?v={token}"
             served = await assert_revalidates(client, url)
-            assert served.text == (STATIC / name).read_text(encoding="utf-8")
+            expected = stored_text(STATIC / name)
+            assert served.text == expected
             ranged = await client.get(url, headers={"range": "bytes=0-9"})
             assert ranged.status_code == 206, url
             assert ranged.headers["cache-control"] == "no-cache", url
@@ -215,3 +234,97 @@ async def test_host_token_readiness_and_export_stay_no_store():
         )
         assert exported.status_code == 200, exported.text
         assert exported.headers["cache-control"] == "no-store"
+
+
+def test_static_import_target_rejects_nul_and_overlong_names(tmp_path):
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    (static_dir / "ok.js").write_bytes(b"export const ok = 1;\n")
+    nul_name = "a\x00.js"
+    long_name = "b" * 297 + ".js"
+    assert len(long_name) == 300
+    assert _static_import_target(nul_name, static_dir) is None
+    assert _static_import_target(long_name, static_dir) is None
+    found = _static_import_target("ok.js", static_dir)
+    assert found is not None and found.is_file()
+    source = (
+        'import "/static/' + nul_name + '";\n'
+        + 'import "/static/' + long_name + '";\n'
+        + 'import "/static/ok.js";\n'
+    )
+    stamped = stamp_static_imports(source, static_dir)
+    assert 'import "/static/' + nul_name + '";' in stamped
+    assert 'import "/static/' + long_name + '";' in stamped
+    assert 'import "/static/ok.js?v=' in stamped
+    assert stamped.count("?v=") == 1
+
+
+def test_app_version_rejects_backslash_and_script_markup(monkeypatch, tmp_path):
+    import app.server as server_mod
+
+    monkeypatch.setattr(server_mod, "ROOT", tmp_path)
+    version = tmp_path / "VERSION"
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    (static_dir / "room_client.js").write_bytes(b"export const x = 1;\n")
+    page = 'import "/static/room_client.js";\n'
+
+    version.write_bytes("1.0\\\n".encode("utf-8"))
+    assert app_version() == "0"
+    backslash = stamp_static_imports(page, static_dir)
+    assert "\\" not in backslash
+    assert "?v=0-" in backslash
+
+    version.write_bytes(b"</script><script>alert(1)</script>\n")
+    assert app_version() == "0"
+    script = stamp_static_imports(page, static_dir)
+    assert "</script>" not in script
+    assert "?v=0-" in script
+
+    version.write_bytes(b"1.2.3-rc.1+build\n")
+    assert app_version() == "1.2.3-rc.1+build"
+    assert "?v=1.2.3-rc.1+build-" in stamp_static_imports(page, static_dir)
+
+    version.write_bytes(b"a" * 33 + b"\n")
+    assert app_version() == "0"
+    version.write_bytes(b"a" * 32 + b"\n")
+    assert app_version() == "a" * 32
+
+    version.write_bytes(b"0.2.1\n")
+    assert app_version() == "0.2.1"
+
+
+@pytest.mark.anyio
+async def test_javascript_is_served_as_text_javascript(monkeypatch, tmp_path):
+    import app.server as server_mod
+
+    # A Windows registry often makes guess_type() return text/plain for .js.
+    monkeypatch.setattr(server_mod, "guess_type", lambda *_args, **_kwargs: ("text/plain", None))
+    monkeypatch.setattr(
+        "starlette.responses.guess_type",
+        lambda *_args, **_kwargs: ("text/plain", None),
+    )
+    copied = tmp_path / "static"
+    shutil.copytree(server_mod.STATIC, copied)
+    client_js = copied / "room_client.js"
+    client_js.write_bytes(b'import "/static/host_caption.js";\n' + client_js.read_bytes())
+    (copied / "extra.mjs").write_bytes(b'import "/static/host_caption.js";\nexport const extra = 1;\n')
+    monkeypatch.setattr(server_mod, "STATIC", copied)
+    app = make_app()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8780") as client:
+        plain = await client.get("/static/host_caption.js")
+        assert plain.status_code == 200
+        assert plain.headers["content-type"] == "text/javascript; charset=utf-8"
+        assert plain.headers["cache-control"] == "no-cache"
+        assert b"?v=" not in plain.content
+        for name in ("recorder_machine.js", "room_client.js", "extra.mjs"):
+            resp = await client.get(f"/static/{name}")
+            assert resp.status_code == 200, name
+            assert resp.headers["content-type"] == "text/javascript; charset=utf-8", name
+            assert resp.headers["cache-control"] == "no-cache", name
+        rewritten = await client.get("/static/room_client.js")
+        assert 'import "/static/host_caption.js?v=' in rewritten.text
+        module = await client.get("/static/extra.mjs")
+        assert 'import "/static/host_caption.js?v=' in module.text
+        assert module.headers["content-type"] == "text/javascript; charset=utf-8"
