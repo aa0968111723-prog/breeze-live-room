@@ -2,7 +2,7 @@
 // J5: 1000 captions × 2 versions stay ordered.
 
 import assert from "node:assert/strict";
-import { connectRoom, liveTail, orderedCaptions } from "../app/static/room_client.js";
+import { connectRoom, liveTail, orderedCaptions, retryCountdown } from "../app/static/room_client.js";
 
 function tick() {
   return new Promise((resolve) => setImmediate(resolve));
@@ -48,6 +48,11 @@ async function testKeepsRetryingPastEight() {
   assert.ok(states.some((detail) => detail && String(detail.text).includes("暫時連不上")), joined);
   assert.ok(states.some((detail) => detail && String(detail.subtitle).includes("下次自動重試")), joined);
   assert.ok(states.some((detail) => detail && String(detail.subtitle).includes("30 秒")), joined);
+  assert.equal(retryCountdown(45000, 0), "下次自動重試：45 秒");
+  assert.equal(retryCountdown(45000, 15000), "下次自動重試：30 秒");
+  assert.equal(retryCountdown(45000, 44000), "下次自動重試：1 秒");
+  assert.equal(retryCountdown(45000, 45000), "下次自動重試");
+  assert.equal(retryCountdown(45000, 46000), "下次自動重試");
   assert.equal(states.some((detail) => detail && String(detail.subtitle) === "再試一次"), false);
   assert.deepEqual(waits, [500, 1000, 2000, 4000, 8000, 30000, 30000, 30000, 30000, 30000]);
   assert.equal(waits[0], 500);

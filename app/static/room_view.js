@@ -47,6 +47,19 @@ export function gapCopy(reset) {
   return reset ? "已重新整理字幕" : "漏了一小段，已接回最新內容";
 }
 
+export const EXPIRY_NOTE = "較早的字幕已超過保存時間，已從畫面上拿掉";
+
+// A reopen replays captions_expired for rows this screen never showed.
+// The notice is only for a line that was actually up.
+export function expiryNotice(ids, displayed) {
+  const list = Array.isArray(ids) ? ids : [];
+  const has = displayed && typeof displayed.has === "function" ? (id) => displayed.has(id) : () => false;
+  for (const id of list) {
+    if (id && has(id)) return EXPIRY_NOTE;
+  }
+  return "";
+}
+
 // follow, or the reader is already near the bottom: keep the latest line in view.
 // Otherwise put the scroll offset back after a rebuild.
 export function historyStick(scrollTop, scrollHeight, clientHeight, follow) {

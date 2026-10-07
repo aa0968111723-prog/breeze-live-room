@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>禪譯聽眾</title>
 <style>
+[hidden] { display: none !important; }
 :root { --bg: #fbf6ee; --fg: #2a2118; --muted: #6b5644; --line: rgba(90, 60, 30, .2); --size: clamp(1.5rem, 7vw, 2.125rem); }
 html { background: var(--bg); }
 html.dark, html.project { background: #16130f; }
@@ -16,16 +17,18 @@ html.size-46, body.size-46 { --size: clamp(1.75rem, 8.5vw, 2.875rem); }
 html.size-64, body.size-64 { --size: clamp(2rem, 11vw, 4rem); }
 html.zh-only .en, body.zh-only .en, html.en-only .zh, body.en-only .zh { display: none; }
 html.zh-only .zh, body.zh-only .zh, html.en-only .en, body.en-only .en { font-size: var(--size); color: var(--fg); font-weight: 700; }
-html.project body, body.project { --project-scale: 1.8; }
-body.project .stage { flex-direction: row; flex-wrap: wrap; align-items: center; min-height: calc(100dvh - 72px); }
-body.project .stage-note { flex: 1 1 100%; }
+html.project body, body.project { --project-scale: 1.8; --project-vw: 7vw; --project-vh: 10vh; height: 100dvh; max-height: 100dvh; overflow: hidden; }
+html.project.size-28, body.project.size-28 { --project-vw: 5.5vw; --project-vh: 9vh; }
+html.project.size-64, body.project.size-64 { --project-vh: 13vh; }
+body.project .stage { flex: 1 1 auto; flex-direction: row; flex-wrap: wrap; align-items: flex-end; align-content: flex-end; justify-content: flex-start; min-height: 0; overflow: hidden; }
+body.project .stage-note { flex: 0 0 100%; }
 html.project .en, body.project .en, html.project .zh, body.project .zh { flex: 1 1 18rem; color: var(--fg); font-weight: 700; }
-html.project .en, body.project .en { font-size: max(var(--size), min(calc(var(--size)*1.8), 7vw, 10vh)); overflow-wrap: anywhere; min-width: 0; }
-html.project .zh, body.project .zh { font-size: max(var(--size), min(calc(var(--size)*1.8), 7vw, 10vh)); overflow-wrap: anywhere; min-width: 0; }
+html.project .en, body.project .en { font-size: max(var(--size), min(calc(var(--size) * var(--project-scale)), var(--project-vw), var(--project-vh))); overflow-wrap: anywhere; min-width: 0; }
+html.project .zh, body.project .zh { font-size: max(var(--size), min(calc(var(--size) * var(--project-scale)), var(--project-vw), var(--project-vh))); overflow-wrap: anywhere; min-width: 0; }
 body.project #history, body.project #hist-label { display: none; }
 #leave-project { display: none; }
 html.project #leave-project, body.project #leave-project { display: inline-block; }
-header { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; min-height: 44px; padding: calc(8px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) 8px calc(12px + env(safe-area-inset-left)); background: var(--bg); background: color-mix(in srgb, var(--bg) 92%, transparent); }
+header { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: nowrap; flex-shrink: 0; gap: 8px; align-items: center; min-height: 44px; padding: calc(8px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) 8px calc(12px + env(safe-area-inset-left)); background: var(--bg); background: color-mix(in srgb, var(--bg) 92%, transparent); }
 button, select { font-size: 16px; min-height: 44px; padding: 8px 12px; border-radius: 10px; border: 0; background: #8a5424; color: white; }
 html.dark button, html.dark select, html.project button, html.project select, body.dark button, body.dark select, body.project button, body.project select { background: #c9843f; color: #16130f; }
 button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px solid #c47a32; outline-offset: 2px; }
@@ -35,9 +38,9 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
   html.project #state, body.project #state { flex: 1 0 100%; min-width: 100%; overflow: visible; text-overflow: unset; white-space: normal; overflow-wrap: anywhere; }
 }
 #settings { margin-left: auto; flex: none; }
-.sub { margin: 0; padding: 0 16px 8px; color: var(--muted); font-size: 16px; }
-.banner { margin: 0; padding: 10px 16px; background: #8a5424; color: #fff; font-size: 16px; }
-#drawer { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px calc(16px + env(safe-area-inset-right)) 12px calc(16px + env(safe-area-inset-left)); }
+.sub { margin: 0; padding: 0 16px 8px; color: var(--muted); font-size: 16px; flex-shrink: 0; }
+.banner { margin: 0; padding: 10px 16px; background: #8a5424; color: #fff; font-size: 16px; flex-shrink: 0; }
+#drawer { display: flex; flex-wrap: wrap; flex-shrink: 0; gap: 8px; align-items: center; padding: 8px calc(16px + env(safe-area-inset-right)) 12px calc(16px + env(safe-area-inset-left)); }
 #drawer label { min-height: 44px; display: inline-flex; align-items: center; gap: 8px; }
 #drawer input[type="checkbox"] { width: 24px; height: 24px; margin: 0; }
 #wake-help { flex: 1 1 100%; margin: 0; color: var(--muted); font-size: 16px; }
@@ -108,8 +111,8 @@ li.gap { color: var(--muted); text-align: center; font-size: 14px; border-top-st
 <button id="live" type="button" hidden>回到最新</button>
 <div id="toast" role="status" aria-live="polite" hidden></div>
 <script type="module">
-import { audienceClientId, connectRoom, createCaptionView, liveTail, orderedCaptions } from "/static/room_client.js";
-import { GAP_TOAST_MS, HISTORY_DIVIDER, gapCopy, historyStick, stageMode, stageNoteFor } from "/static/room_view.js";
+import { audienceClientId, connectRoom, createCaptionView, liveTail, orderedCaptions, retryCountdown } from "/static/room_client.js";
+import { GAP_TOAST_MS, HISTORY_DIVIDER, expiryNotice, gapCopy, historyStick, stageMode, stageNoteFor } from "/static/room_view.js";
 import { appearance, focusAfterProjection, fullscreenAvailable, leaveProjection, readPrefs, refreshWakeLock, releaseWakeLock, safeStorage, themeIsDark, wakeLockSupported, writePrefs } from "/static/room_prefs.js";
 const room = location.pathname.split("/").filter(Boolean).pop();
 const listenKey = new URLSearchParams(location.search).get("k") || "";
@@ -248,7 +251,16 @@ function showToast(text) {
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { toast.hidden = true; }, GAP_TOAST_MS);
 }
-let conn = connect();
+let connDetail = null;
+function paintSubtitle(now) {
+  const sub = document.querySelector("#sub");
+  if (!sub || !connDetail) return;
+  if (connDetail.kind === "unreachable" && connDetail.nextRetryAt) {
+    sub.textContent = retryCountdown(connDetail.nextRetryAt, now || Date.now());
+    return;
+  }
+  sub.textContent = connDetail.subtitle || "";
+}
 function connect() {
   return connectRoom({
     room,
@@ -261,11 +273,10 @@ function connect() {
     },
     onState: (detail) => {
       const text = detail && typeof detail === "object" ? (detail.text || "") : String(detail || "");
-      const subtitle = detail && typeof detail === "object" ? (detail.subtitle || "") : "";
       kind = detail && typeof detail === "object" ? (detail.kind || "") : "";
+      connDetail = detail && typeof detail === "object" ? detail : { text, subtitle: "", kind };
       document.querySelector("#state").textContent = text;
-      const sub = document.querySelector("#sub");
-      if (sub) sub.textContent = subtitle;
+      paintSubtitle();
       const offline = document.querySelector("#offline");
       if (offline) offline.hidden = kind !== "device_offline";
       const retry = document.querySelector("#retry");
@@ -280,11 +291,13 @@ function connect() {
     },
     onEvent: (item) => { lastCaptionAt = Date.now(); show(item); },
     onDelete: show,
-    onExpire: () => {
+    onExpire: (data) => {
       const note = document.querySelector("#expiry");
       if (!note) return;
+      const text = expiryNotice(data && data.ids, items);
+      if (!text) return;
       note.hidden = false;
-      note.textContent = "較早的字幕已超過保存時間，已從畫面上拿掉";
+      note.textContent = text;
     },
     onClear: (data) => { view.apply(data && data.type ? data : { type: "captions_cleared" }); render(); },
     onBackfill: (rows) => { view.replace(rows); lastCaptionAt = Date.now(); render(); },
@@ -312,6 +325,7 @@ function connect() {
     },
   });
 }
+let conn = connect();
 document.querySelector("#retry").onclick = () => { conn.restart(); };
 document.querySelector("#settings").onclick = () => {
   const drawer = document.querySelector("#drawer");
@@ -375,7 +389,7 @@ if (window.matchMedia) {
   if (scheme.addEventListener) scheme.addEventListener("change", onScheme);
   else if (scheme.addListener) scheme.addListener(onScheme);
 }
-setInterval(paintChrome, 1000);
+setInterval(() => { paintChrome(); paintSubtitle(); }, 1000);
 paintChrome();
 syncWake("visible");
 </script>

@@ -157,14 +157,18 @@ function stateText(kind, attempt) {
   }
 }
 
-function retrySubtitle(more, now) {
-  const at = Number(more && more.nextRetryAt) || 0;
+export function retryCountdown(nextRetryAt, now) {
+  const at = Number(nextRetryAt) || 0;
   const current = Number(now) || 0;
   if (at > current) {
     const sec = Math.max(1, Math.ceil((at - current) / 1000));
     return "下次自動重試：" + sec + " 秒";
   }
   return "下次自動重試";
+}
+
+function retrySubtitle(more, now) {
+  return retryCountdown(more && more.nextRetryAt, now);
 }
 
 function stateSubtitle(kind, more, now) {

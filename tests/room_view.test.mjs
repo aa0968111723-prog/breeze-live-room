@@ -3,7 +3,9 @@ import {
   CAPTION_IDLE_MS,
   GAP_TOAST_MS,
   HISTORY_DIVIDER,
+  EXPIRY_NOTE,
   contrast,
+  expiryNotice,
   gapCopy,
   historyStick,
   stageMode,
@@ -36,6 +38,13 @@ assert.equal(stageNoteFor("live", "empty", false), "等待主持人開始");
 assert.equal(stageNoteFor("ended", "ended", false), "這堂課已結束");
 assert.equal(gapCopy(false), "漏了一小段，已接回最新內容");
 assert.equal(gapCopy(true), "已重新整理字幕");
+const onScreen = new Map([["class:s2:1", { id: "class:s2:1", zh: "甲" }]]);
+assert.equal(expiryNotice(["class:s2:1"], onScreen), EXPIRY_NOTE);
+assert.equal(expiryNotice(["class:s2:2", "class:s2:1"], onScreen), EXPIRY_NOTE);
+assert.equal(expiryNotice(["class:s1:1"], onScreen), "");
+assert.equal(expiryNotice(["class:s1:1"], new Map()), "");
+assert.equal(expiryNotice([], onScreen), "");
+assert.equal(expiryNotice(null, onScreen), "");
 assert.deepEqual(historyStick(0, 400, 100, true), { stick: true, restore: 0 });
 assert.equal(historyStick(10, 400, 100, false).stick, false);
 assert.equal(historyStick(260, 400, 100, false).stick, true);
