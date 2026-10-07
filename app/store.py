@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import threading
@@ -8,6 +9,45 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 log = logging.getLogger("breeze.store")
+
+
+def _flags_text(value) -> str | None:
+    if not isinstance(value, list) or not value:
+        return None
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _caption_dict(row) -> dict:
+    item = dict(row)
+    raw = item.pop("term_flags", None)
+    if not raw:
+        return item
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return item
+    if isinstance(parsed, list) and parsed:
+        item["term_flags"] = parsed
+    return item
+
+
+def _glossary_row(row) -> dict | None:
+    if not row:
+        return None
+    room_id, version, payload, updated_at = row[0], row[1], row[2], row[3]
+    try:
+        terms = json.loads(payload or "[]")
+    except json.JSONDecodeError:
+        log.warning("room glossary for %s was unreadable", room_id)
+        return None
+    if not isinstance(terms, list):
+        return None
+    try:
+        version_n = int(version or 0)
+        stamp = float(updated_at or 0)
+    except (TypeError, ValueError):
+        return None
+    return {"room_id": str(room_id or ""), "version": version_n, "terms": terms, "updated_at": stamp}
 
 
 class CaptionStore:
@@ -145,8 +185,21 @@ class CaptionStore:
         columns = {row[1] for row in conn.execute("pragma table_info(captions)")}
         if "session_ord" not in columns:
             conn.execute("alter table captions add column session_ord integer")
+        if "term_flags" not in columns:
+            conn.execute("alter table captions add column term_flags text")
         conn.execute("create index if not exists captions_room_session_seq on captions (room_id, session_id, seq)")
         conn.execute("create index if not exists captions_updated_at on captions (updated_at)")
+        # Per-room glossary. Not deleted by the caption TTL. Room reset deletes the row.
+        conn.execute(
+            """
+            create table if not exists room_glossary (
+                room_id text primary key,
+                version integer not null,
+                terms_json text not null,
+                updated_at real not null
+            )
+            """
+        )
         # Captions stay for host export. This marks the close, so the next open's replay can skip them.
         conn.execute(
             """
@@ -189,9 +242,9 @@ class CaptionStore:
                 """
                 insert into captions (
                     id, room_id, session_id, seq, version, zh, zh_raw, en, status,
-                    t0_ms, t1_ms, updated_at, session_ord
+                    t0_ms, t1_ms, updated_at, session_ord, term_flags
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(id) do update set
                     version=excluded.version,
                     zh=excluded.zh,
@@ -201,14 +254,15 @@ class CaptionStore:
                     t0_ms=excluded.t0_ms,
                     t1_ms=excluded.t1_ms,
                     updated_at=excluded.updated_at,
-                    session_ord=coalesce(excluded.session_ord, captions.session_ord)
+                    session_ord=coalesce(excluded.session_ord, captions.session_ord),
+                    term_flags=excluded.term_flags
                 where excluded.version >= captions.version
                 """,
                 (
                     event.get("id"), event.get("room_id"), event.get("session_id"), int(event.get("seq") or 0),
                     int(event.get("version") or 1), event.get("zh") or "", event.get("zh_raw") or "",
                     event.get("en") or "", event.get("status") or "", event.get("t0_ms"), event.get("t1_ms"),
-                    time.time(), event.get("session_ord"),
+                    time.time(), event.get("session_ord"), _flags_text(event.get("term_flags")),
                 ),
             )
 
@@ -254,6 +308,8 @@ class CaptionStore:
             return 0
         with conn:
             cur = conn.execute("delete from captions where room_id = ?", (room_id,))
+            # Whole-room caption delete is the room reset. The glossary is not on the caption TTL.
+            conn.execute("delete from room_glossary where room_id = ?", (room_id,))
             return int(cur.rowcount or 0)
 
     def delete_id(self, room_id: str, seg_id: str) -> int:
@@ -286,6 +342,7 @@ class CaptionStore:
             return 0
         cutoff = time.time() - ttl_s
         with conn:
+            # room_glossary stays until the host resets or deletes the room.
             cur = conn.execute("delete from captions where updated_at < ?", (cutoff,))
             return int(cur.rowcount or 0)
 
@@ -358,14 +415,15 @@ class CaptionStore:
                 )
                 select captions.id, captions.room_id, captions.session_id, captions.seq,
                        captions.version, captions.zh, captions.zh_raw, captions.en, captions.status,
-                       captions.t0_ms, captions.t1_ms, captions.updated_at, sessions.session_ord
+                       captions.t0_ms, captions.t1_ms, captions.updated_at, sessions.session_ord,
+                       captions.term_flags
                 from captions join sessions on captions.session_id = sessions.session_id
                 where captions.room_id = ?
                 order by sessions.session_ord, captions.seq
                 """,
                 (room_id, room_id),
             ).fetchall()
-            return [dict(row) for row in rows]
+            return [_caption_dict(row) for row in rows]
         finally:
             conn.row_factory = None
 
@@ -413,6 +471,86 @@ class CaptionStore:
             return float(row[0])
         except (TypeError, ValueError):
             return None
+
+    def save_glossary(self, room_id: str, version: int, terms: list, updated_at: float) -> None:
+        if not self.enabled:
+            return
+        payload = json.dumps(list(terms or []), ensure_ascii=False, separators=(",", ":"))
+        if self._on_writer():
+            self._write_glossary(room_id, int(version), payload, float(updated_at))
+            return
+        self._submit(self._write_glossary, room_id, int(version), payload, float(updated_at)).result()
+
+    def _write_glossary(self, room_id: str, version: int, payload: str, updated_at: float) -> None:
+        conn = self._conn
+        if conn is None:
+            return
+        with conn:
+            conn.execute(
+                """
+                insert into room_glossary (room_id, version, terms_json, updated_at)
+                values (?, ?, ?, ?)
+                on conflict(room_id) do update set
+                    version=excluded.version,
+                    terms_json=excluded.terms_json,
+                    updated_at=excluded.updated_at
+                """,
+                (room_id, int(version), payload, float(updated_at)),
+            )
+
+    def delete_glossary(self, room_id: str) -> None:
+        if not self.enabled:
+            return
+        if self._on_writer():
+            self._delete_glossary_now(room_id)
+            return
+        self._submit(self._delete_glossary_now, room_id).result()
+
+    def _delete_glossary_now(self, room_id: str) -> None:
+        conn = self._conn
+        if conn is None:
+            return
+        with conn:
+            conn.execute("delete from room_glossary where room_id = ?", (room_id,))
+
+    def get_glossary(self, room_id: str) -> dict | None:
+        if not self.enabled:
+            return None
+        if self._on_writer():
+            return self._get_glossary_now(room_id)
+        return self._submit(self._get_glossary_now, room_id).result()
+
+    def _get_glossary_now(self, room_id: str) -> dict | None:
+        conn = self._conn
+        if conn is None:
+            return None
+        row = conn.execute(
+            "select room_id, version, terms_json, updated_at from room_glossary where room_id = ?",
+            (room_id,),
+        ).fetchone()
+        return _glossary_row(row)
+
+    def load_glossaries(self) -> list[dict]:
+        if not self.enabled:
+            return []
+        if self._on_writer():
+            return self._load_glossaries_now()
+        rows = self._submit(self._load_glossaries_now).result()
+        return rows or []
+
+    def _load_glossaries_now(self) -> list[dict]:
+        conn = self._conn
+        if conn is None:
+            return []
+        found = conn.execute(
+            "select room_id, version, terms_json, updated_at from room_glossary"
+        ).fetchall()
+        rows = []
+        for row in found:
+            parsed = _glossary_row(row)
+            if parsed is not None:
+                rows.append(parsed)
+        return rows
 
     def flush(self) -> None:
         if not self.enabled or self._pool is None or self._closed:
