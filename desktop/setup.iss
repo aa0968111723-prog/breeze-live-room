@@ -107,9 +107,21 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
   Bootstrapper: String;
+  VcInstaller: String;
 begin
   if CurStep <> ssPostInstall then Exit;
   Bootstrapper := ExpandConstant('{app}\desktop\WebView2Bootstrapper.exe');
-  if (not WebView2Present) and FileExists(Bootstrapper) then
-    Exec(Bootstrapper, '/silent /install', '', SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
+  if not WebView2Present then begin
+    if (not FileExists(Bootstrapper)) or (not Exec(Bootstrapper, '/silent /install', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)) then
+      RaiseException('Microsoft WebView2 安裝未完成，請重新執行安裝程式。');
+    if (ResultCode <> 0) and (ResultCode <> 3010) then
+      RaiseException('Microsoft WebView2 安裝失敗，請確認網路後重新安裝。');
+  end;
+  VcInstaller := ExpandConstant('{app}\desktop\vc_redist.x64.exe');
+  if not FileExists(ExpandConstant('{sys}\msvcp140.dll')) then begin
+    if (not FileExists(VcInstaller)) or (not Exec(VcInstaller, '/install /quiet /norestart', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)) then
+      RaiseException('Microsoft Visual C++ 安裝未完成，請重新執行安裝程式。');
+    if (ResultCode <> 0) and (ResultCode <> 3010) and (ResultCode <> 1638) then
+      RaiseException('Microsoft Visual C++ 安裝失敗；可能需要管理員協助。');
+  end;
 end;

@@ -3,14 +3,6 @@
     [string]$DesktopPath
 )
 $ErrorActionPreference = 'Stop'
-# Windows PowerShell's C# compiler cannot start reliably when its TEMP path
-# contains non-ANSI characters. The project itself can still use Unicode.
-if ($env:TEMP -match '[^\x00-\x7F]') {
-    $compileTemp = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Temp'
-    New-Item -ItemType Directory -Force $compileTemp | Out-Null
-    $env:TEMP = $compileTemp
-    $env:TMP = $compileTemp
-}
 # Use the Unicode Shell Link interface. WScript.Shell loses characters on an
 # English Windows installation when a target contains a Chinese directory.
 

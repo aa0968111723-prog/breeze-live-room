@@ -35,15 +35,19 @@ class GuardedRedirect(urllib.request.HTTPRedirectHandler):
 def assert_https(url: str) -> None:
     if not str(url).startswith("https://"):
         raise ValueError("更新位址必須是 HTTPS")
-    host = urlsplit(url).hostname
+    parts = urlsplit(url)
+    if parts.username is not None or parts.password is not None or parts.port not in (None, 443):
+        raise ValueError("更新位址含有不允許的帳號或連接埠")
+    host = parts.hostname
     if host not in ALLOWED_HOSTS:
         raise ValueError("更新位址不在允許的範圍")
 
 
 def parse_version(value: str) -> tuple[int, int, int]:
-    text = str(value).strip().lstrip("v")
-    if not re.fullmatch(r"\d+\.\d+\.\d+", text):
+    text = str(value).strip()
+    if not re.fullmatch(r"v?\d+\.\d+\.\d+", text):
         raise ValueError("版本資訊無效")
+    text = text.removeprefix('v')
     return tuple(int(part) for part in text.split("."))
 
 
@@ -75,6 +79,10 @@ def plan(release: dict, current: str) -> dict:
     setup, digest = assets[SETUP_NAME], assets[SHA_NAME]
     assert_https(setup.get("browser_download_url") or "")
     assert_https(digest.get("browser_download_url") or "")
+    prefix = f'https://github.com/{REPOSITORY}/releases/download/{tag}/'
+    for item in (setup, digest):
+        if item['browser_download_url'] != prefix + item['name']:
+            raise ValueError('更新檔不屬於此專案的正式版本')
     size = int(setup.get("size") or 0)
     if size <= 0 or size > MAX_BYTES:
         raise ValueError("安裝檔大小異常")
@@ -142,7 +150,7 @@ def download_update(chosen: dict) -> dict:
         return {key: chosen[key] for key in ("status", "version", "message") if key in chosen}
     sidecar = fetch_text(chosen["sha_url"])
     digest = parse_sha256_sidecar(sidecar)
-    destination = Path(tempfile.gettempdir()) / SETUP_NAME
+    destination = Path(tempfile.mkdtemp(prefix='BreezeUpdate-')) / SETUP_NAME
     stream_verified(chosen["setup_url"], destination, digest, limit=int(chosen["bytes"]))
     return {"status": "ready", "version": chosen["version"], "path": str(destination), "sha256": digest}
 

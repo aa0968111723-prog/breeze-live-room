@@ -63,6 +63,14 @@ def test_plan_rejects_non_https_and_foreign_hosts():
         assert_https("https://example.com/file")
 
 
+def test_update_cannot_use_another_repository_or_release_tag():
+    for replacement in ('another-owner/another-repo/releases/download/v0.4.0', 'aa0968111723-prog/breeze-live-room/releases/download/v9.9.9'):
+        bad = release()
+        bad['assets'][0]['browser_download_url'] = 'https://github.com/' + replacement + '/' + SETUP_NAME
+        with pytest.raises(ValueError):
+            plan(bad, '0.3.0')
+
+
 def test_sidecar_binds_the_installer_name():
     digest = "a" * 64
     assert parse_sha256_sidecar(digest + "  " + SETUP_NAME) == digest

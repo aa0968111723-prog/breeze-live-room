@@ -16,7 +16,7 @@
 2. 套件改動須同步 `requirements.txt` 與 `requirements-lock.txt`，在 Windows/Linux、Python 3.11/3.12 執行回歸。鎖檔包含間接依賴；勿只更動頂層版本。
 3. 模型或原生工具改動，更新 `runtime-manifest.json` 的固定 URL、版本、大小與 SHA256。確認 CPU 相容性、授權及中文辨識品質。
 4. Python 更新須檢查官方 Windows 支援和安全維護狀態，更新 `bootstrap-manifest.json` 的版本與 SHA256、安裝器版本檢查、CI；並在已安裝舊版的電腦驗證升級。涉及 Python 大版本的更新，先重新執行新安裝包的 `install.bat` 準備新 runtime。
-5. 將通過驗證的提交標記 `v<版本>` 並 push。`Windows release` workflow 先跑回歸、全新一鍵安裝及兩次真實推論，成功才自動建立 GitHub Release，附 ZIP 和 SHA256。
+5. 將通過驗證的提交標記 `v<版本>` 並 push。`Windows release` workflow 先跑回歸、全新原始碼安裝及兩次真實推論，再編譯離線 Setup.exe，檢查 App 視窗啟動／關閉、重複安裝保留設定與字幕。成功才建立 GitHub Release，附 Setup.exe、原始碼 ZIP 與各自的 SHA256。
 6. `workflow_dispatch` 可驗證並產生 Actions 安裝包，但不會發布正式 Release。Workflow 失敗不會刊出正式安裝包。
 
 Dependabot 每週提出 Python 依賴更新，每月檢查 Actions；仍需維護者審查、更新鎖檔與實機驗收後發布。Python/模型/ffmpeg 的更新不會由 Dependabot 自動完成。不能把自動化設定視為永遠不需人維護。

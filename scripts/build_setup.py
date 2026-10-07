@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,11 +51,27 @@ def stage_bootstrapper(payload: Path) -> None:
     cache = ROOT / ".downloads" / "WebView2Bootstrapper.exe"
     sibling = ROOT.parent / "cache" / "WebView2Bootstrapper.exe"
     source = cache if cache.is_file() else sibling
-    if not source.is_file() or source.stat().st_size != spec["size"] or sha256(source) != spec["sha256"]:
+    if not source.is_file():
+        cache.parent.mkdir(exist_ok=True)
+        with urllib.request.urlopen(spec['url'], timeout=60) as incoming, cache.open('wb') as outgoing:
+            shutil.copyfileobj(incoming, outgoing)
+        source = cache
+    if source.stat().st_size != spec["size"] or sha256(source) != spec["sha256"]:
         raise RuntimeError("WebView2 bootstrapper is missing or failed checksum")
     destination = payload / "desktop" / "WebView2Bootstrapper.exe"
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
+
+
+def stage_vc_runtime(payload: Path) -> None:
+    spec = json.loads((ROOT / 'desktop/desktop-manifest.json').read_text())['vc_runtime']
+    cached = ROOT / '.downloads/vc_redist.x64.exe'
+    if not cached.is_file():
+        with urllib.request.urlopen(spec['url'], timeout=60) as incoming, cached.open('wb') as outgoing:
+            shutil.copyfileobj(incoming, outgoing)
+    if sha256(cached) != spec['sha256']:
+        raise RuntimeError('Microsoft runtime checksum mismatch')
+    shutil.copy2(cached, payload / 'desktop/vc_redist.x64.exe')
 
 
 def clean_user_paths(payload: Path) -> None:
@@ -71,8 +88,11 @@ def clean_user_paths(payload: Path) -> None:
 def build(payload: Path, output: Path, assets: Path, sdk: Path | None) -> Path:
     os.environ.pop("SSLKEYLOGFILE", None)
     stage_python_cache()
+    if payload == ROOT or payload == assets or ROOT.is_relative_to(payload) or assets.is_relative_to(payload):
+        raise ValueError('Payload must be a dedicated build directory, separate from source and user installation')
     prepare(payload, assets, sdk)
     stage_bootstrapper(payload)
+    stage_vc_runtime(payload)
     clean_user_paths(payload)
     python = next((payload / ".python").glob("*/tools/python.exe"))
     probe = subprocess.run([str(python), "-c", "import fastapi, uvicorn, pywhispercpp, numpy"], cwd=payload)
