@@ -534,9 +534,14 @@ def test_replay_hello_keeps_newest_captions_inside_100kib():
     }
     before = _json_bytes(hello)
     assert before > 100 * 1024
+    backfill_before = len(hello["backfill"])
     _cap_replay_hello(hello)
     wire = _json_bytes(hello)
     assert wire <= 100 * 1024
+    assert len(hello["backfill"]) >= backfill_before - 1
+    backfill_ids = {item.get("id") for item in hello["backfill"] if isinstance(item, dict) and item.get("id")}
+    history_ids = {item.get("id") for item in hello["history"] if isinstance(item, dict) and item.get("id")}
+    assert backfill_ids.isdisjoint(history_ids)
     assert hello["backfill"][-1]["id"] == "class:s:220"
     assert hello["backfill"][-1]["zh"] == zh
     assert all(item.get("id") != "class:s:1" for item in hello["backfill"])
@@ -610,6 +615,8 @@ async def test_default_cap_rejects_181st_cid_and_bounds_the_replay_hello():
             ip = "203.0.113.181"
             full = 0
             wires = []
+            # Same rows the socket trims into backfill, before the hello cut.
+            pre_cut = _trim_audience_rows(bus.caption_state("class"))
             for index in range(cap + 1):
                 headers = _spoofed(index) if index in {0, cap} else None
                 messages = await drive(
@@ -629,6 +636,10 @@ async def test_default_cap_rejects_181st_cid_and_bounds_the_replay_hello():
                     assert hello["backfill"][-1]["id"] == "class:s:220"
                     assert hello["backfill"][-1]["zh"] == zh
                     assert all(item.get("id") != "class:s:1" for item in hello["backfill"])
+                    assert len(hello["backfill"]) >= len(pre_cut) - 1
+                    backfill_ids = {item.get("id") for item in hello["backfill"] if isinstance(item, dict) and item.get("id")}
+                    history_ids = {item.get("id") for item in hello.get("history") or [] if isinstance(item, dict) and item.get("id")}
+                    assert backfill_ids.isdisjoint(history_ids)
                     full += 1
                 else:
                     assert hello.get("backfill_deferred") is True
