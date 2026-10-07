@@ -95,7 +95,8 @@ def sim_settings(**over) -> Settings:
         gap_wait_s=3 * SCALE,
         heartbeat_s=0.05,
         idle_timeout_s=5,
-        stop_flush_s=2 * SCALE,
+        # Spec stop flush is 8s. Scaled, and last_seq still returns once audio has settled.
+        stop_flush_s=8 * SCALE,
         shutdown_flush_s=0.2,
     )
     base.update(over)
@@ -461,11 +462,11 @@ class VirtualHost:
             start_ms = self.clock_ms
             real = time.monotonic()
             await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
-            # Sub-millisecond wakeups are the done-callback, not a recorder pause.
-            # A real pause is the ASR overrun (seconds). Ignore under 1 virtual second
-            # so loop noise cannot stretch a 1000-segment SRT.
+            # Book every real pause, including those under one virtual second.
+            # An immediate return (a free slot) never reaches this wait.
+            # Round-to-zero is the scheduler, not a pause the clock can see.
             spent_ms = int(round((time.monotonic() - real) / self.scale * 1000))
-            if spent_ms >= 1000:
+            if spent_ms > 0:
                 self.clock_ms += spent_ms
                 self.waiting.append((start_ms / 1000, self.clock_ms / 1000))
 
@@ -711,7 +712,7 @@ def _class_plan(zh: str):
     return ("ok", 2.0)
 
 
-async def _run_100min_async() -> SimReport:
+async def _run_100min_async(*, trace: bool) -> SimReport:
     room = "class"
     session = "sim100"
     root = Path(tempfile.mkdtemp(prefix="breeze-sim-"))
@@ -750,9 +751,12 @@ async def _run_100min_async() -> SimReport:
         return orig_admit()
 
     pipe.try_admit_count = storm_admit
-    tracing = tracemalloc.is_tracing()
-    if not tracing:
+    # tracemalloc walks the whole process. On a 100-minute class that walk is
+    # the stall, so the latency run leaves it off. The memory run opts in.
+    started_trace = False
+    if trace and not tracemalloc.is_tracing():
         tracemalloc.start()
+        started_trace = True
     # Host, server and both listeners share one process here, and every real
     # millisecond is 1/SCALE virtual milliseconds. A full GC pass is a 30-90 ms
     # stop-the-world pause on a runner (measured on 3.11), which the recorder model
@@ -888,7 +892,7 @@ async def _run_100min_async() -> SimReport:
         for listener in listeners:
             await listener.close()
         await stop(app)
-        if not tracing and tracemalloc.is_tracing():
+        if started_trace and tracemalloc.is_tracing():
             tracemalloc.stop()
         if gc_was_enabled:
             gc.enable()
@@ -909,13 +913,17 @@ async def _snapshot(app, client, token, seq: int, snapshots: list[dict]) -> None
     snapshots.append(data)
 
 
-def run_100min() -> SimReport:
-    """One paced 100-minute class per process. Shared by backlog, SRT, and limit tests."""
-    key = (SEGMENTS, SCALE, "100min-v2")
+def run_100min(*, trace: bool = False) -> SimReport:
+    """One paced 100-minute class per process. Latency callers leave tracing off.
+
+    trace=True is the memory run: same scale and the same class, plus a heap
+    snapshot. It is not the report latency tests read.
+    """
+    key = (SEGMENTS, SCALE, "100min-v3", bool(trace))
     cached = _RUN_CACHE.get(key)
     if cached is not None:
         return cached
-    report = asyncio.run(_run_100min_async())
+    report = asyncio.run(_run_100min_async(trace=bool(trace)))
     _RUN_CACHE[key] = report
     return report
 
