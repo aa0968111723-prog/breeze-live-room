@@ -579,3 +579,35 @@ async def test_truncated_push_keeps_chinese(tmp_path):
         await stop(app)
 
 
+@pytest.mark.anyio
+async def test_legacy_post_rejects_a_bad_line_without_saving_the_rest():
+    app = app_for(settings=_settings(), translator=Translator(enabled=False))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8780") as client:
+            token = await token_of(app, client)
+            saved = await _put(client, token, "class", [_term("般若", en="prajna")], 0)
+            assert saved.status_code == 200, saved.text
+            cases = (
+                "空性=emptiness\n法鼓山：Dharma Drum Mountain",
+                "空性=emptiness\n法鼓山 Dharma Drum Mountain",
+                "空性=emptiness\n法鼓山=",
+                "空性=emptiness\n=Dharma Drum",
+            )
+            for text in cases:
+                posted = await _post(client, token, "class", text)
+                assert posted.status_code == 400, (text, posted.text)
+                assert posted.json()["count"] == 0
+                reasons = " ".join(item["reason"] for item in posted.json()["rejected"])
+                assert "缺少" in reasons or "空的" in reasons, (text, posted.text)
+                view = (await _get(client, token, "class")).json()
+                assert view["version"] == 1, text
+                assert [item["zh"] for item in view["terms"]] == ["般若"]
+            comments = await _post(client, token, "class", "般若=prajna\n\n# 註解\n")
+            assert comments.status_code == 200, comments.text
+            assert comments.json()["count"] == 1
+            kept = (await _get(client, token, "class")).json()
+            assert [item["zh"] for item in kept["terms"]] == ["般若"]
+    finally:
+        await stop(app)
+
+

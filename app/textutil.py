@@ -140,8 +140,10 @@ _LEGACY_BREAKS = ("\x85", "\u2028", "\u2029")
 def strict_legacy_rows(raw: str, limit: int = 40, max_en: int = 80) -> tuple[list[dict], list[dict]]:
     """Parse a host textarea without dropping rows or cutting English short.
 
-    Any rejected entry means the caller must not save. An empty box is rejected
-    so it cannot clear the room. `parse_glossary` still truncates for old callers.
+    A non-blank line that is not `zh=en` is rejected. Any rejected entry means the
+    caller must not save. Blank lines and `#` comments are ignored. An empty box
+    is rejected so it cannot clear the room. `parse_glossary` still truncates for
+    old callers.
     """
     if not isinstance(raw, str):
         return [], [{"line": 0, "reason": "text 必須是文字"}]
@@ -156,6 +158,7 @@ def strict_legacy_rows(raw: str, limit: int = 40, max_en: int = 80) -> tuple[lis
             continue
         split = _split_glossary(text)
         if split is None:
+            rejected.append({"line": line_no, "reason": "缺少 = 或 ＝"})
             continue
         left, right = split
         en = right.strip()
@@ -167,6 +170,7 @@ def strict_legacy_rows(raw: str, limit: int = 40, max_en: int = 80) -> tuple[lis
             zh = left.strip()
             aliases = []
         if not zh or not en:
+            rejected.append({"line": line_no, "reason": "中文或英文是空的"})
             continue
         if len(rows) >= limit:
             return [], [{"line": line_no, "reason": f"術語超過 {limit} 條"}]
