@@ -194,7 +194,7 @@ async function recoverAuth() {
     const headers = { authorization: "Bearer " + token, "content-type": "application/json" };
     const opened = await fetch("/api/rooms/open", { method: "POST", headers, body: JSON.stringify({ room_id: room }) });
     if (opened.ok) rememberRoom(await opened.json());
-    await fetch("/api/glossary", { method: "POST", headers, body: JSON.stringify({ room_id: room, session_id: sessionId, text: document.querySelector("#glossary").value }) });
+    await postGlossary(room, sessionId, headers);
     listenCaptions(room, true);
   })();
   try {
@@ -202,6 +202,20 @@ async function recoverAuth() {
   } finally {
     authJob = null;
   }
+}
+function glossaryText() {
+  const box = document.querySelector("#glossary");
+  return box ? box.value : "";
+}
+async function postGlossary(room, sessionId, headers) {
+  const text = glossaryText();
+  // An empty box is the page default. Do not replace a glossary already saved for this room.
+  if (!String(text || "").trim()) return null;
+  const payload = JSON.stringify({ room_id: room, session_id: sessionId, text });
+  if (headers) {
+    return fetch("/api/glossary", { method: "POST", headers, body: payload });
+  }
+  return hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: payload });
 }
 async function hostFetch(url, options) {
   const build = () => {
@@ -420,12 +434,12 @@ go.onclick = async () => {
     const opened = await hostFetch("/api/rooms/open", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: room }) });
     if (opened.ok) rememberRoom(await opened.json());
     listenCaptions(room, true);
-    await hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: room, session_id: "pending", text: document.querySelector("#glossary").value }) });
+    await postGlossary(room, "pending");
     await ctl.start();
     const activeRoom = ctl.session ? ctl.session.roomId : room;
     await hostFetch("/api/session/active", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: activeRoom, active: true }) });
     if (ctl.session) {
-      await hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: ctl.session.roomId, session_id: ctl.session.id, text: document.querySelector("#glossary").value }) });
+      await postGlossary(ctl.session.roomId, ctl.session.id);
     }
     line("開始聽了。每一段都是完整錄音。");
   } catch (err) {
@@ -473,9 +487,13 @@ document.querySelector("#try").onclick = async () => {
   }
 };
 document.querySelector("#save-terms").onclick = async () => {
-  if (!token || !ctl.session) { line("開始聽之後才會把術語套到這一場。"); return; }
-  await hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: ctl.session.roomId, session_id: ctl.session.id, text: document.querySelector("#glossary").value }) });
-  line("已儲存這一場的術語。");
+  if (!token || !ctl.session) { line("開始聽之後才會把術語存到這個房間。"); return; }
+  if (!String(glossaryText() || "").trim()) {
+    line("術語是空的，沒有覆蓋這個房間已儲存的詞表。");
+    return;
+  }
+  await postGlossary(ctl.session.roomId, ctl.session.id);
+  line("已儲存這個房間的術語。");
 };
 document.querySelector("#skip").onclick = async () => {
   if (!token || !ctl.session) {

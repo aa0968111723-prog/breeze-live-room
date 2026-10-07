@@ -24,6 +24,7 @@ from app.asr import CliAsr, ResidentAsr
 from app.audio import AudioError, convert_to_wav, ffmpeg_bin, wav_duration_seconds
 from app.auth import audience_origin_allowed, new_host_token, require_host, require_local_host, same_secret
 from app.dispatch import ListenerSlot, RoomBus, for_listener
+from app.glossary import GLOSSARY_MAX_BODY, SCHEMA_VERSION, legacy_terms, validate_terms
 from app.pipeline import Pipeline, PipelineError, Segment
 from app.rooms import RoomBook, RoomIdError, validate_room_id, validate_session_id
 from app.settings import Settings, fill_process_environ
@@ -935,6 +936,18 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         # Replaying starts here, before the first request is served.
         if store.enabled:
             try:
+                glossaries = await asyncio.to_thread(store.load_glossaries)
+            except Exception:
+                logging.getLogger("breeze.server").exception("glossary load failed")
+                glossaries = []
+            for row in glossaries:
+                loaded_room = str(row.get("room_id") or "")
+                try:
+                    validate_room_id(loaded_room)
+                except RoomIdError:
+                    continue
+                pipeline.install_room_glossary(row)
+            try:
                 room_ids = await asyncio.to_thread(store.room_ids)
             except Exception:
                 logging.getLogger("breeze.server").exception("caption room list failed")
@@ -1182,14 +1195,110 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
         return {"ok": segment.status != "error", **segment.public()}
 
+    def _glossary_body(view: dict, *, accepted=None, rejected=None) -> dict:
+        payload = {
+            "ok": True,
+            "schema_version": SCHEMA_VERSION,
+            "room_id": view["room_id"],
+            "version": int(view["version"]),
+            "updated_at": view["updated_at"],
+            "terms": view["terms"],
+        }
+        if accepted is not None:
+            payload["accepted"] = accepted
+        if rejected is not None:
+            payload["rejected"] = rejected
+        return payload
+
+    async def _save_room_glossary(room_id: str, terms: list) -> dict:
+        previous = pipeline.export_room_glossary(room_id)
+        record = pipeline.replace_room_glossary(room_id, terms)
+        if store.enabled:
+            try:
+                await asyncio.to_thread(
+                    store.save_glossary,
+                    room_id,
+                    int(record["version"]),
+                    record["terms"],
+                    float(record["updated_at"]),
+                )
+            except Exception as exc:
+                pipeline.restore_room_glossary(room_id, previous)
+                logging.getLogger("breeze.server").exception("glossary store failed")
+                raise HTTPException(status_code=503, detail="術語表暫時無法儲存") from exc
+        return pipeline.room_glossary_view(room_id)
+
+    @app.get("/api/rooms/{room_id}/glossary")
+    async def get_room_glossary(room_id: str, request: Request) -> dict:
+        require_host(request, token, settings)
+        try:
+            room_id = validate_room_id(room_id)
+        except RoomIdError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _glossary_body(pipeline.room_glossary_view(room_id))
+
+    @app.put("/api/rooms/{room_id}/glossary")
+    async def put_room_glossary(room_id: str, request: Request):
+        require_host(request, token, settings)
+        try:
+            room_id = validate_room_id(room_id)
+        except RoomIdError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raw = await _read_capped(request, GLOSSARY_MAX_BODY)
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="需要 JSON") from exc
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="需要 JSON 物件")
+        if "if_version" not in body or isinstance(body.get("if_version"), bool) or not isinstance(body.get("if_version"), int):
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "accepted": [], "rejected": [{"line": 0, "reason": "if_version 必須是整數"}]},
+            )
+        current = pipeline.room_glossary_version(room_id)
+        # Stale version wins over a bad term list, so a retry can reload before fixing rows.
+        if int(body["if_version"]) != current:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "version": current,
+                    "accepted": [],
+                    "rejected": [{"line": 0, "reason": "術語表版本不符"}],
+                },
+            )
+        if "terms" not in body:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "accepted": [], "rejected": [{"line": 0, "reason": "缺少 terms"}]},
+            )
+        accepted, rejected = validate_terms(body.get("terms"))
+        if rejected:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "accepted": accepted, "rejected": rejected},
+            )
+        view = await _save_room_glossary(room_id, accepted)
+        return _glossary_body(view, accepted=accepted, rejected=[])
+
     @app.post("/api/glossary")
     async def set_glossary(request: Request) -> dict:
         require_host(request, token, settings)
-        body = await _json(request)
-        room_id = validate_room_id(str(body.get("room_id") or ""))
-        session_id = validate_session_id(str(body.get("session_id") or "default"))
+        raw = await _read_capped(request, GLOSSARY_MAX_BODY)
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="需要 JSON") from exc
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="需要 JSON 物件")
+        try:
+            room_id = validate_room_id(str(body.get("room_id") or ""))
+            validate_session_id(str(body.get("session_id") or "default"))
+        except RoomIdError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         rows = parse_glossary(str(body.get("text") or ""))
-        pipeline.glossary[(room_id, session_id)] = rows
+        await _save_room_glossary(room_id, legacy_terms(rows))
         return {"ok": True, "count": len(rows)}
 
     @app.post("/api/share-host")
@@ -1506,6 +1615,28 @@ def _caption_target(room_id: str, caption_id: str, session_id: str, seq: int) ->
         session = validate_session_id(session_id)
         return f"{room_id}:{session}:{seq}", session, seq
     raise HTTPException(status_code=400, detail="刪除單段需要 id 或 session_id 與 seq")
+
+
+async def _read_capped(request: Request, limit: int) -> bytes:
+    """Refuse a glossary body before it is parsed. Content-Length and the stream are both capped."""
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            size = int(declared)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="需要 JSON") from exc
+        if size > limit:
+            raise HTTPException(status_code=413, detail="術語表內容過大")
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(status_code=413, detail="術語表內容過大")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 async def _json(request: Request) -> dict:

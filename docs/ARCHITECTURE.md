@@ -32,4 +32,4 @@
 
 ## 儲存
 
-預設只在記憶體。設了 `BREEZE_DATA_PATH` 才把字幕寫進 SQLite，不存音檔，也沒有完整 migration。
+預設只在記憶體。設了 `BREEZE_DATA_PATH` 才把字幕寫進 SQLite，不存音檔。舊檔用 `ALTER TABLE` 補上新欄位，不是整庫搬遷。每個房間的術語表在 `room_glossary`，不跟字幕的 24 小時期限一起刪。
