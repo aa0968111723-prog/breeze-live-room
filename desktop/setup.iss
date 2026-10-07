@@ -2,7 +2,7 @@
   #error PayloadDir must point to the prepared offline App
 #endif
 #ifndef AppVersion
-  #define AppVersion "0.3.0"
+  #define AppVersion "0.3.1"
 #endif
 #ifndef OutputDir
   #define OutputDir "..\dist"

@@ -16,7 +16,7 @@
 
 ## 必須配合的新更新
 
-`main` 已合併 Grok PR #12，檢查時提交是 `556c60d19e54a63951e88cc3c3cf61d85b80aa20`。整合目錄已合併該 main；它包括字幕期限、重啟還原、取消／停止、翻譯佇列、瀏覽器重連、捷徑路徑與相關測試。不要用舊分支或舊下載檔直接覆蓋 app/server.py、pipeline.py、store.py、dispatch.py 和前端錄音／聽眾程式。
+`main` 已合併 Grok PR #12，以及 #17、#18、#19、#20 等後續修正；整合副本再次同步至 `db46a1c5beccaf05526fa3d546a2a7679337cb46`。除了字幕期限、重啟還原、取消／停止、翻譯佇列、捷徑處理，還包括聽眾連線金鑰、避免 zh_raw 外送、重送處理、靜態檔重新驗證與單次 multipart 解析。不要用舊分支或舊下載檔直接覆蓋 app/server.py、pipeline.py、store.py、dispatch.py 和前端錄音／聽眾程式。
 
 之前簡單的 TEMP 改寫與 main 的完整捷徑修復重疊。整合版保留 main 的可驗證、可還原 TEMP 處理，移除舊的前置改寫。
 
