@@ -707,6 +707,9 @@ async function testNewSocketDoesNotInheritThePreviousQuietClock() {
   assert.equal(sockets[0].closed, true);
   check();
   assert.equal(sockets[1].closed, undefined);
+  now = 75000;
+  check();
+  assert.equal(sockets[1].closed, undefined, "35s exactly is still inside the quiet window");
   now = 75001;
   check();
   assert.equal(sockets[1].closed, true);
