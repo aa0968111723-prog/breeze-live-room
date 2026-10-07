@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -111,8 +112,12 @@ class Settings:
     silence_rms: float = 0.0
     caption_ttl_s: float = 86400.0
     room_caption_cap: int = 5000
-    # Full replay/backfill responses per client IP per minute. Live captions are not counted.
-    replay_per_minute: int = 8
+    # Replay/backfill hellos per public IP per minute. A classroom shares one NAT
+    # address, so this is a classroom-sized ceiling, not 8. Each replay hello is at
+    # most 100 KiB, which is what makes 180 acceptable. Live captions are not counted.
+    replay_per_minute: int = 180
+    # Same budget counted per (IP, audience client id). One phone cannot spend the room's ceiling.
+    replay_client_per_minute: int = 8
     stop_flush_s: float = 8.0
     shutdown_flush_s: float = 2.0
     token_budget: int = 0
@@ -148,6 +153,10 @@ class Settings:
             raise ValueError("BREEZE_ROOM_CAPTION_CAP 至少為 1")
         if self.replay_per_minute < 1:
             raise ValueError("BREEZE_REPLAY_PER_MINUTE 至少為 1")
+        if self.replay_client_per_minute < 1:
+            raise ValueError("BREEZE_REPLAY_CLIENT_PER_MINUTE 至少為 1")
+        if not (math.isfinite(self.caption_ttl_s) and self.caption_ttl_s > 0):
+            raise ValueError("BREEZE_CAPTION_TTL 必須大於 0")
         if self.translate_workers < 1:
             raise ValueError("BREEZE_TRANSLATE_WORKERS 至少為 1")
         if self.gap_wait_s < 0 or self.room_idle_s < 0 or self.stop_flush_s < 0 or self.shutdown_flush_s < 0:
@@ -209,7 +218,8 @@ class Settings:
             silence_rms=_raw_float(env, "BREEZE_SILENCE_RMS", 0.0),
             caption_ttl_s=_raw_float(env, "BREEZE_CAPTION_TTL", 86400.0),
             room_caption_cap=_raw_int(env, "BREEZE_ROOM_CAPTION_CAP", 5000),
-            replay_per_minute=_raw_int(env, "BREEZE_REPLAY_PER_MINUTE", 8),
+            replay_per_minute=_raw_int(env, "BREEZE_REPLAY_PER_MINUTE", 180),
+            replay_client_per_minute=_raw_int(env, "BREEZE_REPLAY_CLIENT_PER_MINUTE", 8),
             stop_flush_s=_raw_float(env, "BREEZE_STOP_FLUSH", 8.0),
             shutdown_flush_s=_raw_float(env, "BREEZE_SHUTDOWN_FLUSH", 2.0),
             token_budget=_raw_int(env, "BREEZE_TOKEN_BUDGET", 0),

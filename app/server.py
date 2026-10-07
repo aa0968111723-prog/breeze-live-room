@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -216,29 +217,385 @@ class Conn:
         self.ws = ws
         self.slot = ListenerSlot(ws.send_json, maxsize=maxsize)
         self.slot.last_pong = time.monotonic()
+        self.client_id = ""
+        self.supplement = False
+
+
+def _seated_listeners(rooms) -> int:
+    """Listener cap. A backfill supplement riding an existing seat does not count."""
+    total = 0
+    for room in rooms:
+        for conn in room.get("listeners", ()):
+            if not getattr(conn, "supplement", False):
+                total += 1
+    return total
+
+
+def _client_still_seated(room, client_id: str) -> bool:
+    if not client_id or client_id == "anon":
+        return False
+    for conn in room.get("listeners", ()):
+        if getattr(conn, "supplement", False):
+            continue
+        if getattr(conn, "client_id", "") == client_id:
+            return True
+    return False
+
+
+def _detach_supplements(room, client_id: str) -> list:
+    """Drop this cid's backfill sockets once no seat remains.
+
+    supplement=1 skips max_listeners only while that seat is still in the room.
+    A socket left behind kept receiving live captions and never counted.
+    """
+    if not client_id or client_id == "anon" or _client_still_seated(room, client_id):
+        return []
+    detached = []
+    for conn in list(room.get("listeners", ())):
+        if not getattr(conn, "supplement", False):
+            continue
+        if getattr(conn, "client_id", "") != client_id:
+            continue
+        room["listeners"].discard(conn)
+        conn.slot.alive = False
+        detached.append(conn)
+    return detached
+
+
+async def _close_detached(conns) -> None:
+    for conn in conns:
+        await conn.slot.close()
+        try:
+            await conn.ws.close(code=1000)
+        except Exception:
+            pass
+
+
+async def _release_listener(room, conn) -> None:
+    room["listeners"].discard(conn)
+    detached = []
+    if not getattr(conn, "supplement", False):
+        detached = _detach_supplements(room, getattr(conn, "client_id", ""))
+    await conn.slot.close()
+    await _close_detached(detached)
+
+
+# Audience replay is the newest screenful, never the whole class. Export stays
+# complete. The whole replay hello, not only the backfill field, stays within
+# 100 KiB so 180 replays a minute stay near 18 MB. A fatter body drops the oldest rows.
+AUDIENCE_BACKFILL_ROWS = 200
+AUDIENCE_BACKFILL_BYTES = 100 * 1024
+_REPLAY_CONTROL = frozenset({"caption_deleted", "captions_cleared", "captions_expired"})
+
+
+def _json_bytes(obj) -> int:
+    """Starlette send_json: compact separators, UTF-8, non-ASCII left as-is."""
+    return len(json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _trim_audience_rows(rows: list[dict], budget: int = AUDIENCE_BACKFILL_BYTES) -> list[dict]:
+    """Newest captions whose JSON array fits in `budget`. Each row is encoded once.
+
+    Re-encoding the whole tail after every dropped row was quadratic. A long
+    class then stalled the event loop for the whole replay burst.
+    """
+    if budget < 2 or not rows:
+        return []
+    tail = [for_listener(item) for item in rows[-AUDIENCE_BACKFILL_ROWS:]]
+    sizes = [_json_bytes(item) for item in tail]
+    used = 2
+    count = 0
+    for size in reversed(sizes):
+        cost = size if count == 0 else size + 1
+        if used + cost > budget:
+            break
+        used += cost
+        count += 1
+    if count:
+        return tail[-count:]
+    item = dict(tail[-1])
+    for key in ("zh", "en", "error"):
+        text = item.get(key)
+        if isinstance(text, str) and len(text) > 80:
+            item[key] = text[:80]
+    return [item] if _json_bytes([item]) <= budget else []
+
+
+def _cap_replay_hello(hello: dict, budget: int = AUDIENCE_BACKFILL_BYTES) -> dict:
+    """Keep one replay hello within `budget` wire bytes.
+
+    Newest backfill rows win. Captions already in that backfill are dropped
+    from history and events first, then older captions, and only then the
+    oldest backfill rows. A hello that already fits is left unchanged, so a
+    short class still receives its live window and its backfill.
+    """
+    list_keys = [key for key in ("history", "events", "backfill") if isinstance(hello.get(key), list)]
+    lists = {key: list(hello[key]) for key in list_keys}
+    sizes = {key: [_json_bytes(row) for row in lists[key]] for key in list_keys}
+    covered: dict[str, int] = {}
+    for row in lists.get("backfill", ()):
+        if not isinstance(row, dict):
+            continue
+        ident = row.get("id")
+        if ident:
+            covered[str(ident)] = int(row.get("version") or 1)
+
+    def is_control(row: dict) -> bool:
+        return str(row.get("type") or "") in _REPLAY_CONTROL
+
+    def is_redundant(row: dict) -> bool:
+        if not isinstance(row, dict) or is_control(row):
+            return False
+        ident = row.get("id")
+        if not ident or str(ident) not in covered:
+            return False
+        return int(row.get("version") or 1) <= covered[str(ident)]
+
+    def is_caption(row: dict) -> bool:
+        return isinstance(row, dict) and not is_control(row) and bool(row.get("id"))
+
+    drop_order: list[tuple[str, int]] = []
+
+    def add_class(key: str, predicate) -> None:
+        for index, row in enumerate(lists.get(key) or []):
+            if predicate(row):
+                drop_order.append((key, index))
+
+    for key in ("history", "events"):
+        add_class(key, is_redundant)
+    for key in ("history", "events"):
+        add_class(key, lambda row: is_caption(row) and not is_redundant(row))
+    add_class("backfill", lambda row: True)
+    for key in ("history", "events"):
+        add_class(key, lambda row: isinstance(row, dict) and is_control(row))
+
+    probe = dict(hello)
+    for key in list_keys:
+        probe[key] = []
+    total = _json_bytes(probe)
+    for key in list_keys:
+        row_sizes = sizes[key]
+        if row_sizes:
+            total += sum(row_sizes) + len(row_sizes) - 1
+    kept = {key: [True] * len(lists[key]) for key in list_keys}
+    remaining = {key: len(lists[key]) for key in list_keys}
+    last_backfill = len(lists["backfill"]) - 1 if lists.get("backfill") else -1
+
+    def saving(key: str, index: int) -> int:
+        size = sizes[key][index]
+        if remaining[key] <= 1:
+            return size
+        return size + 1
+
+    if total > budget:
+        for key, index in drop_order:
+            if total <= budget:
+                break
+            if not kept[key][index]:
+                continue
+            if key == "backfill" and index == last_backfill:
+                continue
+            total -= saving(key, index)
+            kept[key][index] = False
+            remaining[key] -= 1
+    for key in list_keys:
+        hello[key] = [row for row, flag in zip(lists[key], kept[key]) if flag]
+    if _json_bytes(hello) <= budget:
+        return hello
+    # The newest row alone can still be fatter than the hello once the envelope
+    # is counted. Shorten its text once; if that is not enough, send no row.
+    backfill = [row for row in hello.get("backfill") or [] if isinstance(row, dict)]
+    if backfill:
+        item = dict(backfill[-1])
+        for key in ("zh", "en", "error"):
+            text = item.get(key)
+            if isinstance(text, str) and len(text) > 80:
+                item[key] = text[:80]
+        hello["backfill"] = [item]
+        if _json_bytes(hello) <= budget:
+            return hello
+        hello["backfill"] = []
+    if _json_bytes(hello) <= budget:
+        return hello
+    hello["history"] = []
+    hello["events"] = []
+    return hello
+
+
+# Replay buckets are keyed by the TCP peer, not by whatever id the client sends.
+# IPv6 peers in one /64 share a bucket. Client ids subdivide an address and have
+# their own cap, wider than the address table. A full table drops expired keys,
+# then shares one overflow bucket. It does not zero a peer still inside the
+# window, and it does not refuse every new address. Dropping expired addresses
+# walks the client table once, not once per address. The expired-key scan runs
+# at most once a second. Admitting a new key at the cap still drops expired
+# keys immediately.
+_REPLAY_KEY_CAP = 4096
+_REPLAY_CLIENT_KEY_CAP = _REPLAY_KEY_CAP * 8
+_REPLAY_OVERFLOW_PER_WINDOW = 48
+
+
+def _replay_address_key(ip: str) -> str:
+    """One bucket per IPv4 address, or per IPv6 /64. Unparseable text stays as-is.
+
+    app/run.py binds 0.0.0.0 only, so this /64 grouping does nothing until the
+    process also listens on IPv6. One SLAAC /64 would then share the address
+    cap the way a classroom NAT already does.
+    """
+    text = (ip or "").strip()
+    if not text:
+        return ""
+    host = text
+    if host.startswith("[") and "]" in host:
+        host = host[1:host.index("]")]
+    if "%" in host:
+        host = host.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return text
+    mapped = addr.ipv4_mapped if isinstance(addr, ipaddress.IPv6Address) else None
+    if mapped is not None:
+        return str(mapped)
+    if isinstance(addr, ipaddress.IPv6Address):
+        network = ipaddress.IPv6Network((addr, 64), strict=False)
+        return f"{network.network_address}/64"
+    return str(addr)
 
 
 class _ReplayGate:
-    """Caps full replay/backfill dumps per client IP. Live captions are not counted."""
+    """Caps replay/backfill hellos. Live captions never consult this gate.
 
-    def __init__(self, limit: int, window_s: float = 60.0):
-        self.limit = max(1, int(limit))
-        self.window_s = window_s
-        self._hits: dict[str, list[float]] = {}
+    One bucket is the TCP peer address (a classroom behind NAT shares it).
+    A client id only subdivides that address. It is not an address key, so
+    rotating ids cannot fill the table. When the address table is full of
+    peers still inside the window, further addresses share one overflow
+    bucket instead of being refused. A rate-limited hello is explicit:
+    the caller sends backfill_deferred instead of an empty screen.
+    """
 
-    def allow(self, ip: str) -> bool:
-        now = time.monotonic()
-        bucket = self._hits.get(ip)
-        if bucket is None:
-            bucket = []
-            self._hits[ip] = bucket
+    def __init__(
+        self,
+        ip_limit: int,
+        client_limit: int | None = None,
+        window_s: float = 60.0,
+        *,
+        clock=None,
+        max_keys: int = _REPLAY_KEY_CAP,
+        overflow_limit: int = _REPLAY_OVERFLOW_PER_WINDOW,
+        max_client_keys: int | None = None,
+    ):
+        self.ip_limit = max(1, int(ip_limit))
+        self.limit = self.ip_limit
+        requested = self.ip_limit if client_limit is None else int(client_limit)
+        self.client_limit = max(1, min(self.ip_limit, requested))
+        self.window_s = float(window_s)
+        self.max_keys = max(1, int(max_keys))
+        self.max_client_keys = max(1, int(_REPLAY_CLIENT_KEY_CAP if max_client_keys is None else max_client_keys))
+        self.overflow_limit = max(1, int(overflow_limit))
+        self._clock = clock or time.monotonic
+        self._swept_at: float | None = None
+        self._ip_hits: dict[str, list[float]] = {}
+        self._client_hits: dict[tuple[str, str], list[float]] = {}
+        self._overflow: list[float] = []
+        # How many times an address expiry walked the client table, and how many
+        # client keys that walk compared. Tests use this to pin a linear scan.
+        self._expire_passes = 0
+        self._expire_visits = 0
+
+    def _prune(self, bucket: list[float], now: float) -> None:
         cutoff = now - self.window_s
         if bucket and bucket[0] <= cutoff:
             bucket[:] = [item for item in bucket if item > cutoff]
-        if len(bucket) >= self.limit:
-            return False
-        bucket.append(now)
-        return True
+
+    def _drop_expired(self, store: dict, now: float) -> None:
+        cutoff = now - self.window_s
+        dead = [key for key, bucket in store.items() if not bucket or bucket[-1] <= cutoff]
+        if store is self._ip_hits and dead:
+            # One pass over the client table for every expired address. A pass
+            # per address was quadratic in (addresses × client keys).
+            gone = set(dead)
+            self._expire_passes += 1
+            for client_key in list(self._client_hits):
+                self._expire_visits += 1
+                if client_key[0] in gone:
+                    del self._client_hits[client_key]
+        for key in dead:
+            del store[key]
+
+    def _forget_expired(self, now: float) -> None:
+        self._drop_expired(self._ip_hits, now)
+        self._drop_expired(self._client_hits, now)
+        self._prune(self._overflow, now)
+
+    def _sweep(self, now: float) -> None:
+        if self._swept_at is not None and now - self._swept_at < 1.0:
+            return
+        self._forget_expired(now)
+        self._swept_at = now
+
+    def _make_room(self, store: dict, now: float, cap: int) -> None:
+        if len(store) < cap:
+            return
+        # Expired keys only. A peer still inside the window keeps its hits.
+        self._drop_expired(store, now)
+
+    def _take(self, store: dict, key, now: float, *, cap: int | None) -> list[float] | None:
+        bucket = store.get(key)
+        if bucket is not None:
+            self._prune(bucket, now)
+            if bucket:
+                return bucket
+            del store[key]
+        if cap is not None:
+            self._make_room(store, now, cap)
+            if len(store) >= cap:
+                return None
+        fresh: list[float] = []
+        store[key] = fresh
+        return fresh
+
+    def _retry_ms(self, bucket: list[float], now: float) -> int:
+        if not bucket:
+            return 1000
+        wait = self.window_s - (now - bucket[0])
+        if wait < 0.25:
+            wait = 0.25
+        return int(wait * 1000) + 1
+
+    def _take_overflow(self, now: float) -> tuple[bool, int]:
+        """One shared bucket for addresses that do not fit in the table."""
+        self._prune(self._overflow, now)
+        if len(self._overflow) >= self.overflow_limit:
+            return False, self._retry_ms(self._overflow, now)
+        self._overflow.append(now)
+        return True, 0
+
+    def allow(self, ip: str, client_id: str = "") -> tuple[bool, int]:
+        now = float(self._clock())
+        self._sweep(now)
+        ip_key = _replay_address_key(ip)
+        who = client_id or ""
+        ip_bucket = self._take(self._ip_hits, ip_key, now, cap=self.max_keys)
+        if ip_bucket is None:
+            # The address table is full of peers still inside the window.
+            # Share the overflow bucket instead of refusing the whole room.
+            return self._take_overflow(now)
+        if len(ip_bucket) >= self.ip_limit:
+            # A refused address must not allocate a client bucket.
+            return False, self._retry_ms(ip_bucket, now)
+        client_bucket = self._take(self._client_hits, (ip_key, who), now, cap=self.max_client_keys)
+        if client_bucket is None:
+            # Client-key cap. Overflow, and do not keep an empty address bucket
+            # or touch a peer that is still inside the window.
+            if not ip_bucket:
+                self._ip_hits.pop(ip_key, None)
+            return self._take_overflow(now)
+        if len(client_bucket) >= self.client_limit:
+            return False, self._retry_ms(client_bucket, now)
+        ip_bucket.append(now)
+        client_bucket.append(now)
+        return True, 0
 
 
 # Room for multipart boundaries and the small text fields around one audio part.
@@ -374,6 +731,31 @@ def _public_result(done: Segment) -> JSONResponse:
     return JSONResponse(status_code=code, content=body)
 
 
+class _ReferrerPolicy:
+    """Set Referrer-Policy without buffering the body.
+
+    Starlette's http decorator middleware reads each response into memory.
+    The 1000-segment class is measured in RSS, so this stays a header stamp.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_policy(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers") or [])
+                headers.append((b"referrer-policy", b"no-referrer"))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_policy)
+
+
 def create_app(settings: Settings | None = None, asr=None, translator: Translator | None = None, decoder=None) -> FastAPI:
     if settings is None:
         fill_process_environ()
@@ -413,8 +795,9 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             asr = CliAsr(whisper, model, threads=settings.asr_threads, timeout_s=settings.asr_timeout_s, audio_context=settings.asr_audio_context, beam_size=settings.asr_beam_size, best_of=settings.asr_best_of)
     share_override = {"host": settings.share_host}
     tasks: list[asyncio.Task] = []
+    close_jobs: set[asyncio.Task] = set()
     replay_floors: dict[str, float] = {}
-    replay_gate = _ReplayGate(settings.replay_per_minute)
+    replay_gate = _ReplayGate(settings.replay_per_minute, settings.replay_client_per_minute)
     share_cache: dict[str, object] = {"at": 0.0, "hosts": []}
 
     def current_host() -> str | None:
@@ -507,7 +890,9 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         kept: list[dict] = []
         for row in rows:
             kind = str(row.get("type") or "")
-            if kind in {"captions_cleared", "caption_deleted", "ping", "pong"}:
+            # Expiry has no caption timestamp. Dropping it here hid the notice
+            # from a listener who reconnected after the line had already aged out.
+            if kind in {"captions_cleared", "caption_deleted", "captions_expired", "ping", "pong"}:
                 kept.append(row)
                 continue
             stamp = stamps.get(str(row.get("id") or ""))
@@ -517,6 +902,34 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
 
     def _audience_captions(rows: list[dict]) -> list[dict]:
         return [for_listener(item) for item in rows]
+
+    def _audience_backfill(rows: list[dict]) -> list[dict]:
+        """Last rows a listener may see, and never a larger JSON body than the budget.
+
+        The wire encoding matches Starlette's send_json (compact separators).
+        """
+        return _trim_audience_rows(rows, AUDIENCE_BACKFILL_BYTES)
+
+    def _schedule_close(conns) -> None:
+        if not conns:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        job = loop.create_task(_close_detached(conns))
+        close_jobs.add(job)
+        job.add_done_callback(close_jobs.discard)
+
+    def _drop_unsendable(room, dead) -> None:
+        """A seat that can no longer take captions must not leave its supplement behind."""
+        detached = []
+        for conn in dead:
+            room["listeners"].discard(conn)
+            if getattr(conn, "supplement", False):
+                continue
+            detached.extend(_detach_supplements(room, getattr(conn, "client_id", "")))
+        _schedule_close(detached)
 
     def _fanout(snap: dict) -> None:
         room = book.get(str(snap.get("room_id") or ""))
@@ -529,8 +942,19 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         for conn in list(room["listeners"]):
             if not conn.slot.offer(outgoing):
                 dead.append(conn)
-        for conn in dead:
-            room["listeners"].discard(conn)
+        _drop_unsendable(room, dead)
+
+    def _announce_live(room_id: str) -> None:
+        """Tell this room's listeners whether the host mic is on. No secrets."""
+        room = book.get(room_id)
+        if room is None:
+            return
+        note = {"type": "room", "room_id": room_id, "live": bool(room.get("session_active"))}
+        dead = []
+        for conn in list(room["listeners"]):
+            if not conn.slot.offer(note):
+                dead.append(conn)
+        _drop_unsendable(room, dead)
 
     def on_event(event: dict):
         try:
@@ -538,7 +962,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             if snap is None:
                 return None
             _fanout(snap)
-            if store.enabled and snap.get("id") and snap.get("type") not in {"captions_cleared", "caption_deleted"}:
+            if store.enabled and snap.get("id") and snap.get("type") not in {"captions_cleared", "caption_deleted", "captions_expired"}:
                 store.submit_save(snap)
             return snap
         except Exception:
@@ -589,10 +1013,16 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
     def _expire_captions() -> None:
         # Each caption expires on its own updated time, including in an open room.
         # SQLite purge uses the same rule. An empty idle room then drops its runtime.
-        for room_id, seg_id in bus.prune_expired(settings.caption_ttl_s):
+        removed = bus.prune_expired(settings.caption_ttl_s)
+        expired: dict[str, list[str]] = {}
+        for room_id, seg_id in removed:
             session_id, seq = _split_kept_id(room_id, seg_id)
             if session_id and seq:
                 pipeline.forget_expired(room_id, session_id, seq)
+            expired.setdefault(room_id, []).append(seg_id)
+        for room_id, ids in expired.items():
+            # Listeners must hear this. Dropping the line with no event looks like a glitch.
+            on_event({"type": "captions_expired", "room_id": room_id, "ids": ids})
         for room_id in list(bus._state):
             if bus.has_captions(room_id) or book.get(room_id) is not None:
                 continue
@@ -667,11 +1097,13 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             await sweep_once()
 
     async def shutdown() -> None:
-        for task in tasks:
+        pending = list(tasks) + list(close_jobs)
+        for task in pending:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         tasks.clear()
+        close_jobs.clear()
         await pipeline.aclose()
         if hasattr(asr, "close"):
             asr.close()
@@ -697,6 +1129,9 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             await shutdown()
 
     app = FastAPI(title="breeze-live-room", lifespan=lifespan)
+    # Outer header only. The listen key is in the page query; do not send that URL onward.
+    app.add_middleware(_ReferrerPolicy)
+
     static_files = RevalidatingStaticFiles(directory=STATIC)
     app.mount("/static", static_files, name="static")
     app.state.settings = settings
@@ -712,6 +1147,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
     app.state.shutdown = shutdown
     app.state.sweep_once = sweep_once
     app.state.resident_error = resident_error
+    app.state.replay_gate = replay_gate
 
     def share_for(room_id: str, *, include_key: bool = False) -> str | None:
         key = _listen_key_of(room_id) if include_key else ""
@@ -772,7 +1208,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             "resident_error": getattr(asr, "last_error", "") or resident_error,
             "host_token": None,
             "queue": pipeline.stats(),
-            "listeners": sum(len(item["listeners"]) for item in book.rooms.values()),
+            "listeners": _seated_listeners(book.rooms.values()),
             "storage": store.enabled,
             "storage_recovered": bool(getattr(store, "recovered", False)),
         }
@@ -861,6 +1297,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         if book.get(room_id) is None:
             ensure_room(room_id)
         book.set_session_active(room_id, bool(body.get("active")))
+        _announce_live(room_id)
         return {"ok": True}
 
     @app.post("/api/session/end")
@@ -887,6 +1324,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         await pipeline.end_session(room_id, session_id, flush_s=flush_s, last_seq=last_seq)
         await asyncio.to_thread(store.flush)
         book.set_session_active(room_id, False)
+        _announce_live(room_id)
         return {"ok": True}
 
     @app.post("/api/segment/missing")
@@ -959,7 +1397,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         require_host(request, token, settings)
         return {
             **pipeline.stats(),
-            "listeners": sum(len(item["listeners"]) for item in book.rooms.values()),
+            "listeners": _seated_listeners(book.rooms.values()),
             "rooms": book._active_count(),
             "rss_bytes": rss_bytes(),
             "tokens_used": translator.tokens_used,
@@ -1129,39 +1567,107 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             if form is not None:
                 await form.close()
 
+    def _audience_client_id(cid: str) -> str:
+        text = (cid or "").strip()
+        if text and len(text) <= 64 and all(ch.isascii() and (ch.isalnum() or ch in "_-") for ch in text):
+            return text
+        # Omitted and forged ids used to get a fresh bucket per socket, which
+        # multiplied the per-client quota up to the per-address ceiling.
+        return "anon"
+
+    async def _refuse_listen(ws: WebSocket, code: int, reason: str, room_id: str = "") -> None:
+        """Accept, name the refusal, then close.
+
+        A close before accept is an HTTP 403. Browsers report that as 1006, so
+        the page cannot show 「連結已失效」 or 「無法開啟」. The message carries
+        no hello and no caption.
+        """
+        await ws.accept()
+        note: dict = {"type": "room_unavailable", "reason": reason}
+        if room_id:
+            note["room_id"] = room_id
+        try:
+            await ws.send_json(note)
+        except Exception:
+            pass
+        await ws.close(code=code)
+
     @app.websocket("/ws/listen")
-    async def listen(ws: WebSocket, room_id: str = "class", cursor: int = 0, replay: int = 0, k: str = "") -> None:
+    async def listen(ws: WebSocket, room_id: str = "class", cursor: int = 0, replay: int = 0, k: str = "", cid: str = "", supplement: int = 0) -> None:
         try:
             room_id = validate_room_id(room_id)
         except RoomIdError:
-            await ws.close(code=1008)
+            await _refuse_listen(ws, 1008, "rejected")
             return
-        # Origin and the listen key are checked before accept, so a rejected
-        # socket never receives hello or a caption.
+        # Origin and the listen key are checked before any caption is read.
+        # Accept still happens so the browser can see the refusal instead of 1006.
         if not audience_origin_allowed(
             ws.headers.get("origin"),
             ws.headers.get("host", ""),
             settings,
             _audience_extra_hosts(),
         ):
-            await ws.close(code=1008)
+            await _refuse_listen(ws, 1008, "rejected", room_id)
             return
         room = book.get(room_id)
         if room is not None and not _listener_authorized(ws, room, k):
-            await ws.close(code=4401)
+            await _refuse_listen(ws, 4401, "link_invalid", room_id)
             return
         await ws.accept()
         if room is None:
-            await ws.send_json({"type": "room_unavailable", "room_id": room_id, "reason": "unknown_or_ended"})
+            # Accept is required to name the reason. The page must not treat this
+            # accept as "live": the room is still closed or not open yet.
+            stored = book.rooms.get(room_id)
+            reason = "ended" if stored is not None and stored.get("ended") else "unknown_or_ended"
+            note = {"type": "room_unavailable", "room_id": room_id, "reason": reason}
+            if reason == "unknown_or_ended":
+                note["retry_after_ms"] = 5000
+            await ws.send_json(note)
             await ws.close(code=4404)
             return
-        if len(room["listeners"]) >= settings.max_listeners:
-            await ws.send_json({"type": "room_unavailable", "room_id": room_id, "reason": "full"})
+        client_id = _audience_client_id(cid)
+        replay_flag = int(replay or 0) == 1
+        already_seated = False
+        already_supplement = False
+        if client_id and client_id != "anon":
+            for item in room["listeners"]:
+                if getattr(item, "client_id", "") != client_id:
+                    continue
+                if getattr(item, "supplement", False):
+                    already_supplement = True
+                else:
+                    already_seated = True
+        # The page keeps its live socket and opens one extra socket for the
+        # replay it was asked to wait for. That extra socket must not take the
+        # seat the next listener is waiting on, and a second extra does not
+        # get the same exemption.
+        supplement_flag = bool(
+            int(supplement or 0) == 1 and replay_flag and already_seated and not already_supplement
+        )
+        if not supplement_flag and _seated_listeners((room,)) >= settings.max_listeners:
+            await ws.send_json({
+                "type": "room_unavailable",
+                "room_id": room_id,
+                "reason": "full",
+                "retry_after_ms": 20000,
+            })
             await ws.close(code=1013)
             return
         conn = Conn(ws, settings.listener_queue)
+        conn.client_id = client_id
+        conn.supplement = supplement_flag
         room["listeners"].add(conn)
+        # The seat can leave between the exemption check and this insert.
+        if conn.supplement and not _client_still_seated(room, conn.client_id):
+            room["listeners"].discard(conn)
+            try:
+                await ws.close(code=1000)
+            except Exception:
+                pass
+            return
         await ensure_hydrated(room_id)
+        if conn not in room["listeners"]:
+            return
         resumed = bus.since(room_id, cursor)
         history = bus.history(room_id) if cursor <= 0 else []
         events = list(resumed["events"]) if cursor > 0 else []
@@ -1174,21 +1680,34 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             "oldest_cursor": resumed["oldest_cursor"],
             "room_id": room_id,
             "epoch": bus.epoch(room_id),
+            "host_live": bool(room.get("session_active")),
         }
         wants_backfill = int(replay or 0) == 1 or (cursor > 0 and bool(resumed.get("gap")))
         if wants_backfill:
-            if int(replay or 0) == 1:
-                source = bus.caption_state(room_id)
-            else:
-                source = list(resumed.get("backfill") or [])
-            visible = _captions_since_open(room_id, source)
+            # TCP peer only. X-Forwarded-For, X-Real-IP, and Forwarded are not an address.
+            # Decide before copying caption state so a refused replay does not pay for it.
             ip = ws.client.host if ws.client is not None else ""
-            if replay_gate.allow(ip):
-                hello["backfill"] = _audience_captions(visible)
+            allowed, retry_ms = replay_gate.allow(ip, _audience_client_id(cid))
+            if not allowed:
+                # Say so. An omitted backfill used to look like an empty class.
+                hello["backfill_deferred"] = True
+                hello["retry_after"] = retry_ms
+                hello["retry_after_ms"] = retry_ms
+            else:
+                if int(replay or 0) == 1:
+                    source = bus.caption_state(room_id)
+                else:
+                    source = list(resumed.get("backfill") or [])
+                visible = _captions_since_open(room_id, source)
+                hello["backfill"] = _audience_backfill(visible)
+            # history and events used to repeat the backfill. One hello stays within 100 KiB.
+            _cap_replay_hello(hello)
         try:
             await ws.send_json(hello)
         except Exception:
-            room["listeners"].discard(conn)
+            await _release_listener(room, conn)
+            return
+        if conn not in room["listeners"]:
             return
         conn.slot.start()
         ping_task = asyncio.create_task(_ping(conn, settings))
@@ -1214,8 +1733,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
             pass
         finally:
             ping_task.cancel()
-            room["listeners"].discard(conn)
-            await conn.slot.close()
+            await _release_listener(room, conn)
 
     _TRACKED.append(app)
     return app
