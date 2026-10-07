@@ -1,10 +1,8 @@
 """B-f. Stopping the session waits for audio already in ASR, not for English.
 
 VirtualHost.stop posts /api/session/end the way host.html does: after uploads drain,
-with no flush=0. sim_settings sets stop_flush_s to 8 virtual seconds (the spec's
-8s, scaled). Stop still returns once the audio has settled, so a 40s translation
-does not hold the button and the 3.5s bound stays. B-f2 raises that budget so
-the gated ASR can finish.
+with no flush=0. sim_settings sets stop_flush_s to 2 virtual seconds so a 40s translation
+does not hold the stop button. B-f2 raises that budget so the gated ASR can finish.
 """
 
 import threading

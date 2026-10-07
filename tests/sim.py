@@ -136,8 +136,9 @@ def sim_settings(**over) -> Settings:
         gap_wait_s=3 * SCALE,
         heartbeat_s=0.05,
         idle_timeout_s=5,
-        # Spec stop flush is 8s. Scaled, and last_seq still returns once audio has settled.
-        stop_flush_s=8 * SCALE,
+        # 2 virtual seconds, not the product's 8s. A wider sim budget hides a stop
+        # that sits out the flush window instead of returning once audio has settled.
+        stop_flush_s=2 * SCALE,
         shutdown_flush_s=0.2,
     )
     base.update(over)
@@ -640,6 +641,8 @@ class SimReport:
     tracemalloc_500: int = 0
     tracemalloc_750: int = 0
     tracemalloc_1000: int = 0
+    rss_0: int = 0
+    rss_250: int = 0
     rss_500: int = 0
     rss_750: int = 0
     rss_1000: int = 0
@@ -838,7 +841,10 @@ async def _run_100min_async(*, trace: bool) -> SimReport:
         # A plain return does not yield, so the upload cannot admit first.
         if seq == 601:
             storm["rounds"] = 16
-        if seq not in (500, 750) and seq % 50 != 0:
+        # 250 is an RSS point on the latency run only. The traced run still
+        # collects here, but does not snapshot: that walk is the stall.
+        rss_points = (250, 500, 750) if not trace else (500, 750)
+        if seq not in rss_points and seq % 50 != 0:
             return None
         # The upload created at the end of the previous slice has not run yet.
         # Park it so the sample is not inside its Chinese latency, then let any
@@ -848,7 +854,7 @@ async def _run_100min_async(*, trace: bool) -> SimReport:
             assert host is not None
             host.hold_new_slices()
             try:
-                if seq in (500, 750):
+                if seq in rss_points:
                     mem_at[seq] = await sample_after_translations(pipe, _sample_server_memory)
                 else:
                     await sample_after_translations(pipe, gc.collect)
@@ -878,6 +884,10 @@ async def _run_100min_async(*, trace: bool) -> SimReport:
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline and len(getattr(translator, "finished", [])) < 1:
                 await asyncio.sleep(0.01)
+            # Baseline RSS for the latency run, after warmup, before segment 1.
+            # The traced run does not sample here: a snapshot walk is the stall.
+            if not trace:
+                mem_at[0] = await sample_after_translations(pipe, _sample_server_memory)
             host = VirtualHost(client, token, room, session)
             pending_snaps: list[asyncio.Task] = []
 
@@ -908,6 +918,8 @@ async def _run_100min_async(*, trace: bool) -> SimReport:
             final = (await client.get("/api/metrics", headers=auth(token))).json()
             state = caption_rows(app, room)
             pipe = app.state.pipeline
+            _, rss_0 = mem_at.get(0, (0, 0))
+            _, rss_250 = mem_at.get(250, (0, 0))
             traced_500, rss_500 = mem_at.get(500, (0, 0))
             traced_750, rss_750 = mem_at.get(750, (0, 0))
             traced_1000, rss_1000 = mem_at.get(1000, (0, 0))
@@ -935,6 +947,8 @@ async def _run_100min_async(*, trace: bool) -> SimReport:
                 tracemalloc_500=traced_500,
                 tracemalloc_750=traced_750,
                 tracemalloc_1000=traced_1000,
+                rss_0=rss_0,
+                rss_250=rss_250,
                 rss_500=rss_500,
                 rss_750=rss_750,
                 rss_1000=rss_1000,

@@ -103,20 +103,48 @@ def test_100min_structures_bounded(report):
 
 
 def test_100min_memory_flattens():
-    """Heap and RSS for the traced class. Not the latency report.
+    """App heap for the traced class. Not the latency report.
 
     The latency run leaves tracemalloc off. This one turns it on and checks the
-    server heap flattens across the last 500 segments, without a 5 MB escape.
+    server heap only. Late growth across the last 250 segments has to be at
+    most half the previous 250, and that same late growth has to be under 1 MB.
+    Both are required: being under 1 MB does not excuse a ratio above one half,
+    and the old total-growth escape (under 5 MB) stays gone. RSS is not judged
+    here.
     """
     report = run_100min(trace=True)
     assert report.tracemalloc_500 > 0
     early = report.tracemalloc_750 - report.tracemalloc_500
     late = report.tracemalloc_1000 - report.tracemalloc_750
-    assert late <= max(early, 0) * 0.75 or late < 1024 * 1024, (early, late)
-    assert report.rss_1000 - report.rss_500 < 100 * 1024 * 1024
-    rss_early = report.rss_750 - report.rss_500
-    rss_late = report.rss_1000 - report.rss_750
-    assert rss_late <= rss_early, (rss_early, rss_late, report.rss_500, report.rss_750, report.rss_1000)
+    assert late <= max(early, 0) / 2, (early, late)
+    assert late < 1024 * 1024, (early, late)
+
+
+def test_100min_rss_bounded(report):
+    """RSS on the latency run, with tracemalloc off.
+
+    Real growth is about 24 KB per segment. Each 250-segment window stays under
+    10 MB, and the whole 1000-segment class stays under 40 MB. A traced run
+    cannot host this check: its RSS is mostly the tracer.
+    """
+    windows = (
+        report.rss_250 - report.rss_0,
+        report.rss_500 - report.rss_250,
+        report.rss_750 - report.rss_500,
+        report.rss_1000 - report.rss_750,
+    )
+    assert all(growth < 10 * 1024 * 1024 for growth in windows), (
+        windows,
+        report.rss_0,
+        report.rss_250,
+        report.rss_500,
+        report.rss_750,
+        report.rss_1000,
+    )
+    assert report.rss_1000 - report.rss_0 < 40 * 1024 * 1024, (
+        report.rss_0,
+        report.rss_1000,
+    )
 
 
 def test_emitted_segs_bounded(report):
@@ -238,11 +266,68 @@ async def test_429_retry_lands_once():
 
 
 @pytest.mark.anyio
+async def test_upload_latency_stays_inside_one_slice():
+    """One slice-sized upload finishes inside 60 ms when tracing is off.
+
+    The traced run below does not time this. Tracing itself was the stall, so
+    the 60 ms bound lives only on this latency path. The clock is the whole
+    push, same as before: perf_counter around the post, strictly under 60 ms.
+    The bulk is the audio part (a text field over 64 KB is now rejected). The
+    silence scan stays off, so it is not what the clock measures, and the audio
+    bytes have to come back intact.
+    """
+    import hashlib
+    import time
+    import tracemalloc
+
+    from app.asr import AsrResult
+
+    from tests.sim import TextAsr, open_room, post_segment, serving, sim_settings
+
+    assert not tracemalloc.is_tracing()
+    weird = "甲\r\n--not-the-boundary\r\n乙".encode()
+    payload = b"x" * (512 * 1024)
+    digest = hashlib.sha256(payload).digest()
+
+    class SliceAsr(TextAsr):
+        def __init__(self):
+            super().__init__(0)
+            self.intact = False
+
+        def transcribe(self, wav, prompt=""):
+            data = wav.read_bytes()
+            if hashlib.sha256(data).digest() == digest:
+                self.intact = True
+                return AsrResult(ok=True, text="x")
+            return super().transcribe(wav, prompt)
+
+    asr = SliceAsr()
+    async with serving(asr=asr, settings=sim_settings(translate=False)) as (app, client, token):
+        del app
+        await open_room(client, token, "class")
+        odd = await post_segment(client, token, "class", "s", 1, weird, 0, 6000)
+        assert odd.status_code == 200, odd.text
+        assert odd.json().get("zh") == weird.decode()
+        warm = await post_segment(client, token, "class", "s", 2, b"warm", 6000, 12000)
+        assert warm.status_code == 200, warm.text
+        started = time.perf_counter()
+        resp = await post_segment(client, token, "class", "s", 3, payload, 12000, 18000)
+        elapsed = time.perf_counter() - started
+    assert resp.status_code == 200, resp.text
+    assert resp.json().get("zh") == "x"
+    assert asr.intact
+    assert elapsed < 0.06, elapsed
+    assert not tracemalloc.is_tracing()
+
+
+@pytest.mark.anyio
 async def test_traced_upload_stays_inside_one_slice():
     """A boundary-like slice still parses through Starlette while tracing.
 
     The upload uses Request.form. Bytes that look like a multipart boundary
     stay inside the audio part, and a slice-sized file comes back as Chinese.
+    This traced path does not assert upload latency. That 60 ms bound is on
+    test_upload_latency_stays_inside_one_slice, which does not trace.
     """
     import tracemalloc
 
