@@ -44,7 +44,7 @@ def _api_club():
     return [
         {
             "zh": "禪學社",
-            "aliases": ["柴學社", "柴学社", "禪學"],
+            "aliases": ["柴學社", "柴学社"],
             "en": "Zen Club",
             "lock": True,
             "category": "社團",

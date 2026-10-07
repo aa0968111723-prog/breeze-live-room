@@ -16,7 +16,7 @@ from pathlib import Path
 
 from app.aio import cancellation_pending, wait_bounded
 from app.audio import AudioError, riff_duration_seconds, wav_duration_seconds, wav_rms
-from app.glossary import missing_locked, normalize
+from app.glossary import guarded_flags, missing_locked, normalize
 from app.rtf import RtfMeter
 from app.settings import Settings
 from app.textutil import annotate_question
@@ -359,7 +359,10 @@ class Pipeline:
         self._flight.clear()
 
     def drop_room(self, room_id: str) -> None:
-        """Forget one ended room. A later host open uses a new generation, so late jobs cannot refill it."""
+        """Forget one ended room. The glossary stays; only a room delete clears it.
+
+        A later host open uses a new generation, so late jobs cannot refill captions.
+        """
         self._room_gen[room_id] = self._room_gen.get(room_id, 1) + 1
         keys = {key for key in self.results if key[0] == room_id}
         keys.update(key for key in self._flight if key[0] == room_id)
@@ -1631,14 +1634,13 @@ class Pipeline:
             segment.term_flags = []
             segment.translate_queued = False
             return False
+        zh_for_flags = zh_snapshot if zh_snapshot is not None else segment.zh
+        snapshot = segment.glossary_snapshot
+        flags: list = []
         if translated.status == "ok" and segment.en:
-            segment.term_flags = missing_locked(
-                zh_snapshot if zh_snapshot is not None else segment.zh,
-                segment.glossary_snapshot,
-                segment.en,
-            )
-        else:
-            segment.term_flags = []
+            flags.extend(missing_locked(zh_for_flags, snapshot, segment.en))
+        flags.extend(guarded_flags(zh_for_flags, snapshot))
+        segment.term_flags = flags
         self.results[segment.key] = segment
         self._emit(segment)
         return True

@@ -6,6 +6,7 @@ are reported only. Replacing leftover Chinese inside `en` is not implemented.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 
 SCHEMA_VERSION = 1
@@ -26,11 +27,17 @@ TEMPLATE_CSV = "zh,aliases,en,lock,category,note\n"
 
 # Minimum traditional fold used only for matching. Output is always the canonical term.
 FOLD = str.maketrans(
-    "学会观经数开静禅语头话调务师处关习觉围",
-    "學會觀經數開靜禪語頭話調務師處關習覺圍",
+    "学会观经数开静禅语头话调务师处关习觉围产",
+    "學會觀經數開靜禪語頭話調務師處關習覺圍產",
 )
 # Common words that must never be aliases. Matching ignores them even if stored.
 ALIAS_STOP = frozenset({"開始", "法式", "師傅", "社科", "只觀", "工案", "開事", "一座", "產修"})
+# A hit that overlaps one of these words is not rewritten. The host still sees a flag.
+# Simplified and fullwidth forms are folded at match time; this list is the traditional spelling.
+COMMON_GUARD = (
+    "開始", "法式", "師傅", "社科", "只觀", "工案", "開事", "一座", "產修",
+    "建設", "建設課程", "開設", "開設課程", "天空", "學會",
+)
 
 
 # Match keys are pure, and lectures repeat the same characters.
@@ -68,10 +75,18 @@ def _match_key(text: str) -> str:
 
 
 _STOP_KEYS = frozenset(_match_key(word) for word in ALIAS_STOP)
+_GUARD_KEYS = tuple(
+    sorted({_match_key(word) for word in COMMON_GUARD if len(_match_key(word)) >= 2}, key=len, reverse=True)
+)
 
 
 def _is_stop_alias(alias: str) -> bool:
     return alias in ALIAS_STOP or _match_key(alias) in _STOP_KEYS
+
+
+def _traditional(text: str) -> str:
+    """Simplified-to-traditional only. Fullwidth and case stay for match time."""
+    return text.translate(FOLD)
 
 
 def is_locked(term: dict) -> bool:
@@ -122,6 +137,7 @@ def validate_terms(raw) -> tuple[list[dict], list[dict]]:
             canons.append(term["zh"])
     canon_set = set(canons)
     canon_keys = {_match_key(zh) for zh in canons}
+    canon_folded = [(zh, _match_key(zh)) for zh in canons]
     seen_zh: dict[str, int] = {}
     seen_keys: dict[str, int] = {}
     # Owners are keyed by the match fold, so 学社 and 學社 are the same alias.
@@ -140,16 +156,27 @@ def validate_terms(raw) -> tuple[list[dict], list[dict]]:
         seen_zh[zh] = index
         seen_keys[zh_key] = index
         for alias in term["aliases"]:
+            alias_key = _match_key(alias)
             if len(alias) < MIN_ALIAS:
                 rejected.append({"line": index, "reason": f"別名「{_clip(alias)}」少於 2 字"})
                 bad_lines.add(index)
             if _is_stop_alias(alias):
                 rejected.append({"line": index, "reason": f"別名「{_clip(alias)}」是常用詞，不能當別名"})
                 bad_lines.add(index)
-            if alias in canon_set or _match_key(alias) in canon_keys:
+            if alias in canon_set or alias_key in canon_keys:
                 rejected.append({"line": index, "reason": f"別名「{_clip(alias)}」與標準詞相同"})
                 bad_lines.add(index)
-            alias_owners.setdefault(_match_key(alias), []).append((index, zh, alias))
+            if len(alias_key) >= MIN_ALIAS:
+                for other, folded in canon_folded:
+                    if other == zh or alias_key == folded or alias_key not in folded:
+                        continue
+                    rejected.append({
+                        "line": index,
+                        "reason": f"別名「{_clip(alias)}」是標準詞「{_clip(other)}」的子字串",
+                    })
+                    bad_lines.add(index)
+                    break
+            alias_owners.setdefault(alias_key, []).append((index, zh, alias))
     for _key, owners in alias_owners.items():
         targets = {zh for _, zh, _alias in owners}
         if len(targets) < 2:
@@ -167,44 +194,33 @@ def validate_terms(raw) -> tuple[list[dict], list[dict]]:
 
 
 def normalize(text: str, glossary) -> str:
-    """Left-to-right longest match. A canonical span is consumed and not replaced again."""
-    table = _dictionary(glossary)
-    if not table or not text:
-        return text or ""
-    longest = max(len(key) for key in table)
-    folded = _match_key(text)
-    # A fold that changed the length would shift every later index. Leave the line alone.
-    if len(folded) != len(text):
-        return text
-    out: list[str] = []
-    index = 0
-    while index < len(text):
-        hit = None
-        for size in range(min(longest, len(text) - index), 1, -1):
-            key = folded[index:index + size]
-            if key in table:
-                hit = (size, table[key])
-                break
-        if hit:
-            out.append(hit[1])
-            index += hit[0]
-        else:
-            out.append(text[index])
-            index += 1
-    return "".join(out)
+    """Left-to-right longest match. One pass; replacement text is not scanned again."""
+    rewritten, _flags = _apply(text, glossary)
+    return rewritten
+
+
+def guarded_flags(text: str, glossary) -> list[dict]:
+    """Alias hits left in place because they sit inside a common word. Host-only."""
+    _rewritten, flags = _apply(text, glossary)
+    return flags
 
 
 def matched_terms(zh: str, glossary) -> list[dict]:
-    """Canonical hits in an already normalized line. Longest match, no overlap."""
+    """Canonical hits in an already normalized line. One-character terms are not targets."""
     by_zh: dict[str, dict] = {}
     for term in _term_rows(glossary):
-        by_zh[term["zh"]] = term
+        text = term["zh"]
+        if len(text) < 2 or _traditional(text) != text:
+            continue
+        by_zh[text] = term
     keys = sorted(by_zh, key=len, reverse=True)
     found: list[dict] = []
     index = 0
     text = zh or ""
     while index < len(text):
         for key in keys:
+            if len(key) < 2:
+                continue
             if text.startswith(key, index):
                 found.append(by_zh[key])
                 index += len(key)
@@ -249,23 +265,110 @@ def missing_locked(zh: str, glossary, en: str) -> list[dict]:
 
 
 def term_hit(en: str, term: dict) -> bool:
+    """ASCII words match on boundaries, so Zen does not hit zenith."""
     needle = _plain(str(term.get("en") or ""))
     if not needle:
         return False
-    return needle in _plain(str(en or ""))
+    hay = _plain(str(en or ""))
+    pattern = r"(?<!\w)" + re.escape(needle) + r"(?!\w)"
+    return re.search(pattern, hay) is not None
 
 
-def _dictionary(glossary) -> dict[str, str]:
-    table: dict[str, str] = {}
+def _apply(text: str, glossary) -> tuple[str, list[dict]]:
+    if not text:
+        return text or "", []
+    canon, alias, en_of = _tables(glossary)
+    if not canon and not alias:
+        return text, []
+    folded = _match_key(text)
+    # A fold that changed the length would shift every later index. Leave the line alone.
+    if len(folded) != len(text):
+        return text, []
+    guards = _guard_spans(folded)
+    longest = 1
+    for key in canon:
+        longest = max(longest, len(key))
+    for key in alias:
+        longest = max(longest, len(key))
+    out: list[str] = []
+    flags: list[dict] = []
+    seen: set[str] = set()
+    index = 0
+    while index < len(text):
+        chosen: tuple[int, str] | None = None
+        suppressed: str | None = None
+        limit = min(longest, len(text) - index)
+        for size in range(limit, 1, -1):
+            key = folded[index:index + size]
+            if key in canon:
+                chosen = (size, canon[key])
+                break
+            if key not in alias:
+                continue
+            if _overlaps(index, index + size, guards):
+                if suppressed is None:
+                    suppressed = alias[key]
+                continue
+            chosen = (size, alias[key])
+            break
+        if chosen is not None:
+            out.append(chosen[1])
+            index += chosen[0]
+            continue
+        if suppressed and suppressed not in seen:
+            seen.add(suppressed)
+            flags.append({"zh": suppressed, "en": en_of.get(suppressed, ""), "reason": "guarded"})
+        out.append(text[index])
+        index += 1
+    return "".join(out), flags
+
+
+def _tables(glossary) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """Canonical output, alias fold to canonical, and English for a guarded flag.
+
+    A one-character canonical is never a replacement target. A simplified canonical
+    is not either: matching must not rewrite traditional text into simplified.
+    """
+    canon: dict[str, str] = {}
+    alias: dict[str, str] = {}
+    en_of: dict[str, str] = {}
     rows = _term_rows(glossary)
     for term in rows:
-        table[_match_key(term["zh"])] = term["zh"]
+        zh = term["zh"]
+        if len(zh) < 2 or _traditional(zh) != zh:
+            continue
+        en_of.setdefault(zh, str(term.get("en") or ""))
+        canon.setdefault(_match_key(zh), zh)
     for term in rows:
-        for alias in term["aliases"]:
-            if len(alias) < MIN_ALIAS or _is_stop_alias(alias):
+        zh = term["zh"]
+        if zh not in en_of:
+            continue
+        for surface in term["aliases"]:
+            if len(surface) < MIN_ALIAS or _is_stop_alias(surface):
                 continue
-            table.setdefault(_match_key(alias), term["zh"])
-    return table
+            alias.setdefault(_match_key(surface), zh)
+    return canon, alias, en_of
+
+
+def _guard_spans(folded: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    length = len(folded)
+    for start in range(length):
+        for key in _GUARD_KEYS:
+            size = len(key)
+            if start + size > length:
+                continue
+            if folded.startswith(key, start):
+                spans.append((start, start + size))
+                break
+    return spans
+
+
+def _overlaps(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
+    for left, right in spans:
+        if start < right and end > left:
+            return True
+    return False
 
 
 def _term_rows(glossary) -> list[dict]:
@@ -300,6 +403,8 @@ def _parse_term(item) -> tuple[dict | None, list[str]]:
         zh_text = zh.strip()
         if _has_control(zh_text):
             problems.append("中文含有控制字元")
+        elif _traditional(zh_text) != zh_text:
+            problems.append(f"標準詞「{_clip(zh_text)}」必須是繁體")
         elif not MIN_ZH <= len(zh_text) <= MAX_ZH:
             problems.append("中文必須是 1 到 20 字")
     if not isinstance(en, str):
@@ -414,7 +519,8 @@ def _has_control(text: str) -> bool:
     for char in text:
         if char in "\r\n\t":
             return True
-        if unicodedata.category(char).startswith("C"):
+        category = unicodedata.category(char)
+        if category.startswith("C") or category in {"Zl", "Zp"}:
             return True
     return False
 
