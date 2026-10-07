@@ -15,8 +15,8 @@ from functools import partial
 from pathlib import Path
 
 from app.aio import cancellation_pending, wait_bounded
-from app.asr import AsrResult
-from app.audio import AudioError, wav_duration_seconds, wav_rms
+from app.audio import AudioError, riff_duration_seconds, wav_duration_seconds, wav_rms
+from app.rtf import RtfMeter
 from app.settings import Settings
 from app.textutil import annotate_question
 from app.translate import TranslateResult, Translator
@@ -125,6 +125,7 @@ class Pipeline:
         self.missing_count = 0
         self.oldest_wait_started: float | None = None
         self.last_process_s: float | None = None
+        self._rtf = RtfMeter()
         self._translate_q: asyncio.Queue | None = None
         self._translate_pool: ThreadPoolExecutor | None = None
         self._tr_epoch: dict[tuple[str, str, int], int] = {}
@@ -194,7 +195,7 @@ class Pipeline:
         oldest = 0
         if self._slots and self.oldest_wait_started is not None:
             oldest = int((time.monotonic() - self.oldest_wait_started) * 1000)
-        return {
+        payload = {
             "pending": self._slots,
             "inflight": len(self._active),
             "oldest_wait_ms": oldest,
@@ -206,6 +207,8 @@ class Pipeline:
             "translate_queued": 0 if self._translate_q is None else self._translate_q.qsize(),
             "translate_skipped": self.translate_skipped,
         }
+        payload.update(self._rtf.snapshot())
+        return payload
 
     def ensure_workers(self) -> None:
         if self._workers:
@@ -1173,7 +1176,8 @@ class Pipeline:
             if segment.key in self._cancel:
                 self.fail_received(segment, "主持端取消這段", status="cancelled")
                 return segment
-            seconds = wav_duration_seconds(wav)
+            known = riff_duration_seconds(wav)
+            seconds = known if known is not None else wav_duration_seconds(wav)
             if seconds is not None and seconds > self.settings.max_audio_seconds:
                 self.fail_received(segment, f"音訊長於 {self.settings.max_audio_seconds} 秒，已拒絕")
                 raise AudioError(413, segment.error)
@@ -1190,18 +1194,31 @@ class Pipeline:
                 self._release(segment)
                 return segment
             segment.status = "transcribing"
+            # Queue wait is backlog, not recognition speed. Only a real WAVE duration counts.
+            audio_s = float(known) if known else 0.0
+            if audio_s > 0:
+                self._rtf.note_waiting(segment.key, audio_s)
+            record_s: float | None = None
             try:
                 async with self._asr_slots:
-                    asr: AsrResult = await wait_bounded(
-                        asyncio.to_thread(self.asr.transcribe, wav, self.prompt),
-                        timeout=self.settings.asr_timeout_s,
-                    )
-            except asyncio.TimeoutError:
-                self.fail_received(segment, "辨識逾時", status="timeout")
-                return segment
+                    asr_started = time.monotonic()
+                    try:
+                        asr = await wait_bounded(
+                            asyncio.to_thread(self.asr.transcribe, wav, self.prompt),
+                            timeout=self.settings.asr_timeout_s,
+                        )
+                    except asyncio.TimeoutError:
+                        record_s = time.monotonic() - asr_started
+                        self.fail_received(segment, "辨識逾時", status="timeout")
+                        return segment
+                    record_s = time.monotonic() - asr_started
             except Exception as exc:
                 self.fail_received(segment, str(exc)[:180] or "辨識失敗", status="error")
                 return segment
+            finally:
+                self._rtf.clear_waiting(segment.key)
+                if record_s is not None:
+                    self._rtf.record(record_s, audio_s, (segment.room_id, segment.session_id))
             self.last_process_s = time.monotonic() - started
             if segment.key in self._cancel:
                 self.fail_received(segment, "主持端取消這段", status="cancelled")
