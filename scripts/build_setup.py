@@ -106,6 +106,7 @@ def build(payload: Path, output: Path, assets: Path, sdk: Path | None) -> Path:
         "/Qp",
         "/DPayloadDir=" + str(payload),
         "/DAppVersion=" + version,
+        "/DPythonVersion=" + json.loads((payload / 'bootstrap-manifest.json').read_text())['python']['version'],
         "/DOutputDir=" + str(output),
         str(ROOT / "desktop" / "setup.iss"),
     ]

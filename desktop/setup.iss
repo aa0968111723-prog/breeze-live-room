@@ -7,6 +7,9 @@
 #ifndef OutputDir
   #define OutputDir "..\dist"
 #endif
+#ifndef PythonVersion
+  #define PythonVersion "3.12.10"
+#endif
 [Setup]
 AppId={{68770E3F-50EE-493F-8A23-6A82C5FFDA69}
 AppName=禪譯聽眾房
@@ -70,7 +73,9 @@ ExitSetupMessage=安裝還沒完成。確定要離開嗎？
 SetupAborted=安裝未完成。可以稍後再執行一次安裝程式。
 
 [Files]
-Source: "{#PayloadDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "*.pyc,__pycache__\*,.env,data\*,logs\*,tmp\*,.venv\*,.updates\*"
+Source: "{#PayloadDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "*.pyc,__pycache__\*,.env,data\*,logs\*,tmp\*,.venv\*,.updates\*,models\*"
+; Quantized weights hardly compress; copy them directly to keep builds fast.
+Source: "{#PayloadDir}\models\*"; DestDir: "{app}\models"; Flags: ignoreversion nocompression
 Source: "{#PayloadDir}\.env.example"; DestDir: "{app}"; DestName: ".env"; Flags: onlyifdoesntexist uninsneveruninstall
 
 [Dirs]
@@ -79,6 +84,9 @@ Name: "{app}\logs"; Flags: uninsneveruninstall
 Name: "{app}\tmp"
 
 [InstallDelete]
+; Replace only the App-managed dependency tree. User settings and captions
+; live outside .python and are retained during reinstall and uninstall.
+Type: filesandordirs; Name: "{app}\.python\{#PythonVersion}\tools\Lib\site-packages"
 Type: files; Name: "{autodesktop}\Breeze Live Room.lnk"
 Type: files; Name: "{userprograms}\Breeze Live Room\Breeze Live Room.lnk"
 Type: files; Name: "{userprograms}\Breeze Live Room\Uninstall Breeze Live Room.lnk"
