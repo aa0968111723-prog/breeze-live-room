@@ -667,4 +667,51 @@ async function testHostLiveIsNotACaption() {
   await conn.done;
 }
 await testHostLiveIsNotACaption();
+
+async function testNewSocketDoesNotInheritThePreviousQuietClock() {
+  let now = 1000;
+  let check = null;
+  const sockets = [];
+  const conn = connectRoom({
+    room: "class",
+    url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
+    now: () => now,
+    staleMs: 35000,
+    schedule(fn) {
+      check = fn;
+      return 9;
+    },
+    cancelSchedule() { check = null; },
+    isForeground: () => true,
+    openSocket(address) {
+      const ws = {
+        address,
+        readyState: 0,
+        sent: [],
+        close() { this.closed = true; },
+        send() {},
+      };
+      sockets.push(ws);
+      return ws;
+    },
+    sleep: () => Promise.resolve(),
+    onState: () => {},
+    onEvent: () => {},
+  });
+  await tick();
+  sockets[0].onopen();
+  now = 40000;
+  check();
+  await tick();
+  assert.equal(sockets.length, 2);
+  assert.equal(sockets[0].closed, true);
+  check();
+  assert.equal(sockets[1].closed, undefined);
+  now = 75001;
+  check();
+  assert.equal(sockets[1].closed, true);
+  conn.stop();
+  await conn.done;
+}
+await testNewSocketDoesNotInheritThePreviousQuietClock();
 console.log("room client state ok");

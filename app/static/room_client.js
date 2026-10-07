@@ -551,6 +551,8 @@ export function connectRoom({
           continue;
         }
         socket = ws;
+        // New handshake. The previous socket's last message must not close this one.
+        lastMessageAt = clock();
         await new Promise((resolve) => {
           let settled = false;
           const finish = () => {
