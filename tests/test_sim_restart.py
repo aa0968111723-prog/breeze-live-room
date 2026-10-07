@@ -156,30 +156,73 @@ async def test_default_window_exceeded_reports_gap():
             assert len(hello["history"]) == 160
 
 
+def _stamp_when_close_is_handled(client) -> dict:
+    """Monotonic time when POST /api/rooms/close enters the ASGI app.
+
+    httpx builds that request on the test task before the app is called. One
+    virtual second is 10 ms real here, and that gap is not the close notice.
+    """
+    import time
+
+    stamp: dict[str, float] = {}
+    transport = client._transport
+    inner = transport.app
+
+    async def app(scope, receive, send):
+        if (
+            not stamp
+            and scope.get("type") == "http"
+            and scope.get("method") == "POST"
+            and scope.get("path") == "/api/rooms/close"
+        ):
+            stamp["at"] = time.monotonic()
+        await inner(scope, receive, send)
+
+    transport.app = app
+    return stamp
+
+
 @pytest.mark.anyio
 async def test_room_close_closes_listener_socket():
-    """B-e4."""
-    import time
-    from tests.sim import SCALE
+    """B-e4. Notice within 1 virtual second of handling close; socket closed within 2.
+
+    The clock starts when the server enters the close request. Building the POST
+    can collect the suite heap first (a full collection of this process is tens
+    or hundreds of milliseconds and is not the close path). Limits are unchanged.
+    """
+    import gc
+
+    from tests.sim import SCALE, vlimit
 
     async with serving(asr=TextAsr(0), settings=sim_settings(translate=False)) as (app, client, token):
         await open_room(client, token, "class")
         async with Listener(app, "class") as listener:
             assert await listener.wait_for(lambda: any(m.get("type") == "hello" for m in listener.messages), 5)
-            started = time.monotonic()
-            resp = await client.post(
-                "/api/rooms/close",
-                json={"room_id": "class"},
-                headers={**auth(token), "content-type": "application/json"},
-            )
-            assert resp.status_code == 200, resp.text
-            assert await listener.wait_for(lambda: any(m.get("type") == "room_unavailable" for m in listener.messages), 5)
-            note = next(m for m in listener.messages if m.get("type") == "room_unavailable")
-            assert note["reason"] == "ended"
-            assert (note["_recv_mono"] - started) / SCALE <= __import__("tests.sim", fromlist=["vlimit"]).vlimit(1)
-            assert await listener.wait_for(lambda: listener.closed, 5)
-            close = next(m for m in listener.messages if m.get("type") == "websocket.close")
-            assert (close["_recv_mono"] - started) / SCALE <= __import__("tests.sim", fromlist=["vlimit"]).vlimit(2)
+            # Pay a pending collection of the suite heap before the budget, then
+            # keep a new one from starting inside the 10 ms real window.
+            gc.collect()
+            handled = _stamp_when_close_is_handled(client)
+            was_gc = gc.isenabled()
+            gc.disable()
+            try:
+                resp = await client.post(
+                    "/api/rooms/close",
+                    json={"room_id": "class"},
+                    headers={**auth(token), "content-type": "application/json"},
+                )
+                assert resp.status_code == 200, resp.text
+                assert await listener.wait_for(lambda: any(m.get("type") == "room_unavailable" for m in listener.messages), 5)
+                note = next(m for m in listener.messages if m.get("type") == "room_unavailable")
+                assert note["reason"] == "ended"
+                assert "at" in handled
+                started = handled["at"]
+                assert (note["_recv_mono"] - started) / SCALE <= vlimit(1)
+                assert await listener.wait_for(lambda: listener.closed, 5)
+                close = next(m for m in listener.messages if m.get("type") == "websocket.close")
+                assert (close["_recv_mono"] - started) / SCALE <= vlimit(2)
+            finally:
+                if was_gc:
+                    gc.enable()
 
 
 @pytest.mark.anyio
