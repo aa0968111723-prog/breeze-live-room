@@ -129,6 +129,9 @@ class Pipeline:
         self._translate_q: asyncio.Queue | None = None
         self._translate_pool: ThreadPoolExecutor | None = None
         self._tr_epoch: dict[tuple[str, str, int], int] = {}
+        # Per-room clock. Epochs only increase, so dropping a key cannot
+        # make a later upload reuse a number an in-flight worker still holds.
+        self._tr_clock: dict[str, int] = {}
         self._version_floor: dict[tuple[str, str, int], int] = {}
         self._seeded: set[str] = set()
         self._flushing: set[tuple[str, str]] = set()
@@ -314,6 +317,7 @@ class Pipeline:
             self._gap_since.pop(stamp, None)
         for key in [key for key in self._tr_epoch if key[0] == room_id]:
             self._tr_epoch.pop(key, None)
+        self._tr_clock.pop(room_id, None)
         self._flushing = {group for group in self._flushing if group[0] != room_id}
         for group in [group for group in self._recent_zh if group[0] == room_id]:
             self._recent_zh.pop(group, None)
@@ -467,6 +471,7 @@ class Pipeline:
             # Same cap as the compact index. The set used to live until drop_room,
             # so a long class kept one tuple per segment forever.
             self._emitted_segs.discard(key)
+        self._trim_epochs(room_id)
 
     def _rehydrate(self, key: tuple[str, str, int]) -> Segment | None:
         row = self._index.get(key)
@@ -532,8 +537,7 @@ class Pipeline:
             self._wake(key, blank)
         for group in [group for group in self._held if group[0] == room_id]:
             self._held.pop(group, None)
-        for key in [key for key in self._tr_epoch if key[0] == room_id]:
-            self._tr_epoch[key] = self._tr_epoch.get(key, 0) + 1
+        self._drop_room_epochs(room_id)
         # A single-caption delete still in flight must not unseal what this room delete sealed.
         self._braced.pop(room_id, None)
         self._mute_backlog.pop(room_id, None)
@@ -565,7 +569,7 @@ class Pipeline:
         flight = self._flight.get(key)
         if flight is not None and not flight.done():
             return
-        self._tr_epoch[key] = self._tr_epoch.get(key, 0) + 1
+        self._drop_epoch(key)
         self.results.pop(key, None)
         self._index.pop(key, None)
         self._hashes.pop(key, None)
@@ -660,7 +664,7 @@ class Pipeline:
             braced.discard(ident)
         self._sealed.setdefault(room_id, set()).add(ident)
         self._braced_dropped.pop(ident, None)
-        self._tr_epoch[key] = self._tr_epoch.get(key, 0) + 1
+        self._drop_epoch(key)
         self._index.pop(key, None)
         self._hashes.pop(key, None)
         self._emitted_segs.discard(key)
@@ -1321,6 +1325,34 @@ class Pipeline:
             return self._abandon(segment)
         return self.results.get(segment.key, segment)
 
+    def _next_epoch(self, key: tuple[str, str, int]) -> int:
+        room = key[0]
+        clock = self._tr_clock.get(room, 0) + 1
+        self._tr_clock[room] = clock
+        self._tr_epoch[key] = clock
+        return clock
+
+    def _drop_epoch(self, key: tuple[str, str, int]) -> None:
+        """Invalidate in-flight work for this seq and forget the entry.
+
+        The room clock only moves forward, so a later upload of the same seq
+        cannot reuse an epoch an in-flight worker still holds.
+        """
+        room = key[0]
+        self._tr_clock[room] = self._tr_clock.get(room, 0) + 1
+        self._tr_epoch.pop(key, None)
+
+    def _drop_room_epochs(self, room_id: str) -> None:
+        self._tr_clock[room_id] = self._tr_clock.get(room_id, 0) + 1
+        for key in [key for key in self._tr_epoch if key[0] == room_id]:
+            self._tr_epoch.pop(key, None)
+
+    def _trim_epochs(self, room_id: str) -> None:
+        """Keep translation epochs inside the caption cap. One int per live row."""
+        live = {key for key in self._index if key[0] == room_id}
+        for key in [key for key in self._tr_epoch if key[0] == room_id and key not in live]:
+            self._tr_epoch.pop(key, None)
+
     def _epoch_current(self, segment: Segment, epoch: int) -> bool:
         return (
             not self._stale(segment)
@@ -1349,8 +1381,7 @@ class Pipeline:
     def _put_translation(self, segment: Segment) -> None:
         assert self._translate_q is not None
         self._drop_queued(segment.key)
-        epoch = self._tr_epoch.get(segment.key, 0) + 1
-        self._tr_epoch[segment.key] = epoch
+        epoch = self._next_epoch(segment.key)
         item = (epoch, time.monotonic(), segment)
         # Epoch travels with the queue item. The segment object is shared, so a
         # later retranslate must not change which attempt a worker already holds.
