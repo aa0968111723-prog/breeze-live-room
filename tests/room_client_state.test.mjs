@@ -463,4 +463,36 @@ await testEndedRestartKeepsCursor();
 await testNudgeAfterStopRestarts();
 await testHiddenUnreachableWaitsSixtySeconds();
 await testReconnectJitterBoundsAfterHello();
+
+async function testHostLiveIsNotACaption() {
+  const events = [];
+  const hosts = [];
+  const sockets = [];
+  const conn = connectRoom({
+    room: "class",
+    url: () => "ws://127.0.0.1:8780/ws/listen?room_id=class",
+    openSocket(address) {
+      const ws = fakeSocket(address);
+      sockets.push(ws);
+      return ws;
+    },
+    sleep: () => Promise.resolve(),
+    onState: () => {},
+    onEvent: (item) => events.push(item),
+    onHost: (item) => hosts.push(item),
+  });
+  await tick();
+  sockets[0].onopen();
+  sockets[0].onmessage({
+    data: JSON.stringify({ type: "hello", latest_cursor: 1, history: [], host_live: true, room_id: "class" }),
+  });
+  sockets[0].onmessage({ data: JSON.stringify({ type: "room", room_id: "class", live: false }) });
+  assert.equal(hosts.length, 2);
+  assert.equal(hosts[0].live, true);
+  assert.equal(hosts[1].live, false);
+  assert.equal(events.length, 0);
+  conn.stop();
+  await conn.done;
+}
+await testHostLiveIsNotACaption();
 console.log("room client state ok");

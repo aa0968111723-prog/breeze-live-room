@@ -669,6 +669,19 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         for conn in dead:
             room["listeners"].discard(conn)
 
+    def _announce_live(room_id: str) -> None:
+        """Tell this room's listeners whether the host mic is on. No secrets."""
+        room = book.get(room_id)
+        if room is None:
+            return
+        note = {"type": "room", "room_id": room_id, "live": bool(room.get("session_active"))}
+        dead = []
+        for conn in list(room["listeners"]):
+            if not conn.slot.offer(note):
+                dead.append(conn)
+        for conn in dead:
+            room["listeners"].discard(conn)
+
     def on_event(event: dict):
         try:
             snap = bus.publish(event)
@@ -1004,6 +1017,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         if book.get(room_id) is None:
             ensure_room(room_id)
         book.set_session_active(room_id, bool(body.get("active")))
+        _announce_live(room_id)
         return {"ok": True}
 
     @app.post("/api/session/end")
@@ -1030,6 +1044,7 @@ def create_app(settings: Settings | None = None, asr=None, translator: Translato
         await pipeline.end_session(room_id, session_id, flush_s=flush_s, last_seq=last_seq)
         await asyncio.to_thread(store.flush)
         book.set_session_active(room_id, False)
+        _announce_live(room_id)
         return {"ok": True}
 
     @app.post("/api/segment/missing")
