@@ -35,6 +35,7 @@ textarea[readonly] { background: #f3eadb; color: #6b5644; }
 #rtf-speed.speed-ok { color: #0b3d1e; background: #e7f6ec; border-left: 6px solid #1b7a3a; }
 #rtf-speed.speed-warn { color: #4a3200; background: #fff4cc; border-left: 6px solid #a86b00; }
 #rtf-speed.speed-bad { color: #7a1e0c; background: #fde8e1; border-left: 6px solid #c13a1d; }
+#rtf-speed.speed-stale { outline: 2px dashed #5c5346; outline-offset: 2px; }
 #caption-en { font-size: 28px; line-height: 1.35; min-height: 1.35em; }
 #caption-zh { color: #6b5644; min-height: 1.4em; }
 #log { white-space: pre-wrap; min-height: 140px; max-height: 280px; overflow: auto; }
@@ -54,7 +55,7 @@ textarea[readonly] { background: #f3eadb; color: #6b5644; }
 <button id="try" class="secondary" type="button">試音</button>
 </div>
 <p id="phase">收音狀態：待命</p>
-<p id="rtf-speed" class="speed-empty" title="每 1 秒錄音需要的辨識秒數。一般是最近 200 段的中位數，最慢是第 95 百分位。低於 0.9 才跟得上。">辨識速度：開始聽之後才有數字</p>
+<p id="rtf-speed" class="speed-empty" title="每 1 秒錄音需要的辨識秒數。一般是這一場最近 200 段的中位數，最慢是第 95 百分位。低於 0.9 才跟得上。新的一場沒有樣本時，不顯示上一場的數字。">辨識速度：開始聽之後才有數字</p>
 <p id="caption-en"></p>
 <p id="caption-zh"></p>
 <p id="status"></p>
@@ -400,26 +401,37 @@ async function setup() {
 }
 async function refreshMetrics() {
   if (!token) return;
-  const resp = await fetch("/api/metrics", { headers: { authorization: "Bearer " + token } });
-  if (!resp.ok) return;
-  const data = await resp.json();
-  const ram = data.rss_bytes ? Math.round(data.rss_bytes / 1048576) + " MB" : "尚未讀到";
-  const tokens = data.tokens_used ? "，譯文 tokens " + data.tokens_used : "";
-  const price = data.price ? "，金額只依 " + data.price.date + " 的來源" : "";
-  metrics.textContent = "待處理 " + data.pending + "，最久等待 " + data.oldest_wait_ms + " ms，上次辨識 " + (data.last_process_ms ?? "—") + " ms，拒絕 " + data.rejected + "，缺段 " + data.missing + "，聽眾 " + data.listeners + "，記憶體 " + ram + tokens + price;
-  paintRecognitionSpeed(data);
+  try {
+    const resp = await fetch("/api/metrics", { headers: { authorization: "Bearer " + token } });
+    if (!resp.ok) {
+      noteMetricsFailure(document.querySelector("#rtf-speed"));
+      return;
+    }
+    const data = await resp.json();
+    const ram = data.rss_bytes ? Math.round(data.rss_bytes / 1048576) + " MB" : "尚未讀到";
+    const tokens = data.tokens_used ? "，譯文 tokens " + data.tokens_used : "";
+    const price = data.price ? "，金額只依 " + data.price.date + " 的來源" : "";
+    metrics.textContent = "待處理 " + data.pending + "，最久等待 " + data.oldest_wait_ms + " ms，上次辨識 " + (data.last_process_ms ?? "—") + " ms，純辨識 " + (data.process_ms ?? "—") + " ms，正在辨識 " + (data.asr_active_s ?? "—") + " 秒，拒絕 " + data.rejected + "，缺段 " + data.missing + "，聽眾 " + data.listeners + "，記憶體 " + ram + tokens + price;
+    paintRecognitionSpeed(data);
+  } catch (err) {
+    noteMetricsFailure(document.querySelector("#rtf-speed"));
+  }
 }
-function recognitionSpeedView(data) {
-  const windowStats = data && data.rtf && data.rtf.window;
-  const block = windowStats && windowStats.rtf;
-  const count = windowStats && windowStats.count != null ? Number(windowStats.count) : 0;
-  const limit = windowStats && windowStats.limit != null ? Number(windowStats.limit) : 200;
+function recognitionSpeedView(data, listening) {
+  const title = "每 1 秒錄音需要的辨識秒數。一般是這一場最近 200 段的中位數，最慢是第 95 百分位。低於 0.9 才跟得上。新的一場沒有樣本時，不顯示上一場的數字。";
+  const empty = { text: "辨識速度：開始聽之後才有數字", tone: "speed-empty", title: title };
+  if (!listening || !listening.roomId || !listening.sessionId) return empty;
+  const sessions = data && data.rtf && Array.isArray(data.rtf.sessions) ? data.rtf.sessions : [];
+  let found = null;
+  for (const row of sessions) {
+    if (row && row.room_id === listening.roomId && row.session_id === listening.sessionId) found = row;
+  }
+  const stats = found && found.recent ? found.recent : found;
+  const count = stats && stats.count != null ? Number(stats.count) : 0;
+  const block = stats && stats.rtf;
   const p50 = block && block.p50 != null ? Number(block.p50) : null;
   const p95 = block && block.p95 != null ? Number(block.p95) : null;
-  const title = "每 1 秒錄音需要的辨識秒數。一般是最近 200 段的中位數，最慢是第 95 百分位。低於 0.9 才跟得上。";
-  if (!count || p50 == null || p95 == null || Number.isNaN(p50) || Number.isNaN(p95)) {
-    return { text: "辨識速度：開始聽之後才有數字", tone: "speed-empty", title: title };
-  }
+  if (!(count > 0) || p50 == null || p95 == null || Number.isNaN(p50) || Number.isNaN(p95)) return empty;
   let tone = "speed-ok";
   let word = "跟得上";
   if (p95 >= 0.9) {
@@ -429,14 +441,42 @@ function recognitionSpeedView(data) {
     tone = "speed-warn";
     word = "接近上限";
   }
-  const text = "辨識速度：一般 " + p50.toFixed(2) + "、最慢 " + p95.toFixed(2) + "（低於 0.9 才跟得上）。最近 " + limit + " 段。狀態：" + word;
+  const shown = Math.round(count);
+  const text = word + "｜辨識速度：一般 " + p50.toFixed(2) + "、最慢 " + p95.toFixed(2) + "（低於 0.9 才跟得上）。最近 " + shown + " 段";
   return { text: text, tone: tone, title: title };
+}
+function sessionKey(session) {
+  if (!session || !session.roomId || !session.id) return "";
+  return String(session.roomId) + "\n" + String(session.id);
+}
+function noteMetricsFailure(speed) {
+  if (!speed) return;
+  const session = (typeof ctl !== "undefined" && ctl) ? ctl.session : null;
+  const current = sessionKey(session);
+  const painted = speed.metricsSession || "";
+  if (painted !== current) {
+    const listening = current ? { roomId: session.roomId, sessionId: session.id } : null;
+    const view = recognitionSpeedView(null, listening);
+    if (speed.classList && speed.classList.remove) {
+      speed.classList.remove("speed-empty", "speed-ok", "speed-warn", "speed-bad", "speed-stale");
+    }
+    if (speed.classList) speed.classList.add(view.tone);
+    speed.textContent = view.text;
+    speed.title = view.title;
+    speed.metricsSession = current;
+  }
+  if (speed.classList) speed.classList.add("speed-stale");
+  const mark = "（數字暫停更新）";
+  const textNow = speed.textContent || "";
+  if (!textNow.includes(mark)) speed.textContent = textNow + mark;
 }
 function paintRecognitionSpeed(data) {
   const speed = document.querySelector("#rtf-speed");
   if (!speed) return;
-  const view = recognitionSpeedView(data);
-  speed.classList.remove("speed-empty", "speed-ok", "speed-warn", "speed-bad");
+  const listening = ctl.session ? { roomId: ctl.session.roomId, sessionId: ctl.session.id } : null;
+  const view = recognitionSpeedView(data, listening);
+  speed.metricsSession = sessionKey(ctl.session);
+  speed.classList.remove("speed-empty", "speed-ok", "speed-warn", "speed-bad", "speed-stale");
   speed.classList.add(view.tone);
   speed.textContent = view.text;
   speed.title = view.title;
