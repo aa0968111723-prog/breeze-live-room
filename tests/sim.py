@@ -115,6 +115,57 @@ def vlimit(limit: float) -> float:
 
 _ACTIVE_CLOCK: "_ScaledClock | None" = None
 
+# Wall-clock loop-lag probe. Not asyncio.sleep / call_later: the scaled clock
+# jumps those timers and the sample comes back in ~0 ms. 30 ms is the thread
+# probe's gate (perf review §4.3). A timer-based wall-clock test would use 40 ms
+# because of the Windows 15.6 ms tick; this probe does not.
+LOOP_LAG_SAMPLE_S = 0.010
+LOOP_LAG_OVER_MS = 30.0
+LOOP_LAG_OVER_MAX = 10
+LOOP_LAG_MAX_MS = 100.0
+
+
+def loop_lag_gate_enforced() -> bool:
+    """Fail the 30 ms / 100 ms lag gates unless this is GitHub Actions.
+
+    GITHUB_ACTIONS=true (the four CI matrix jobs) prints the per-run line and
+    does not fail: those runners have no measured lag baseline yet. Local and
+    any other process must fail, so a 70 ms-per-segment loop stall (R1b) is red.
+    """
+    return os.environ.get("GITHUB_ACTIONS") != "true"
+
+
+def _loadavg():
+    getter = getattr(os, "getloadavg", None)
+    if getter is None:
+        return None
+    try:
+        return tuple(float(x) for x in getter())
+    except OSError:
+        return None
+
+
+def format_loop_lag_line(report: "SimReport") -> str:
+    """One line of p50 / p99 / max / >30 count / load for a paced class."""
+
+    def _fmt_load(item) -> str:
+        if item is None:
+            return "n/a"
+        return ",".join(f"{x:.2f}" for x in item)
+
+    load = report.loop_lag_load
+    if load is None:
+        load_s = "n/a"
+    else:
+        load_s = f"{_fmt_load(load[0])}->{_fmt_load(load[1])}"
+    gate = "enforce" if loop_lag_gate_enforced() else "report-only (GITHUB_ACTIONS)"
+    return (
+        f"sim loop lag: n={report.loop_lag_n} p50={report.loop_lag_p50_ms:.3f}ms "
+        f"p99={report.loop_lag_p99_ms:.3f}ms max={report.loop_lag_max_ms:.3f}ms "
+        f"over{LOOP_LAG_OVER_MS:.0f}={report.loop_lag_over_30ms} load={load_s} "
+        f"gate={gate}"
+    )
+
 
 def _loop_sleeper(loop):
     """Object whose ``select(timeout)`` is what the running loop blocks in.
@@ -132,6 +183,97 @@ def _loop_sleeper(loop):
     return None
 
 
+class _LoopLagProbe:
+    """Real event-loop lag via a thread and call_soon_threadsafe.
+
+    lag = real perf_counter at callback minus the value passed in. Only the
+    stable window (first upload through last upload) counts, and samples that
+    overlap a GC / heap hold are dropped.
+    """
+
+    def __init__(self, real_perf, real_sleep) -> None:
+        self._real_perf = real_perf
+        self._real_sleep = real_sleep
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._loop = None
+        self._lags: list[float] = []
+        self._holds: list[tuple[float, float]] = []
+        self._hold_t0: float | None = None
+        self._stable = False
+        self._stable_t0: float | None = None
+        self._stable_t1: float | None = None
+        self.load_t0 = None
+        self.load_t1 = None
+
+    def start(self, loop) -> None:
+        self._loop = loop
+        self._thread = threading.Thread(target=self._run, name="sim-loop-lag", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._loop = None
+        thread = self._thread
+        self._thread = None
+        if thread is not None:
+            thread.join(timeout=1.0)
+
+    def enter_stable(self) -> None:
+        self._stable_t0 = self._real_perf()
+        self.load_t0 = _loadavg()
+        self._stable = True
+
+    def leave_stable(self) -> None:
+        self._stable_t1 = self._real_perf()
+        self.load_t1 = _loadavg()
+        self._stable = False
+
+    def begin_hold(self) -> None:
+        self._hold_t0 = self._real_perf()
+
+    def end_hold(self) -> None:
+        t0 = self._hold_t0
+        self._hold_t0 = None
+        if t0 is not None:
+            self._holds.append((t0, self._real_perf()))
+
+    def summary_ms(self) -> tuple[int, float, float, float, int]:
+        ms = [lag * 1000.0 for lag in self._lags]
+        if not ms:
+            return 0, 0.0, 0.0, 0.0, 0
+        over = sum(1 for item in ms if item > LOOP_LAG_OVER_MS)
+        return len(ms), percentile(ms, 0.50), percentile(ms, 0.99), max(ms), over
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            sent = self._real_perf()
+            loop = self._loop
+            if loop is not None:
+                try:
+                    loop.call_soon_threadsafe(self._on_tick, sent)
+                except RuntimeError:
+                    pass
+            self._stop.wait(LOOP_LAG_SAMPLE_S)
+
+    def _on_tick(self, sent: float) -> None:
+        if self._stop.is_set():
+            return
+        exec_at = self._real_perf()
+        t0 = self._stable_t0
+        if t0 is None:
+            return
+        end = self._stable_t1 if self._stable_t1 is not None else exec_at
+        if sent < t0 or exec_at > end:
+            return
+        if self._hold_t0 is not None:
+            return
+        for hold0, hold1 in self._holds:
+            if sent < hold1 and exec_at > hold0:
+                return
+        self._lags.append(exec_at - sent)
+
+
 class _ScaledClock:
     """Scaled clock for the paced 100-minute class.
 
@@ -146,8 +288,10 @@ class _ScaledClock:
     """
 
     def __init__(self) -> None:
+        # Real clocks must be saved before install() replaces monotonic / perf_counter.
         self._real_monotonic = time.monotonic
         self._real_perf = time.perf_counter
+        self._real_sleep = time.sleep
         self._lock = threading.Lock()
         self._origin_m = self._real_monotonic()
         self._origin_p = self._real_perf()
@@ -164,6 +308,9 @@ class _ScaledClock:
         # Released by the loop thread. If that never happens, fail the wait
         # instead of leaving a worker parked until the suite is killed.
         self._real_wait_s = 180.0
+        self._last_real = self._origin_p
+        self._went_backward = False
+        self.probe: _LoopLagProbe | None = None
 
     def monotonic(self) -> float:
         with self._lock:
@@ -238,6 +385,17 @@ class _ScaledClock:
             return min(float(timeout), waiter_delta)
         return waiter_delta
 
+    def _advance_locked(self, delta: float) -> None:
+        if delta < 0:
+            self._went_backward = True
+            return
+        if delta:
+            self.now += delta
+
+    def sync_real(self) -> None:
+        """Drop real time spent outside select (GC / heap holds) so it is not 1:1."""
+        self._last_real = self._real_perf()
+
     def install(self) -> None:
         global _ACTIVE_CLOCK
         import asyncio.futures as aio_futures
@@ -262,6 +420,7 @@ class _ScaledClock:
                 return clock._orig_select(timeout)
             ready = clock._orig_select(0)
             if ready:
+                clock._last_real = clock._real_perf()
                 return ready
             wake: list[threading.Event] = []
             # Never block forever. A worker can park after we drop the lock;
@@ -270,19 +429,29 @@ class _ScaledClock:
             with clock._lock:
                 wake.extend(clock._take_due_locked())
                 busy = clock._pending - clock._parked
+                now_real = clock._real_perf()
+                elapsed = now_real - clock._last_real
                 if busy > 0:
-                    # A worker is still doing real work. Do not skip its time, and
-                    # do not spin on the GIL or that worker never reaches its sleep.
-                    poll = 0.001
+                    # Real work is in flight. Advance 1:1 with wall time so
+                    # asyncio.timeout(decode_timeout_s) still fires; a frozen
+                    # clock would accept a 45s decode against a 40s budget.
+                    # Do not skip, and do not spin on the GIL or that worker
+                    # never reaches its sleep.
+                    if elapsed > 0:
+                        clock._advance_locked(elapsed)
+                    wake.extend(clock._take_due_locked())
+                    due_timer = timeout is not None and elapsed >= float(timeout)
+                    poll = 0.0 if due_timer else 0.001
                 else:
                     delta = clock._next_delta_locked(timeout)
                     if delta is not None:
                         if delta > 0:
-                            clock.now += delta
+                            clock._advance_locked(delta)
                         wake.extend(clock._take_due_locked())
                         poll = 0.0
                     # delta is None: the loop is waiting on I/O, not a timer.
                     # Do not invent virtual time for that poll.
+                clock._last_real = clock._real_perf()
             for done in wake:
                 done.set()
             return clock._orig_select(poll)
@@ -319,10 +488,16 @@ class _ScaledClock:
             raise
         self.active = True
         _ACTIVE_CLOCK = self
+        self._last_real = self._real_perf()
+        self.probe = _LoopLagProbe(self._real_perf, self._real_sleep)
+        self.probe.start(loop)
 
     def close(self) -> None:
         global _ACTIVE_CLOCK
         self.active = False
+        if self.probe is not None:
+            self.probe.stop()
+            self.probe = None
         if _ACTIVE_CLOCK is self:
             _ACTIVE_CLOCK = None
         if self._selector is not None and self._orig_select is not None:
@@ -389,6 +564,8 @@ class TextAsr:
         self.on_start = on_start
         self.calls = 0
         self.done_at: list[float] = []
+        self.spent_v: list[float] = []
+        self.clock_sleeps = 0
         self.seen: list[str] = []
 
     def transcribe(self, wav: Path, prompt: str = "") -> AsrResult:
@@ -405,12 +582,16 @@ class TextAsr:
             if not gate["release"].wait(5):
                 raise TimeoutError("ASR gate was not released")
         delay_s = max(0.0, self.delay_v) * SCALE
+        started = time.monotonic()
         clock = _ACTIVE_CLOCK
         if clock is not None and clock.active:
             clock.sleep(delay_s)
+            self.clock_sleeps += 1
         else:
             time.sleep(delay_s)
-        self.done_at.append(time.monotonic())
+        finished = time.monotonic()
+        self.done_at.append(finished)
+        self.spent_v.append((finished - started) / SCALE)
         return AsrResult(ok=True, text=text)
 
 
@@ -917,6 +1098,20 @@ class SimReport:
     translate_rows: list = field(default_factory=list)
     translate_queued_at_export: int = 0
     translate_busy_at_export: int = 0
+    loop_lag_n: int = 0
+    loop_lag_p50_ms: float = 0.0
+    loop_lag_p99_ms: float = 0.0
+    loop_lag_max_ms: float = 0.0
+    loop_lag_over_30ms: int = 0
+    loop_lag_load: tuple | None = None
+    clock_installed: bool = False
+    clock_monotonic_patched: bool = False
+    clock_perf_patched: bool = False
+    clock_virtual_s: float = 0.0
+    clock_paced_s: float = 0.0
+    clock_went_backward: bool = True
+    asr_virtual_median_s: float = 0.0
+    asr_clock_sleeps: int = 0
 
 
 def _zh_ready_times(listeners: list[Listener]) -> dict[int, float]:
@@ -1135,11 +1330,21 @@ async def _run_100min_impl(*, trace: bool) -> SimReport:
         async def _pause_for_sample() -> None:
             assert host is not None
             host.hold_new_slices()
+            clock = _ACTIVE_CLOCK
+            probe = None if clock is None else clock.probe
             try:
-                if seq in rss_points:
-                    mem_at[seq] = await sample_after_translations(pipe, _sample_server_memory)
-                else:
-                    await sample_after_translations(pipe, gc.collect)
+                if probe is not None:
+                    probe.begin_hold()
+                try:
+                    if seq in rss_points:
+                        mem_at[seq] = await sample_after_translations(pipe, _sample_server_memory)
+                    else:
+                        await sample_after_translations(pipe, gc.collect)
+                finally:
+                    if probe is not None:
+                        probe.end_hold()
+                    if clock is not None:
+                        clock.sync_real()
             finally:
                 host.release_new_slices()
 
@@ -1178,7 +1383,30 @@ async def _run_100min_impl(*, trace: bool) -> SimReport:
                     return
                 pending_snaps.append(asyncio.create_task(_snapshot(app, client, token, seq, snapshots)))
 
-            await host.run(SEGMENTS, pace=True, on_each=on_each, before_slice=collect_between_slices)
+            clock = _ACTIVE_CLOCK
+            probe = None if clock is None else clock.probe
+            if probe is not None:
+                probe.enter_stable()
+            try:
+                await host.run(SEGMENTS, pace=True, on_each=on_each, before_slice=collect_between_slices)
+            finally:
+                if probe is not None:
+                    probe.leave_stable()
+            clock_installed = clock is not None and clock.active and _ACTIVE_CLOCK is clock
+            # Bound methods are new objects on each lookup; identity is the instance.
+            clock_monotonic_patched = getattr(time.monotonic, "__self__", None) is clock
+            clock_perf_patched = getattr(time.perf_counter, "__self__", None) is clock
+            clock_virtual_s = (clock.now / SCALE) if clock is not None and SCALE else 0.0
+            clock_paced_s = host.clock_ms / 1000.0
+            clock_went_backward = True if clock is None else clock._went_backward
+            asr_virtual_median_s = percentile(asr.spent_v, 0.50) if asr.spent_v else 0.0
+            asr_clock_sleeps = int(asr.clock_sleeps)
+            if probe is not None:
+                lag_n, lag_p50, lag_p99, lag_max, lag_over = probe.summary_ms()
+                lag_load = (probe.load_t0, probe.load_t1)
+            else:
+                lag_n, lag_p50, lag_p99, lag_max, lag_over = 0, 0.0, 0.0, 0.0, 0
+                lag_load = None
             if pending_snaps:
                 await asyncio.gather(*pending_snaps)
             await _snapshot(app, client, token, SEGMENTS, snapshots)
@@ -1254,6 +1482,20 @@ async def _run_100min_impl(*, trace: bool) -> SimReport:
                 translate_rows=translate_rows,
                 translate_queued_at_export=queued_at_export,
                 translate_busy_at_export=busy_at_export,
+                loop_lag_n=lag_n,
+                loop_lag_p50_ms=lag_p50,
+                loop_lag_p99_ms=lag_p99,
+                loop_lag_max_ms=lag_max,
+                loop_lag_over_30ms=lag_over,
+                loop_lag_load=lag_load,
+                clock_installed=clock_installed,
+                clock_monotonic_patched=clock_monotonic_patched,
+                clock_perf_patched=clock_perf_patched,
+                clock_virtual_s=clock_virtual_s,
+                clock_paced_s=clock_paced_s,
+                clock_went_backward=clock_went_backward,
+                asr_virtual_median_s=asr_virtual_median_s,
+                asr_clock_sleeps=asr_clock_sleeps,
             )
             await host.stop()
     finally:
@@ -1314,11 +1556,12 @@ def run_100min(*, trace: bool = False) -> SimReport:
     trace=True is the memory run: same scale and the same class, plus a heap
     snapshot. It is not the report latency tests read.
     """
-    key = (SEGMENTS, SCALE, "100min-v3", bool(trace))
+    key = (SEGMENTS, SCALE, "100min-v4", bool(trace))
     cached = _RUN_CACHE.get(key)
     if cached is not None:
         return cached
     report = asyncio.run(_run_100min_async(trace=bool(trace)))
+    print(format_loop_lag_line(report), file=sys.__stderr__, flush=True)
     _RUN_CACHE[key] = report
     return report
 

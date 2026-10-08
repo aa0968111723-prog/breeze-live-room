@@ -6,9 +6,28 @@ recording ended, converted with SCALE. It is not "virtual now minus ideal t1", w
 would accumulate asyncio delay across 1000 segments.
 """
 
+import time
+
 import pytest
 
-from tests.sim import SEGMENTS, latencies, percentile, run_100min, vlimit
+from tests.sim import (
+    LOOP_LAG_MAX_MS,
+    LOOP_LAG_OVER_MAX,
+    SEGMENTS,
+    TextAsr,
+    _ScaledClock,
+    copy_decoder,
+    format_loop_lag_line,
+    latencies,
+    loop_lag_gate_enforced,
+    open_room,
+    percentile,
+    post_segment,
+    run_100min,
+    serving,
+    sim_settings,
+    vlimit,
+)
 
 
 @pytest.fixture(scope="module")
@@ -43,6 +62,71 @@ def test_100min_session_never_waits(report):
     assert report.final_metrics["rejected"] == report.storm_rejects
     assert report.missing == 0
     assert [int(row["seq"]) for row in report.export_json] == list(range(1, SEGMENTS + 1))
+
+
+def test_100min_event_loop_real_lag(report, capsys):
+    """Wall-clock event-loop lag during the paced class.
+
+    A daemon thread samples every 10 ms with call_soon_threadsafe, using the
+    perf_counter saved before the scaled clock is installed. asyncio.sleep is
+    not the probe: the scaled clock jumps those timers. GITHUB_ACTIONS=true
+    (CI matrix) prints the line and does not fail. Local runs enforce
+    over-30ms <= 10 and max <= 100 ms so a 70 ms-per-segment stall is red.
+    """
+    line = format_loop_lag_line(report)
+    with capsys.disabled():
+        print(line, flush=True)
+    if not loop_lag_gate_enforced():
+        return
+    assert report.loop_lag_n > 0, line
+    assert report.loop_lag_over_30ms <= LOOP_LAG_OVER_MAX, line
+    assert report.loop_lag_max_ms <= LOOP_LAG_MAX_MS, line
+
+
+def test_100min_scaled_clock_self_check(report):
+    """The 100-minute class actually ran under a moving scaled clock."""
+    assert report.clock_installed
+    assert report.clock_monotonic_patched
+    assert report.clock_perf_patched
+    assert not report.clock_went_backward
+    assert report.clock_paced_s == pytest.approx(SEGMENTS * 6.0, abs=1.0)
+    assert report.clock_virtual_s >= SEGMENTS * 6.0 * 0.9
+    assert report.asr_virtual_median_s >= 1.0
+    assert report.asr_clock_sleeps >= SEGMENTS
+
+
+@pytest.mark.anyio
+async def test_scaled_clock_stuck_decode_times_out_in_real_time():
+    """A stuck decode worker must hit decode_timeout_s in real time.
+
+    Same shape as a 45 s stall against the product 40 s budget: virtual time
+    used to freeze while the worker was busy, so asyncio.timeout never fired
+    and the stall was accepted. 0.8 s against 0.5 s must return 408, not wait
+    for the worker to finish.
+    """
+    real_perf = time.perf_counter
+    real_sleep = time.sleep
+
+    def stuck_decoder(src, dest):
+        real_sleep(0.8)
+        return copy_decoder(src, dest)
+
+    async with serving(
+        settings=sim_settings(decode_timeout_s=0.5, translate=False),
+        asr=TextAsr(0),
+        decoder=stuck_decoder,
+    ) as (app, client, token):
+        clock = _ScaledClock()
+        clock.install()
+        try:
+            await open_room(client, token, "class")
+            started = real_perf()
+            resp = await post_segment(client, token, "class", "s", 1, "第1句".encode(), 0, 6000)
+            elapsed = real_perf() - started
+        finally:
+            clock.close()
+    assert resp.status_code == 408, (resp.status_code, resp.text, elapsed)
+    assert elapsed < 0.75, elapsed
 
 
 def report_scale():
