@@ -6,7 +6,6 @@ draft club glossary.
 
 import asyncio
 import json
-import shutil
 import sqlite3
 import subprocess
 import time
@@ -32,6 +31,7 @@ from app.settings import Settings
 from app.store import CaptionStore
 from app.textutil import parse_glossary, strict_legacy_rows
 from app.translate import SYSTEM, TranslateResult, Translator
+from tests.test_node_suites import _node_bin
 from tests.test_round2 import Socket, app_for, auth, open_room, push, stop, token_of
 
 
@@ -790,8 +790,7 @@ def _stored_legacy_box(raw: str) -> str:
 
 
 def _frontend_canonical(samples: dict[str, str]) -> dict[str, str]:
-    node = shutil.which("node")
-    assert node, "node is required to compare the host canonical text"
+    node = _node_bin()
     script = (
         'import { glossaryCanonicalText } from "./app/static/host_glossary.js";\n'
         'import { readFileSync } from "node:fs";\n'
