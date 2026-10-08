@@ -38,6 +38,8 @@ textarea[readonly] { background: #f3eadb; color: #6b5644; }
 #rtf-speed.speed-stale { outline: 2px dashed #5c5346; outline-offset: 2px; }
 #caption-en { font-size: 28px; line-height: 1.35; min-height: 1.35em; }
 #caption-zh { color: #6b5644; min-height: 1.4em; }
+#first-run ol { margin: 8px 0 0; padding-left: 1.2em; }
+#first-run li { margin: 6px 0; }
 #log { white-space: pre-wrap; min-height: 140px; max-height: 280px; overflow: auto; }
 </style>
 </head>
@@ -45,6 +47,15 @@ textarea[readonly] { background: #f3eadb; color: #6b5644; }
 <main>
 <h1>禪譯主持</h1>
 <p class="lead">這台是主持端。同一個 Wi-Fi 的手機掃下面的 QR。沒有金鑰時只出中文。</p>
+<div class="card" id="first-run">
+<p><strong>第一次使用，只要三步</strong></p>
+<ol>
+<li>按「開始聽」，並允許麥克風。</li>
+<li>對著電腦說話，下面會出現中文字幕。</li>
+<li>手機連同一個 Wi-Fi，掃描 QR 看字幕。</li>
+</ol>
+<button id="hide-guide" class="secondary" type="button">我知道了</button>
+</div>
 <div class="card">
 <label>房間 <input id="room" value="class" autocomplete="off"></label>
 <label>麥克風 <select id="mic"><option value="">預設麥克風</option></select></label>
@@ -92,6 +103,14 @@ const phaseEl = document.querySelector("#phase");
 const captionEn = document.querySelector("#caption-en");
 const captionZh = document.querySelector("#caption-zh");
 const go = document.querySelector("#go");
+const guide = document.querySelector("#first-run");
+function hideGuide() {
+  if (!guide) return;
+  guide.hidden = true;
+  try { localStorage.setItem("breeze-guide", "1"); } catch (err) {}
+}
+try { if (localStorage.getItem("breeze-guide") === "1") hideGuide(); } catch (err) {}
+document.querySelector("#hide-guide").onclick = hideGuide;
 const stopBtn = document.querySelector("#stop");
 const lines = [];
 let token = "";
@@ -387,7 +406,8 @@ async function setup() {
     nic.appendChild(option);
   }
   const missing = [];
-  if (!data.whisper) missing.push("whisper-cli.exe");
+  const modeNames = { native: "本機常駐", resident: "常駐服務", cli: "命令列" };
+  if (!data.whisper && data.asr_mode !== "native") missing.push("whisper-cli.exe");
   if (!data.model) missing.push("Breeze 模型");
   if (!data.ffmpeg) missing.push("ffmpeg");
   if (data.asr_ready === false) missing.push(data.resident_error || "辨識服務尚未就緒");
@@ -395,7 +415,7 @@ async function setup() {
   status.className = missing.length || !data.storage ? "warn" : "";
   status.textContent = missing.length
     ? ("還缺：" + missing.join("、") + "。不會改走雲端辨識。")
-    : (data.translate_label + "。模型模式：" + data.asr_mode + (data.model_reloads_each_segment ? "，每段會重新載入。" : "，常駐服務已就緒。") + (data.storage ? "逐字稿已啟用儲存，可匯出保存期限內的完整內容。" : "逐字稿未啟用儲存；重開服務會清空，只可匯出近期字幕。"));
+    : (data.translate_label + "。模型模式：" + (modeNames[data.asr_mode] || data.asr_mode) + (data.model_reloads_each_segment ? "，每段會重新載入。" : "，常駐服務已就緒。") + (data.storage ? "逐字稿已啟用儲存，可匯出保存期限內的完整內容。" : "逐字稿未啟用儲存；重開服務會清空，只可匯出近期字幕。"));
   go.disabled = !ready || !token || !ctl.canEditRoom();
   listenCaptions(roomEl.value);
   loadGlossary(roomEl.value);
@@ -574,6 +594,7 @@ function lockRoom() {
   phaseEl.textContent = "收音狀態：" + (phaseLabels[ctl.state] || ctl.state) + extra;
 }
 go.onclick = async () => {
+  hideGuide();
   if (!ready || !ctl.canEditRoom() || holdRoom) return;
   const room = (roomEl.value || "class").trim() || "class";
   roomEl.value = room;

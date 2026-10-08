@@ -19,6 +19,9 @@ def test_release_excludes_configuration_models_and_captions(tmp_path):
     with zipfile.ZipFile(archive) as zipped:
         assert 'install.bat' in zipped.namelist()
         assert 'update.ps1' in zipped.namelist()
+        assert 'desktop/Launcher.cs' in zipped.namelist()
+        assert 'desktop/setup.iss' in zipped.namelist()
+        assert 'app/desktop_update.py' in zipped.namelist()
         assert not any(n == '.env' or n.startswith(('.venv/', '.python/', 'models/', 'data/', '.git/')) for n in zipped.namelist())
     unpack(archive, tmp_path / 'unpacked')
 

@@ -14,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from app.asr import CliAsr, ResidentAsr
+from app.native_asr import NativeResidentAsr
 from app.audio import ffmpeg_bin
 from app.settings import Settings, fill_process_environ
 from scripts.install_runtime import download_verified, sha256
@@ -40,6 +41,10 @@ def main() -> int:
         return 1
     report = {"service": "breeze-live-room", "platform": platform.system(), "python": platform.python_version(), "engine": settings.asr_mode, "audio_context": settings.asr_audio_context, "beam_size": settings.asr_beam_size, "best_of": settings.asr_best_of, "fixture": "provided audio" if args.audio else "public-domain English JFK sample; not Chinese microphone validation", "microphone_tested": False, "translation_tested": False, "calls": [], "inference_ok": False}
     asr = ResidentAsr(settings.resident_url, server_bin=server, model=model, threads=settings.asr_threads, startup_timeout_s=settings.resident_startup_s, inference_timeout_s=settings.asr_timeout_s, audio_context=settings.asr_audio_context, beam_size=settings.asr_beam_size, best_of=settings.asr_best_of) if settings.asr_mode == "resident" else CliAsr(whisper, model, threads=settings.asr_threads, timeout_s=settings.asr_timeout_s, audio_context=settings.asr_audio_context, beam_size=settings.asr_beam_size, best_of=settings.asr_best_of)
+    if settings.asr_mode == 'native':
+        asr = NativeResidentAsr(model, threads=settings.asr_threads, startup_timeout_s=settings.resident_startup_s,
+            inference_timeout_s=settings.asr_timeout_s, audio_context=settings.asr_audio_context,
+            beam_size=settings.asr_beam_size, best_of=settings.asr_best_of)
     try:
         report["model_sha256"] = sha256(model)
         source = args.audio or download_verified(FIXTURE, ROOT / ".downloads" / "jfk.wav")

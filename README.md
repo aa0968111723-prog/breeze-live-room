@@ -14,9 +14,17 @@
 
 錯誤時雙擊 `doctor.bat`。詳細步驟與 Microsoft 官方下載入口在 [安裝說明](docs/INSTALL.md)。
 
+## 安裝成 App
+
+雙擊 `Breeze-Live-Room-Setup.exe`。安裝精靈是中文，不用選資料夾，也不用另外裝 Python。完成後桌面會出現「禪譯聽眾房」，按完成就會開啟。打開後畫面上有三步：開始聽、允許麥克風、手機掃 QR。
+
+打開後先看到啟動狀態，模型就緒才進入字幕頁。選單「檢查更新」只接受這個儲存庫正式 Release 的同名安裝檔，核對 SHA256 後才安裝；`.env` 與字幕資料會留著。關閉視窗會一併停止字幕服務與辨識程序。
+
+還沒有附安裝檔的正式 Release 時，檢查更新會直接說明，不會改去下載其他檔案。
+
 ## 安裝包與更新
 
-正式安裝包在 [GitHub Releases](https://github.com/aa0968111723-prog/breeze-live-room/releases)。下載 ZIP、解壓縮後雙擊 `install.bat`；第一次安裝自動準備 Python、套件、模型與工具，並建立啟動／更新／診斷桌面捷徑。
+正式安裝包有兩種，不要裝進同一個資料夾。App 用 `Breeze-Live-Room-Setup.exe`。原始碼包在 [GitHub Releases](https://github.com/aa0968111723-prog/breeze-live-room/releases)：下載 ZIP、解壓縮後雙擊 `install.bat`；第一次安裝自動準備 Python、套件、模型與工具，並建立啟動／更新／診斷桌面捷徑。
 
 桌面捷徑的檢查、結束代碼與 `BREEZE_SKIP_SHORTCUT`／`BREEZE_REQUIRE_SHORTCUT` 見 [安裝說明](docs/INSTALL.md#安裝)。
 
@@ -26,7 +34,7 @@
 
 沒有 API 金鑰即可使用本機中文字幕。英譯需自行在 `.env` 填 `OPENAI_API_KEY`，中文辨識不改走雲端。安裝器不覆蓋既有 `.env` 或逐字稿。
 
-新安裝預設 `BREEZE_ASR=resident`；常駐服務必須回報模型真正就緒後才允許開始。失敗會提示，不會偷偷改成 CLI 模式。`BREEZE_ASR=cli` 仍可使用，但每段會重新載入模型。
+新安裝預設 `BREEZE_ASR=native`，模型留在同一個本機程序。App 視窗也會強制使用這個模式。失敗會提示，不會偷偷改成 CLI 或雲端。`BREEZE_ASR=resident` 與 `BREEZE_ASR=cli` 仍可使用；cli 每段會重新載入模型。
 
 新安裝以 SQLite 保存文字（`BREEZE_DATA_PATH=data/captions.sqlite3`），不保存錄音。啟用儲存後，匯出讀取資料庫中保存期限內的完整內容，重開服務後仍可匯出，不只最近 200 段。預設保留 24 小時，重要場次請及時匯出；可用 `BREEZE_CAPTION_TTL` 調整秒數。既有配置保留原值，未啟用儲存時只有近期字幕。
 

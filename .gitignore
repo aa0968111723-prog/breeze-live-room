@@ -16,3 +16,4 @@ logs/
 .python/
 .updates/
 dist/
+build/
