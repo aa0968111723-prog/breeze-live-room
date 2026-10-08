@@ -113,6 +113,236 @@ def vlimit(limit: float) -> float:
     return limit
 
 
+_ACTIVE_CLOCK: "_ScaledClock | None" = None
+
+
+def _loop_sleeper(loop):
+    """Object whose ``select(timeout)`` is what the running loop blocks in.
+
+    Selector loops expose ``_selector``. CPython's ProactorEventLoop (Windows)
+    aliases that same attribute to the IOCP proactor, which also has
+    ``select(timeout)``. ``_proactor`` is the fallback if the alias is absent.
+    Returning None is a hard error: a wall-clock fallback would count scheduler
+    delay as recorder pause again.
+    """
+    for name in ("_selector", "_proactor"):
+        sleeper = getattr(loop, name, None)
+        if sleeper is not None and hasattr(sleeper, "select"):
+            return sleeper
+    return None
+
+
+class _ScaledClock:
+    """Scaled clock for the paced 100-minute class.
+
+    Slot waits, Chinese latency, and translation deadlines are read off the wall
+    clock and divided by SCALE (0.01 here, 0.02 on Windows). A few real
+    milliseconds of scheduler delay is then several virtual seconds, so a loaded
+    interpreter books a recorder pause even though the scripted ASR is 1.5s inside
+    a 6s slice. This clock moves only when a scripted sleep or an asyncio timer
+    asks it to. One unit is still one scaled second, so a 40s translate budget
+    remains ``40 * SCALE`` on the product's monotonic clock. CPU time does not
+    move it, and neither do the scenario thresholds.
+    """
+
+    def __init__(self) -> None:
+        self._real_monotonic = time.monotonic
+        self._real_perf = time.perf_counter
+        self._lock = threading.Lock()
+        self._origin_m = self._real_monotonic()
+        self._origin_p = self._real_perf()
+        self.now = 0.0
+        self._waiters: list[tuple[float, threading.Event, threading.Event | None]] = []
+        self._pending = 0
+        self._parked = 0
+        self.active = False
+        self._loop = None
+        self._selector = None
+        self._orig_select = None
+        self._orig_wrap = None
+        self._orig_aio_wrap = None
+        # Released by the loop thread. If that never happens, fail the wait
+        # instead of leaving a worker parked until the suite is killed.
+        self._real_wait_s = 180.0
+
+    def monotonic(self) -> float:
+        with self._lock:
+            return self._origin_m + self.now
+
+    def perf_counter(self) -> float:
+        with self._lock:
+            return self._origin_p + self.now
+
+    def pending_inc(self) -> None:
+        with self._lock:
+            self._pending += 1
+
+    def pending_dec(self) -> None:
+        with self._lock:
+            self._pending = max(0, self._pending - 1)
+
+    def sleep(self, delay_s: float, cancel: threading.Event | None = None) -> bool:
+        """Park a worker until scaled time passes. True if cancel won."""
+        if delay_s <= 0 or (cancel is not None and cancel.is_set()):
+            return bool(cancel is not None and cancel.is_set())
+        done = threading.Event()
+        with self._lock:
+            self._waiters.append((self.now + float(delay_s), done, cancel))
+            self._parked += 1
+        # The loop may already be inside select. Wake it so it observes this
+        # waiter. Waiting on the loop thread would deadlock: select never runs.
+        self._wake_loop()
+        if not done.wait(self._real_wait_s):
+            with self._lock:
+                before = len(self._waiters)
+                self._waiters = [item for item in self._waiters if item[1] is not done]
+                if len(self._waiters) != before:
+                    self._parked = max(0, self._parked - 1)
+            raise TimeoutError("scaled clock did not release a worker wait")
+        return bool(cancel is not None and cancel.is_set())
+
+    def _wake_loop(self) -> None:
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self._noop)
+        except RuntimeError:
+            return
+
+    @staticmethod
+    def _noop() -> None:
+        return
+
+    def _take_due_locked(self) -> list[threading.Event]:
+        due: list[threading.Event] = []
+        keep: list[tuple[float, threading.Event, threading.Event | None]] = []
+        for deadline, done, cancel in self._waiters:
+            if deadline <= self.now + 1e-9 or (cancel is not None and cancel.is_set()):
+                due.append(done)
+            else:
+                keep.append((deadline, done, cancel))
+        if due:
+            self._waiters = keep
+            self._parked = max(0, self._parked - len(due))
+        return due
+
+    def _next_delta_locked(self, timeout: float | None) -> float | None:
+        waiter_delta = None
+        if self._waiters:
+            nxt = min(item[0] for item in self._waiters)
+            waiter_delta = max(0.0, nxt - self.now)
+        if timeout is not None and timeout > 0:
+            if waiter_delta is None:
+                return float(timeout)
+            return min(float(timeout), waiter_delta)
+        return waiter_delta
+
+    def install(self) -> None:
+        global _ACTIVE_CLOCK
+        import asyncio.futures as aio_futures
+
+        loop = asyncio.get_running_loop()
+        selector = _loop_sleeper(loop)
+        if selector is None:
+            raise RuntimeError(
+                "scaled clock needs loop._selector.select or loop._proactor.select; "
+                "refusing to fall back to the wall clock"
+            )
+        self._loop = loop
+        self._selector = selector
+        self._orig_select = selector.select
+        self._orig_wrap = aio_futures.wrap_future
+        self._orig_aio_wrap = asyncio.wrap_future
+        clock = self
+
+        def select(timeout=None):
+            # timeout 0: the loop already has ready callbacks, or a timer that is due.
+            if not clock.active or timeout == 0:
+                return clock._orig_select(timeout)
+            ready = clock._orig_select(0)
+            if ready:
+                return ready
+            wake: list[threading.Event] = []
+            # Never block forever. A worker can park after we drop the lock;
+            # an infinite select would then leave both sides waiting.
+            poll = 0.02
+            with clock._lock:
+                wake.extend(clock._take_due_locked())
+                busy = clock._pending - clock._parked
+                if busy > 0:
+                    # A worker is still doing real work. Do not skip its time, and
+                    # do not spin on the GIL or that worker never reaches its sleep.
+                    poll = 0.001
+                else:
+                    delta = clock._next_delta_locked(timeout)
+                    if delta is not None:
+                        if delta > 0:
+                            clock.now += delta
+                        wake.extend(clock._take_due_locked())
+                        poll = 0.0
+                    # delta is None: the loop is waiting on I/O, not a timer.
+                    # Do not invent virtual time for that poll.
+            for done in wake:
+                done.set()
+            return clock._orig_select(poll)
+
+        def wrap_future(future, *, loop=None):
+            if not clock.active:
+                return clock._orig_wrap(future, loop=loop)
+            clock.pending_inc()
+            try:
+                afut = clock._orig_wrap(future, loop=loop)
+            except BaseException:
+                clock.pending_dec()
+                raise
+
+            def _dec(_fut) -> None:
+                clock.pending_dec()
+
+            # Dec on the loop, after the awaiter is chained, so a jump cannot
+            # land between "thread finished" and "coroutine saw the result".
+            if afut.done():
+                _dec(afut)
+            else:
+                afut.add_done_callback(_dec)
+            return afut
+
+        try:
+            selector.select = select
+            aio_futures.wrap_future = wrap_future
+            asyncio.wrap_future = wrap_future
+            time.monotonic = self.monotonic
+            time.perf_counter = self.perf_counter
+        except BaseException:
+            self.close()
+            raise
+        self.active = True
+        _ACTIVE_CLOCK = self
+
+    def close(self) -> None:
+        global _ACTIVE_CLOCK
+        self.active = False
+        if _ACTIVE_CLOCK is self:
+            _ACTIVE_CLOCK = None
+        if self._selector is not None and self._orig_select is not None:
+            self._selector.select = self._orig_select
+        if self._orig_wrap is not None:
+            import asyncio.futures as aio_futures
+
+            aio_futures.wrap_future = self._orig_wrap
+            if self._orig_aio_wrap is not None:
+                asyncio.wrap_future = self._orig_aio_wrap
+        time.monotonic = self._real_monotonic
+        time.perf_counter = self._real_perf
+        with self._lock:
+            stranded = [done for _deadline, done, _cancel in self._waiters]
+            self._waiters.clear()
+            self._parked = 0
+        for done in stranded:
+            done.set()
+
+
 def percentile(values: list[float], p: float) -> float:
     if not values:
         return 0.0
@@ -174,15 +404,29 @@ class TextAsr:
             gate["started"].set()
             if not gate["release"].wait(5):
                 raise TimeoutError("ASR gate was not released")
-        time.sleep(max(0.0, self.delay_v) * SCALE)
+        delay_s = max(0.0, self.delay_v) * SCALE
+        clock = _ACTIVE_CLOCK
+        if clock is not None and clock.active:
+            clock.sleep(delay_s)
+        else:
+            time.sleep(delay_s)
         self.done_at.append(time.monotonic())
         return AsrResult(ok=True, text=text)
 
 
 def _sleep_cancel(delay_s: float, cancel) -> bool:
-    """Sleep delay_s. Return True if cancel fired first."""
+    """Sleep delay_s. Return True if cancel fired first.
+
+    The pipeline passes a cancel event, so the scripted translator waits on
+    ``Event.wait`` rather than ``time.sleep``. Both are wall clocks. Under the
+    scaled clock they park on that clock instead, or a loaded runner stretches
+    every translation past its scaled deadline.
+    """
     if delay_s <= 0:
         return bool(cancel is not None and cancel.is_set())
+    clock = _ACTIVE_CLOCK
+    if clock is not None and clock.active:
+        return clock.sleep(delay_s, cancel)
     if cancel is None:
         time.sleep(delay_s)
         return False
@@ -800,6 +1044,16 @@ def _class_plan(zh: str):
 
 
 async def _run_100min_async(*, trace: bool) -> SimReport:
+    # Wall time under SCALE is not the class clock. See _ScaledClock.
+    clock = _ScaledClock()
+    clock.install()
+    try:
+        return await _run_100min_impl(trace=trace)
+    finally:
+        clock.close()
+
+
+async def _run_100min_impl(*, trace: bool) -> SimReport:
     room = "class"
     session = "sim100"
     root = Path(tempfile.mkdtemp(prefix="breeze-sim-"))
