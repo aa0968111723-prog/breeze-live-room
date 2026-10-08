@@ -7,8 +7,10 @@ draft club glossary.
 import asyncio
 import json
 import sqlite3
+import subprocess
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -17,6 +19,7 @@ from app.glossary import (
     GLOSSARY_MAX_BODY,
     SCHEMA_VERSION,
     TEMPLATE_CSV,
+    legacy_terms,
     matched_terms,
     missing_locked,
     normalize,
@@ -26,8 +29,9 @@ from app.glossary import (
 )
 from app.settings import Settings
 from app.store import CaptionStore
-from app.textutil import parse_glossary
+from app.textutil import parse_glossary, strict_legacy_rows
 from app.translate import SYSTEM, TranslateResult, Translator
+from tests.test_node_suites import _node_bin
 from tests.test_round2 import Socket, app_for, auth, open_room, push, stop, token_of
 
 
@@ -768,3 +772,131 @@ def test_old_schema_database_upgrades_and_glossary_outlives_caption_ttl(tmp_path
         assert glossary["terms"][0]["en"] == "prajna"
     finally:
         reopened.close()
+
+
+def _stored_legacy_box(raw: str) -> str:
+    """Words a legacy POST keeps, written the way the host textarea reloads them."""
+    rows, problems = strict_legacy_rows(raw)
+    assert problems == [], problems
+    accepted, rejected = validate_terms(legacy_terms(rows))
+    assert rejected == [], rejected
+    assert accepted
+    lines = []
+    for term in accepted:
+        aliases = [alias for alias in term.get("aliases") or [] if isinstance(alias, str) and alias]
+        left = "|".join([term["zh"], *aliases]) if aliases else term["zh"]
+        lines.append(f"{left}={term['en']}")
+    return "\n".join(lines)
+
+
+def _frontend_canonical(samples: dict[str, str]) -> dict[str, str]:
+    node = _node_bin()
+    script = (
+        'import { glossaryCanonicalText } from "./app/static/host_glossary.js";\n'
+        'import { readFileSync } from "node:fs";\n'
+        "const samples = JSON.parse(readFileSync(0, \"utf8\"));\n"
+        "const out = {};\n"
+        "for (const [name, text] of Object.entries(samples)) out[name] = glossaryCanonicalText(text);\n"
+        "process.stdout.write(JSON.stringify(out));\n"
+    )
+    root = Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        input=json.dumps(samples),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=root,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def test_legacy_posted_text_matches_the_host_canonical_form():
+    """The host comparison must use the text the legacy POST actually stores.
+
+    Trailing newlines, fullwidth equals, and CRLF are the formats a textarea
+    sends most often. A looser parse (drop a bad line, split on U+2028, cap at
+    40, cut English at 80) would adopt a different glossary.
+    """
+    same = {
+        "trailing-newline": "甲=A1\n乙=A2\n",
+        "blank-line": "甲=A1\n\n乙=A2",
+        "spaces": "甲 = A1\n乙 = A2",
+        "comment": "甲=A1\n# 註解\n乙=A2",
+        "fullwidth": "甲＝A1\n乙＝A2",
+        "crlf": "甲=A1\r\n乙=A2\r\n",
+        "alias-spaces": "禪學社 | 柴學社 = Zen Club\n",
+        "fullwidth-in-en": "般若=pra＝jna\n",
+        "equals-in-en": "等號=a=b\n",
+        "ideographic-space": "甲\u3000=\u3000A1\n乙\u3000＝\u3000A2\n",
+        "duplicate-alias": "甲|別名|別名=A1\n",
+        "english-80": "甲=" + ("a" * 80) + "\n",
+    }
+    expected = {
+        "trailing-newline": "甲=A1\n乙=A2",
+        "blank-line": "甲=A1\n乙=A2",
+        "spaces": "甲=A1\n乙=A2",
+        "comment": "甲=A1\n乙=A2",
+        "fullwidth": "甲=A1\n乙=A2",
+        "crlf": "甲=A1\n乙=A2",
+        "alias-spaces": "禪學社|柴學社=Zen Club",
+        "fullwidth-in-en": "般若=pra＝jna",
+        "equals-in-en": "等號=a=b",
+        "ideographic-space": "甲=A1\n乙=A2",
+        "duplicate-alias": "甲|別名=A1",
+        "english-80": "甲=" + ("a" * 80),
+    }
+    frontend = _frontend_canonical(same)
+    for name, raw in same.items():
+        assert _stored_legacy_box(raw) == expected[name], name
+        assert frontend[name] == expected[name], name
+
+    # The server rejects these, so the host must not rewrite them into the
+    # smaller glossary a loose parser would keep.
+    refused = {
+        "no-equals": "甲=A1\n不是術語\n乙=A2\n",
+        "empty-alias": "甲||乙=A1\n",
+        "line-separator": "甲=A1\u2028乙=A2",
+        "lone-cr": "甲=A1\r乙=A2",
+        "next-line": "甲=A1\u0085乙=A2",
+        "paragraph": "甲=A1\u2029乙=A2",
+        "over-40": "\n".join(f"詞{i:02d}=e{i}" for i in range(41)) + "\n",
+        "english-81": "甲=" + ("a" * 81) + "\n",
+        "comment-only": "# 註解\n\n",
+        "feff": "\uFEFF甲=A1\n",
+    }
+    loose = {
+        "no-equals": "甲=A1\n乙=A2",
+        "empty-alias": "甲|乙=A1",
+        "line-separator": "甲=A1\n乙=A2",
+        "lone-cr": "甲=A1\n乙=A2",
+        "next-line": "甲=A1\n乙=A2",
+        "paragraph": "甲=A1\n乙=A2",
+        "over-40": "\n".join(f"詞{i:02d}=e{i}" for i in range(40)),
+        "english-81": "甲=" + ("a" * 80),
+        "comment-only": "",
+        "feff": "甲=A1",
+    }
+    got = _frontend_canonical(refused)
+    for name, raw in refused.items():
+        rows, problems = strict_legacy_rows(raw)
+        if name == "feff":
+            assert problems == []
+            _accepted, rejected = validate_terms(legacy_terms(rows))
+            assert rejected
+        elif name == "lone-cr":
+            # strict_legacy_rows keeps the CR inside the English; validate rejects it.
+            assert problems == []
+            _accepted, rejected = validate_terms(legacy_terms(rows))
+            assert rejected
+        else:
+            assert problems, name
+        assert got[name] != loose[name], name
+        if name == "feff":
+            # strict_legacy_rows keeps U+FEFF on the term. validate_terms rejects it.
+            # Dropping the mark would match a different, stored term.
+            assert got[name] == "\uFEFF甲=A1"
+        else:
+            assert got[name] == raw, name
