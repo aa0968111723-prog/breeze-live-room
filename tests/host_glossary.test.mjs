@@ -563,7 +563,9 @@ assert.notEqual(racedReloadSave.body.if_version, 1);
 assert.equal(racedReloadSave.body.text, quiet.text);
 assert.equal(racedReloadSave.body.room_id, "room-a");
 
-// Keystrokes after the POST stay in the box and are not posted over the saved terms.
+// Keystrokes after the POST stay in the box. The reload is the text that was
+// posted, so the next save sends those keystrokes with that version. It does
+// not replace them, and it does not post them over a different server body.
 const racedExtra = glossarySaveSettlement(
   glossaryEdit(reconnected, quiet.text + "\n丙=extra"),
   "room-a",
@@ -582,11 +584,56 @@ const racedExtraLoaded = glossaryApplyLoaded(
 );
 assert.equal(racedExtraLoaded.text, quiet.text + "\n丙=extra");
 assert.notEqual(racedExtraLoaded.text, glossaryBoxText(savedTerms));
-assert.equal(racedExtraLoaded.version, null);
+assert.equal(racedExtraLoaded.loadedText, quietSave.body.text);
+assert.equal(racedExtraLoaded.version, 2);
+assert.notEqual(racedExtraLoaded.version, null);
 const racedExtraSave = glossarySaveDecision(racedExtraLoaded, "room-a", "s");
-assert.equal(racedExtraSave.post, false, "unsaved keystrokes must not be posted over the saved glossary");
-assert.equal(racedExtraSave.reason, "no-version");
-assert.equal(racedExtraSave.body, undefined);
+assert.equal(racedExtraSave.post, true);
+assert.equal(racedExtraSave.body.room_id, "room-a");
+assert.equal(racedExtraSave.body.if_version, 2);
+assert.notEqual(racedExtraSave.body.if_version, 1);
+assert.equal(racedExtraSave.body.text, quiet.text + "\n丙=extra");
+assert.notEqual(racedExtraSave.body.text, glossaryBoxText(savedTerms));
+// The reload is not the text that was posted. Do not take its version.
+const racedUnseenTerms = [plainTerm("甲", "remote-unseen")];
+const racedUnseen = glossaryApplyLoaded(
+  racedExtra.state,
+  "room-a",
+  racedExtra.state.generation,
+  racedUnseenTerms,
+  6,
+);
+assert.notEqual(glossaryBoxText(racedUnseenTerms), racedExtra.state.loadedText);
+assert.equal(racedUnseen.text, quiet.text + "\n丙=extra");
+assert.equal(racedUnseen.loadedText, quietSave.body.text);
+assert.equal(racedUnseen.version, null);
+assert.notEqual(racedUnseen.version, 6);
+const racedUnseenSave = glossarySaveDecision(racedUnseen, "room-a", "s");
+assert.equal(racedUnseenSave.post, false);
+assert.equal(racedUnseenSave.reason, "no-version");
+assert.equal(racedUnseenSave.body, undefined);
+// Same box text as the post, but a note the box cannot show. Taking the version
+// would let the next save delete that note.
+const racedNotedTerms = [
+  { zh: "甲", en: "A1", aliases: [], lock: true, note: "沒看過的備註", category: "" },
+  { zh: "乙", en: "A2", aliases: [], lock: true, note: "", category: "" },
+];
+assert.equal(glossaryBoxText(racedNotedTerms), quietSave.body.text);
+const racedNoted = glossaryApplyLoaded(
+  racedExtra.state,
+  "room-a",
+  racedExtra.state.generation,
+  racedNotedTerms,
+  7,
+);
+assert.equal(racedNoted.text, quiet.text + "\n丙=extra");
+assert.equal(racedNoted.loadedText, quietSave.body.text);
+assert.equal(racedNoted.version, null);
+assert.notEqual(racedNoted.version, 7);
+const racedNotedSave = glossarySaveDecision(racedNoted, "room-a", "s");
+assert.equal(racedNotedSave.post, false);
+assert.equal(racedNotedSave.reason, "no-version");
+assert.equal(racedNotedSave.body, undefined);
 
 // The lock hint names the room on screen and points at a person, not a bare placeholder.
 let named = glossaryRoomState();
@@ -640,11 +687,16 @@ const typingLoaded = glossaryApplyLoaded(
 assert.equal(typingLoaded.text, "甲=A1\n乙=A2\n丙=during");
 assert.notEqual(typingLoaded.text, glossaryBoxText(savedTerms));
 assert.equal(typingLoaded.loadedText, typingSave.body.text);
-assert.equal(typingLoaded.version, null);
+assert.equal(typingLoaded.version, 2);
+assert.notEqual(typingLoaded.version, null);
 const typingAgain = glossarySaveDecision(typingLoaded, "room-a", "s");
-assert.equal(typingAgain.post, false, "keystrokes during the POST must not be posted over the saved glossary");
-assert.equal(typingAgain.reason, "no-version");
-assert.equal(typingAgain.body, undefined);
+assert.equal(typingAgain.post, true, "keystrokes typed during the POST are saved with the version of the posted text");
+assert.equal(typingAgain.reason, undefined);
+assert.equal(typingAgain.body.room_id, "room-a");
+assert.equal(typingAgain.body.if_version, 2);
+assert.notEqual(typingAgain.body.if_version, 1);
+assert.equal(typingAgain.body.text, "甲=A1\n乙=A2\n丙=during");
+assert.notEqual(typingAgain.body.text, glossaryBoxText(savedTerms));
 
 // Save for A is still in flight. The host stops, switches A→B→A, and reloads A.
 // That is another visit, not a reconnect of the visit that posted. The late 200 must

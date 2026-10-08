@@ -235,8 +235,17 @@ export function glossaryApplyLoaded(state, room, generation, terms, version) {
     if (state.prefillUnversioned) {
       return { ...state, version: null, note: glossaryPrefillNote(count) };
     }
+    // version is null because this visit just posted loadedText. The reload's
+    // version is the base of keystrokes typed since only when the server body
+    // is that posted text and the glossary is still editable. A different body
+    // or a locked one can hold words the box does not show.
+    const adoptPostedVersion = state.version == null
+      && serverText === state.loadedText
+      && !state.locked
+      && !block.locked;
     return {
       ...state,
+      version: adoptPostedVersion ? version : state.version,
       note: "這個文字框有還沒儲存的修改，沒有用已經存好的詞蓋掉。",
     };
   }
