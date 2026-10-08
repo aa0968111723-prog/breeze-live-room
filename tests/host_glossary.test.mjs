@@ -276,15 +276,45 @@ const saveFailed = glossarySaveDecision(failed, "room-b", "session-from-room-a")
 assert.equal(saveFailed.post, false);
 assert.equal(saveFailed.reason, "room-mismatch");
 assert.match(failed.note, /讀不到這個房間已經存的術語/);
+assert.match(failed.note, /先空白/);
+assert.equal(failed.note, "讀不到這個房間已經存的術語，所以這裡先空白。");
+assert.equal(failed.note.includes("上次看到的內容"), false);
+assert.equal(failed.note.includes("還沒儲存的修改還在"), false);
+assert.equal(failed.locked, true);
+assert.equal(failed.readOnly, true);
 assert.equal(failed.note.includes("沒有寫入"), false);
 assert.equal(failed.note.includes("沒有儲存"), false);
 assert.equal(failed.note.includes("伺服器"), false);
 const failedHint = glossaryRefusal(failed, saveFailed.reason);
 assert.match(failedHint, /^沒有儲存：/);
+assert.match(failedHint, /先空白/);
 assert.equal(failedHint.includes("沒有寫入"), false);
 assert.equal(failedHint.includes("已儲存"), false);
 assert.equal(glossaryRefusal({ note: "" }, "room-mismatch").startsWith("沒有儲存："), true);
 assert.equal(glossaryRefusal({ note: "" }, "room-mismatch").includes("沒有寫入"), false);
+
+// The first load fails before any room has been shown, and the box is still empty.
+// That must lock the box. Keeping the previous screen would leave it editable.
+let firstMiss = glossaryRoomState();
+assert.equal(firstMiss.text, "");
+assert.equal(firstMiss.locked, false);
+assert.equal(firstMiss.readOnly, false);
+firstMiss = glossaryPrepareLoad(firstMiss, "room-a");
+firstMiss = glossaryApplyLoadFailure(firstMiss, "room-a", firstMiss.generation);
+assert.equal(firstMiss.room, null);
+assert.equal(firstMiss.text, "");
+assert.equal(firstMiss.loadedText, "");
+assert.equal(firstMiss.version, null);
+assert.equal(firstMiss.locked, true);
+assert.equal(firstMiss.readOnly, true);
+assert.match(firstMiss.note, /先空白/);
+assert.equal(firstMiss.note, "讀不到這個房間已經存的術語，所以這裡先空白。");
+assert.equal(firstMiss.note.includes("上次看到的內容"), false);
+assert.equal(firstMiss.note.includes("還沒儲存的修改還在"), false);
+const firstMissSave = glossarySaveDecision(firstMiss, "room-a", "s");
+assert.equal(firstMissSave.post, false);
+assert.equal(firstMissSave.reason, "room-mismatch");
+assert.equal(firstMissSave.body, undefined);
 
 // A reconnect must not wipe unsaved text or adopt a newer version.
 let dirty = glossaryRoomState();
@@ -309,6 +339,9 @@ assert.equal(missed.text, "甲=changed");
 assert.equal(missed.version, 1);
 assert.match(missed.note, /讀不到這個房間已經存的術語/);
 assert.match(missed.note, /還沒儲存的修改還在/);
+assert.equal(missed.note, "讀不到這個房間已經存的術語。文字框裡還沒儲存的修改還在。");
+assert.equal(missed.note.includes("先空白"), false);
+assert.equal(missed.note.includes("上次看到的內容"), false);
 assert.equal(missed.note.includes("沒有寫入"), false);
 assert.equal(missed.note.includes("沒有儲存"), false);
 assert.equal(missed.note.includes("伺服器"), false);
@@ -321,6 +354,9 @@ missedClean = glossaryApplyLoadFailure(missedClean, "room-a", missedClean.genera
 assert.equal(missedClean.text, seen);
 assert.equal(missedClean.version, 1);
 assert.match(missedClean.note, /上次看到的內容/);
+assert.equal(missedClean.note, "讀不到這個房間已經存的術語，畫面上仍是上次看到的內容。");
+assert.equal(missedClean.note.includes("先空白"), false);
+assert.equal(missedClean.note.includes("還沒儲存的修改還在"), false);
 assert.equal(missedClean.note.includes("沒有寫入"), false);
 assert.equal(missedClean.note.includes("伺服器"), false);
 
@@ -355,6 +391,19 @@ assert.equal(wipeHint, "沒有儲存：" + typedEarly.note);
 assert.equal(wipeHint.includes("沒有寫入"), false);
 assert.equal(wipeHint.includes("已儲存"), false);
 assert.equal(wipeHint.includes("伺服器"), false);
+// The reload is the same unseen glossary the prefill already paired with loadedText.
+// That must not adopt the server version, or the next save replaces those terms.
+let typedEarlyReload = glossaryPrepareLoad(typedEarly, "room-a");
+typedEarlyReload = glossaryApplyLoaded(typedEarlyReload, "room-a", typedEarlyReload.generation, thirty, 4);
+assert.equal(typedEarlyReload.text, "般若=prajna");
+assert.equal(glossaryBoxText(thirty), typedEarlyReload.loadedText);
+assert.equal(typedEarlyReload.version, null);
+assert.notEqual(typedEarlyReload.version, 4);
+assert.equal(typedEarlyReload.prefillUnversioned, true);
+const typedEarlyReloadSave = glossarySaveDecision(typedEarlyReload, "room-a", "s");
+assert.equal(typedEarlyReloadSave.post, false, "a reload must not give prefilled text the server version");
+assert.equal(typedEarlyReloadSave.reason, "no-version");
+assert.equal(typedEarlyReloadSave.body, undefined);
 
 // An empty server glossary can still take text the host typed before the first load.
 let typedEmpty = glossaryEdit(glossaryRoomState(), "般若=prajna");
@@ -688,3 +737,46 @@ assert.equal(cameMissedSettled.state.version, 5);
 const cameMissedSave = glossarySaveDecision(cameMissedSettled.state, "room-a", "s");
 assert.equal(cameMissedSave.post, true);
 assert.equal(cameMissedSave.body.if_version, 5);
+
+// Save on B after the host has switched to B. This visit's generation equals
+// visitGeneration, so the 200 must be kept. Treating "generation <= visit" as
+// "already left" drops it, and the next save still sends B's old if_version.
+let savedOnB = glossaryRoomState();
+savedOnB = glossaryPrepareLoad(savedOnB, "room-a");
+savedOnB = glossaryApplyLoaded(savedOnB, "room-a", savedOnB.generation, roomA, 1);
+savedOnB = glossaryPrepareLoad(savedOnB, "room-b");
+savedOnB = glossaryApplyLoaded(savedOnB, "room-b", savedOnB.generation, roomB, 4);
+savedOnB = glossaryEdit(savedOnB, "丙=B1\n丁=B2");
+const savedOnBGen = savedOnB.generation;
+const savedOnBReq = glossarySaveDecision(savedOnB, "room-b", "s");
+assert.equal(savedOnBReq.post, true);
+assert.equal(savedOnBReq.body.room_id, "room-b");
+assert.equal(savedOnBReq.body.if_version, 4);
+assert.equal(savedOnBReq.body.text, "丙=B1\n丁=B2");
+const savedOnBSettled = glossarySaveSettlement(savedOnB, "room-b", savedOnBGen, savedOnBReq.body.text);
+assert.equal(savedOnBSettled.settle, true);
+assert.equal(savedOnBSettled.reloadRoom, "room-b");
+assert.equal(savedOnBSettled.state.room, "room-b");
+assert.equal(savedOnBSettled.state.version, null);
+assert.notEqual(savedOnBSettled.state.version, 4);
+assert.equal(savedOnBSettled.state.text, "丙=B1\n丁=B2");
+assert.equal(savedOnBSettled.state.loadedText, savedOnBReq.body.text);
+let savedOnBNext = savedOnBSettled.state;
+savedOnBNext = glossaryPrepareLoad(savedOnBNext, "room-b");
+savedOnBNext = glossaryApplyLoaded(
+  savedOnBNext,
+  "room-b",
+  savedOnBNext.generation,
+  [plainTerm("丙", "B1"), plainTerm("丁", "B2")],
+  5,
+);
+assert.equal(savedOnBNext.version, 5);
+assert.equal(savedOnBNext.room, "room-b");
+assert.equal(savedOnBNext.text, "丙=B1\n丁=B2");
+savedOnBNext = glossaryEdit(savedOnBNext, savedOnBNext.text + "\n戊=B3");
+const savedOnBAgain = glossarySaveDecision(savedOnBNext, "room-b", "s");
+assert.equal(savedOnBAgain.post, true);
+assert.equal(savedOnBAgain.body.room_id, "room-b");
+assert.equal(savedOnBAgain.body.if_version, 5);
+assert.notEqual(savedOnBAgain.body.if_version, 4);
+assert.equal(savedOnBAgain.body.text, "丙=B1\n丁=B2\n戊=B3");
