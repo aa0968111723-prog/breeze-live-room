@@ -8,6 +8,7 @@ import {
   glossaryApplyLoaded,
   glossaryBeginLoad,
   glossaryBoxText,
+  glossaryCanonicalText,
   glossaryEdit,
   glossaryLegacyBlock,
   glossaryLoadTargetsSelector,
@@ -832,3 +833,109 @@ assert.equal(savedOnBAgain.body.room_id, "room-b");
 assert.equal(savedOnBAgain.body.if_version, 5);
 assert.notEqual(savedOnBAgain.body.if_version, 4);
 assert.equal(savedOnBAgain.body.text, "丙=B1\n丁=B2\n戊=B3");
+
+// N11b. A 200 reloads the glossary the legacy POST stored. The box still holds
+// the posted textarea, often with a trailing newline, plus keystrokes typed
+// since. Adopt that version only when those stored words are the posted words.
+function n11During(sent) {
+  return sent.endsWith("\n") ? sent + "丙=during" : sent + "\n丙=during";
+}
+
+function n11Reload(sent, serverTerms, version) {
+  const during = n11During(sent);
+  assert.notStrictEqual(during, sent);
+  let state = glossaryRoomState();
+  state = glossaryPrepareLoad(state, "room-a");
+  state = glossaryApplyLoaded(state, "room-a", state.generation, roomA, 1);
+  state = glossaryEdit(state, sent);
+  const generation = state.generation;
+  const save = glossarySaveDecision(state, "room-a", "s");
+  assert.strictEqual(save.post, true);
+  assert.strictEqual(save.body.text, sent);
+  assert.strictEqual(save.body.room_id, "room-a");
+  assert.strictEqual(save.body.if_version, 1);
+  state = glossaryEdit(state, during);
+  const settled = glossarySaveSettlement(state, save.body.room_id, generation, save.body.text);
+  assert.strictEqual(settled.settle, true);
+  assert.strictEqual(settled.state.version, null);
+  assert.strictEqual(settled.state.loadedText, sent);
+  assert.strictEqual(settled.state.text, during);
+  const loaded = glossaryApplyLoaded(settled.state, "room-a", settled.state.generation, serverTerms, version);
+  return { during, loaded };
+}
+
+function assertAdoptedPosted(label, sent, serverTerms) {
+  assert.strictEqual(glossaryCanonicalText(sent), glossaryBoxText(serverTerms), label);
+  const { during, loaded } = n11Reload(sent, serverTerms, 2);
+  assert.strictEqual(loaded.version, 2, label);
+  assert.notStrictEqual(loaded.version, null, label);
+  assert.notStrictEqual(loaded.version, 1, label);
+  assert.strictEqual(loaded.text, during, label);
+  assert.strictEqual(loaded.loadedText, sent, label);
+  const again = glossarySaveDecision(loaded, "room-a", "s");
+  assert.strictEqual(again.post, true, label);
+  assert.strictEqual(again.reason, undefined, label);
+  assert.strictEqual(again.body.if_version, 2, label);
+  assert.notStrictEqual(again.body.if_version, 1, label);
+  assert.strictEqual(again.body.text, during, label);
+  assert.strictEqual(again.body.room_id, "room-a", label);
+  assert.notStrictEqual(again.body.text, glossaryBoxText(serverTerms), label);
+}
+
+function assertRefusedPosted(label, sent, serverTerms) {
+  assert.notStrictEqual(glossaryCanonicalText(sent), glossaryBoxText(serverTerms), label);
+  const { during, loaded } = n11Reload(sent, serverTerms, 6);
+  assert.strictEqual(loaded.version, null, label);
+  assert.notStrictEqual(loaded.version, 6, label);
+  assert.strictEqual(loaded.text, during, label);
+  assert.strictEqual(loaded.loadedText, sent, label);
+  const again = glossarySaveDecision(loaded, "room-a", "s");
+  assert.strictEqual(again.post, false, label);
+  assert.strictEqual(again.reason, "no-version", label);
+  assert.strictEqual(again.body, undefined, label);
+}
+
+const postedPair = [plainTerm("甲", "A1"), plainTerm("乙", "A2")];
+for (const [label, sent] of [
+  ["trailing newline", "甲=A1\n乙=A2\n"],
+  ["blank line", "甲=A1\n\n乙=A2"],
+  ["spaces around equals", "甲 = A1\n乙 = A2"],
+  ["hash comment", "甲=A1\n# 註解\n乙=A2"],
+  ["fullwidth equals", "甲＝A1\n乙＝A2"],
+  ["crlf", "甲=A1\r\n乙=A2\r\n"],
+]) {
+  assertAdoptedPosted(label, sent, postedPair);
+}
+assertAdoptedPosted("alias spaces", "禪學社 | 柴學社 = Zen Club\n", [
+  { zh: "禪學社", en: "Zen Club", aliases: ["柴學社"], lock: true, note: "", category: "" },
+]);
+assertAdoptedPosted("fullwidth equals inside english", "般若=pra＝jna\n", [plainTerm("般若", "pra＝jna")]);
+assertAdoptedPosted("ascii equals inside english", "等號=a=b\n", [plainTerm("等號", "a=b")]);
+assertAdoptedPosted("ideographic space", "甲\u3000=\u3000A1\n乙\u3000＝\u3000A2\n", postedPair);
+assert.strictEqual(glossaryCanonicalText("甲|別名|別名=A1\n"), "甲|別名=A1");
+
+assertRefusedPosted("server has an extra term", "甲=A1\n乙=A2\n", [
+  plainTerm("甲", "A1"), plainTerm("乙", "A2"), plainTerm("丙", "remote"),
+]);
+assertRefusedPosted("server is missing a term", "甲=A1\n\n乙=A2", [plainTerm("甲", "A1")]);
+assertRefusedPosted("translation differs", "甲 = A1\n乙 = A2", [
+  plainTerm("甲", "A1"), plainTerm("乙", "CHANGED"),
+]);
+assertRefusedPosted("alias differs", "禪學社 | 柴學社 = Zen Club\n", [
+  { zh: "禪學社", en: "Zen Club", aliases: ["別的"], lock: true, note: "", category: "" },
+]);
+assertRefusedPosted("alias missing", "禪學社|柴學社=Zen Club\r\n", [plainTerm("禪學社", "Zen Club")]);
+assertRefusedPosted("line without equals is not dropped", "甲=A1\n不是術語\n乙=A2\n", postedPair);
+assertRefusedPosted("empty alias is not dropped", "甲||乙=A1\n", [
+  { zh: "甲", en: "A1", aliases: ["乙"], lock: true, note: "", category: "" },
+]);
+assertRefusedPosted("unicode line separator is not a newline", "甲=A1\u2028乙=A2", postedPair);
+assertRefusedPosted("lone CR is not a newline", "甲=A1\r乙=A2", postedPair);
+assertRefusedPosted("comment-only is not an empty glossary", "# 註解\n\n", []);
+const fortyOne = Array.from({ length: 41 }, (_, i) => "詞" + String(i).padStart(2, "0") + "=e" + i).join("\n") + "\n";
+assert.strictEqual(glossaryCanonicalText(fortyOne), fortyOne);
+assert.notStrictEqual(glossaryCanonicalText(fortyOne), fortyOne.split("\n").slice(0, 40).join("\n"));
+const longEnglish = "甲=" + "a".repeat(81) + "\n";
+assert.strictEqual(glossaryCanonicalText(longEnglish), longEnglish);
+assert.notStrictEqual(glossaryCanonicalText(longEnglish), "甲=" + "a".repeat(80));
+assert.notStrictEqual(glossaryCanonicalText("\uFEFF甲=A1\n"), "甲=A1");

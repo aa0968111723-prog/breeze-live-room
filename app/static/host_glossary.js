@@ -3,6 +3,15 @@
 // Lock off, a note, a category, text the line would change, or more than 40 rows do not.
 
 const LEGACY_BOX_LIMIT = 40;
+const LEGACY_MAX_EN = 80;
+// str.isspace() in the Python that parses a legacy post. String.trim() also
+// strips U+FEFF, which this set does not, and it misses U+001C–U+001F and U+0085.
+const PYTHON_SPACE = new Set([
+  0x0009, 0x000a, 0x000b, 0x000c, 0x000d, 0x001c, 0x001d, 0x001e, 0x001f,
+  0x0020, 0x0085, 0x00a0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004,
+  0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a, 0x2028, 0x2029, 0x202f,
+  0x205f, 0x3000,
+]);
 const LEGACY_EDIT_PLACE = "請用 PUT /api/rooms/{room_id}/glossary 修改。這是技術操作，請找負責詞表的人。格式見 README「修改房間術語表」。";
 const LEGACY_RICH = "含備註、分類或未鎖定的詞，或文字框無法原樣表示的內容";
 
@@ -58,6 +67,67 @@ export function glossaryBoxText(terms) {
     lines.push(left + "=" + en);
   }
   return lines.join("\n");
+}
+
+function glossaryPythonStrip(text) {
+  let start = 0;
+  let end = text.length;
+  while (start < end && PYTHON_SPACE.has(text.charCodeAt(start))) start += 1;
+  while (end > start && PYTHON_SPACE.has(text.charCodeAt(end - 1))) end -= 1;
+  return text.slice(start, end);
+}
+
+function glossaryHasInvisibleBreak(text) {
+  return text.includes("\u0085") || text.includes("\u2028") || text.includes("\u2029");
+}
+
+// First ASCII "=" wins, including when a fullwidth equals sits later in the English.
+function glossarySplitEquals(text) {
+  const ascii = text.indexOf("=");
+  if (ascii >= 0) return [text.slice(0, ascii), text.slice(ascii + 1)];
+  const full = text.indexOf("＝");
+  if (full >= 0) return [text.slice(0, full), text.slice(full + 1)];
+  return null;
+}
+
+// Text the legacy POST stores, rewritten with glossaryBoxText.
+// strict_legacy_rows drops blank lines and "#" comments, strips each field, splits
+// on the first "=" or "＝", and keeps alias pieces. validate_terms then drops
+// duplicate aliases. "\n" is the only line break; a trailing "\r" is stripped
+// with the field. U+0085 / U+2028 / U+2029 reject the whole body, and so does a
+// line that would not be stored (no equals, an empty alias, an empty side, a
+// 41st term, English over 80). Those stay unchanged: rewriting them into fewer
+// terms would match a different glossary and adopt its version.
+export function glossaryCanonicalText(raw) {
+  const text = String(raw ?? "");
+  if (glossaryHasInvisibleBreak(text)) return text;
+  const rows = [];
+  for (const line of text.split("\n")) {
+    const trimmed = glossaryPythonStrip(line);
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const split = glossarySplitEquals(trimmed);
+    if (!split) return text;
+    const en = glossaryPythonStrip(split[1]);
+    const aliases = [];
+    let zh;
+    if (split[0].includes("|")) {
+      const parts = split[0].split("|");
+      zh = glossaryPythonStrip(parts[0]);
+      for (let i = 1; i < parts.length; i += 1) {
+        const alias = glossaryPythonStrip(parts[i]);
+        if (!alias) return text;
+        if (!aliases.includes(alias)) aliases.push(alias);
+      }
+    } else {
+      zh = glossaryPythonStrip(split[0]);
+    }
+    if (!zh || !en) return text;
+    if (rows.length >= LEGACY_BOX_LIMIT) return text;
+    if ([...en].length > LEGACY_MAX_EN) return text;
+    rows.push({ zh, en, aliases });
+  }
+  if (!rows.length) return text;
+  return glossaryBoxText(rows);
 }
 
 function glossaryLineBreaks(text) {
@@ -238,9 +308,11 @@ export function glossaryApplyLoaded(state, room, generation, terms, version) {
     // version is null because this visit just posted loadedText. The reload's
     // version is the base of keystrokes typed since only when the server body
     // is that posted text and the glossary is still editable. A different body
-    // or a locked one can hold words the box does not show.
+    // or a locked one can hold words the box does not show. Compare the text
+    // the legacy POST stores, not the raw textarea, so a trailing newline is
+    // still the same words.
     const adoptPostedVersion = state.version == null
-      && serverText === state.loadedText
+      && serverText === glossaryCanonicalText(state.loadedText)
       && !state.locked
       && !block.locked;
     return {
