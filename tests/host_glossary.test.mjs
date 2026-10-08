@@ -559,3 +559,132 @@ assert.equal(marked.loadedText, "甲=changed");
 assert.equal(marked.version, null);
 assert.equal(marked.prefillUnversioned, false);
 assert.equal(marked.room, "room-a");
+
+// Same room and the same generation, but the host kept typing while the POST was in flight.
+// loadedText must be the text that was sent, not the box, or the reload looks clean and
+// replaces the new keystrokes with the server body.
+let typing = glossaryRoomState();
+typing = glossaryPrepareLoad(typing, "room-a");
+typing = glossaryApplyLoaded(typing, "room-a", typing.generation, roomA, 1);
+typing = glossaryEdit(typing, "甲=A1\n乙=A2");
+const typingGen = typing.generation;
+const typingSave = glossarySaveDecision(typing, "room-a", "s");
+assert.equal(typingSave.post, true);
+assert.equal(typing.generation, typingGen);
+typing = glossaryEdit(typing, typing.text + "\n丙=during");
+const typingSettled = glossarySaveSettlement(typing, "room-a", typingGen, typingSave.body.text);
+assert.equal(typingSettled.settle, true);
+assert.equal(typingSettled.reloadRoom, "room-a");
+assert.equal(typingSettled.state.room, "room-a");
+assert.equal(typingSettled.state.text, "甲=A1\n乙=A2\n丙=during");
+assert.equal(typingSettled.state.loadedText, typingSave.body.text);
+assert.notEqual(typingSettled.state.text, typingSettled.state.loadedText);
+assert.equal(typingSettled.state.version, null);
+assert.equal(typingSettled.state.prefillUnversioned, false);
+const typingLoaded = glossaryApplyLoaded(
+  typingSettled.state,
+  "room-a",
+  typingSettled.state.generation,
+  savedTerms,
+  2,
+);
+assert.equal(typingLoaded.text, "甲=A1\n乙=A2\n丙=during");
+assert.notEqual(typingLoaded.text, glossaryBoxText(savedTerms));
+assert.equal(typingLoaded.loadedText, typingSave.body.text);
+assert.equal(typingLoaded.version, null);
+const typingAgain = glossarySaveDecision(typingLoaded, "room-a", "s");
+assert.equal(typingAgain.post, false, "keystrokes during the POST must not be posted over the saved glossary");
+assert.equal(typingAgain.reason, "no-version");
+assert.equal(typingAgain.body, undefined);
+
+// Save for A is still in flight. The host stops, switches A→B→A, and reloads A.
+// That is another visit, not a reconnect of the visit that posted. The late 200 must
+// not replace the loaded text or version, or the next reload stays dirty and every
+// later save is refused with no-version.
+let cameBack = glossaryRoomState();
+cameBack = glossaryPrepareLoad(cameBack, "room-a");
+cameBack = glossaryApplyLoaded(cameBack, "room-a", cameBack.generation, roomA, 1);
+cameBack = glossaryEdit(cameBack, "甲=A1\n乙=A2");
+const cameGen = cameBack.generation;
+const cameSave = glossarySaveDecision(cameBack, "room-a", "s");
+assert.equal(cameSave.post, true);
+const cameSent = cameSave.body.text;
+cameBack = glossaryPrepareLoad(cameBack, "room-b");
+cameBack = glossaryApplyLoaded(cameBack, "room-b", cameBack.generation, roomB, 4);
+const roomANewer = [plainTerm("甲", "A1"), plainTerm("乙", "from-server")];
+cameBack = glossaryPrepareLoad(cameBack, "room-a");
+cameBack = glossaryApplyLoaded(cameBack, "room-a", cameBack.generation, roomANewer, 5);
+assert.equal(cameBack.room, "room-a");
+assert.equal(cameBack.version, 5);
+assert.equal(cameBack.text, glossaryBoxText(roomANewer));
+assert.equal(cameBack.loadedText, cameBack.text);
+assert.notEqual(cameBack.text, cameSent);
+const cameClean = cameBack;
+const cameCleanSettled = glossarySaveSettlement(cameClean, "room-a", cameGen, cameSent);
+assert.equal(cameCleanSettled.settle, false);
+assert.equal(cameCleanSettled.reloadRoom, undefined);
+assert.deepEqual(cameCleanSettled.state, cameClean);
+assert.equal(cameCleanSettled.state.version, 5);
+assert.equal(cameCleanSettled.state.loadedText, glossaryBoxText(roomANewer));
+assert.notEqual(cameCleanSettled.state.version, null);
+const cameCleanSave = glossarySaveDecision(cameCleanSettled.state, "room-a", "s");
+assert.equal(cameCleanSave.post, true, "a new visit must keep the version it loaded");
+assert.equal(cameCleanSave.body.if_version, 5);
+assert.equal(cameCleanSave.body.room_id, "room-a");
+assert.equal(cameCleanSave.body.text, glossaryBoxText(roomANewer));
+assert.notEqual(cameCleanSave.body.if_version, 1);
+
+// The reloaded glossary matches what was posted, then the host types. Still a new visit.
+let cameEqual = glossaryRoomState();
+cameEqual = glossaryPrepareLoad(cameEqual, "room-a");
+cameEqual = glossaryApplyLoaded(cameEqual, "room-a", cameEqual.generation, roomA, 1);
+cameEqual = glossaryEdit(cameEqual, "甲=A1\n乙=A2");
+const cameEqualGen = cameEqual.generation;
+const cameEqualSent = glossarySaveDecision(cameEqual, "room-a", "s").body.text;
+cameEqual = glossaryPrepareLoad(cameEqual, "room-b");
+cameEqual = glossaryApplyLoaded(cameEqual, "room-b", cameEqual.generation, roomB, 4);
+cameEqual = glossaryPrepareLoad(cameEqual, "room-a");
+cameEqual = glossaryApplyLoaded(cameEqual, "room-a", cameEqual.generation, savedTerms, 8);
+assert.equal(cameEqual.text, cameEqualSent);
+assert.equal(cameEqual.version, 8);
+cameEqual = glossaryEdit(cameEqual, cameEqual.text + "\n丁=local");
+const cameEqualSettled = glossarySaveSettlement(cameEqual, "room-a", cameEqualGen, cameEqualSent);
+assert.equal(cameEqualSettled.settle, false);
+assert.equal(cameEqualSettled.reloadRoom, undefined);
+assert.deepEqual(cameEqualSettled.state, cameEqual);
+assert.equal(cameEqualSettled.state.version, 8);
+assert.equal(cameEqualSettled.state.loadedText, cameEqualSent);
+assert.equal(cameEqualSettled.state.text, cameEqualSent + "\n丁=local");
+let cameEqualReload = glossaryPrepareLoad(cameEqualSettled.state, "room-a");
+cameEqualReload = glossaryApplyLoaded(cameEqualReload, "room-a", cameEqualReload.generation, savedTerms, 9);
+assert.equal(cameEqualReload.text, cameEqualSent + "\n丁=local");
+assert.equal(cameEqualReload.version, 8);
+assert.notEqual(cameEqualReload.version, null);
+const cameEqualSave = glossarySaveDecision(cameEqualReload, "room-a", "s");
+assert.equal(cameEqualSave.post, true, "later saves must not all be rejected with no-version");
+assert.equal(cameEqualSave.reason, undefined);
+assert.equal(cameEqualSave.body.if_version, 8);
+assert.equal(cameEqualSave.body.text, cameEqualSent + "\n丁=local");
+assert.equal(cameEqualSave.body.room_id, "room-a");
+
+// B's load fails, then A is opened again. The late 200 is still the previous visit.
+let cameMissed = glossaryRoomState();
+cameMissed = glossaryPrepareLoad(cameMissed, "room-a");
+cameMissed = glossaryApplyLoaded(cameMissed, "room-a", cameMissed.generation, roomA, 1);
+cameMissed = glossaryEdit(cameMissed, "甲=A1\n乙=A2");
+const cameMissedGen = cameMissed.generation;
+const cameMissedSent = glossarySaveDecision(cameMissed, "room-a", "s").body.text;
+cameMissed = glossaryPrepareLoad(cameMissed, "room-b");
+cameMissed = glossaryApplyLoadFailure(cameMissed, "room-b", cameMissed.generation);
+assert.equal(cameMissed.room, null);
+cameMissed = glossaryPrepareLoad(cameMissed, "room-a");
+cameMissed = glossaryApplyLoaded(cameMissed, "room-a", cameMissed.generation, roomANewer, 5);
+assert.equal(cameMissed.room, "room-a");
+assert.equal(cameMissed.version, 5);
+const cameMissedSettled = glossarySaveSettlement(cameMissed, "room-a", cameMissedGen, cameMissedSent);
+assert.equal(cameMissedSettled.settle, false);
+assert.deepEqual(cameMissedSettled.state, cameMissed);
+assert.equal(cameMissedSettled.state.version, 5);
+const cameMissedSave = glossarySaveDecision(cameMissedSettled.state, "room-a", "s");
+assert.equal(cameMissedSave.post, true);
+assert.equal(cameMissedSave.body.if_version, 5);

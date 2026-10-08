@@ -99,6 +99,12 @@ function glossaryRoomName(room) {
   return String(room || "").trim() || "class";
 }
 
+// 0 is the first visit. A room change advances it; a same-room reconnect does not.
+function glossaryVisitGeneration(state) {
+  const visit = state && state.visitGeneration;
+  return Number.isInteger(visit) && visit >= 0 ? visit : 0;
+}
+
 function glossaryEditPlace(room) {
   if (room == null) return LEGACY_EDIT_PLACE;
   return LEGACY_EDIT_PLACE.replace("{room_id}", glossaryRoomName(room));
@@ -162,6 +168,7 @@ export function glossaryRoomState() {
     // True when the box held text before the first load of a non-empty glossary.
     // That text must not be given the server version.
     prefillUnversioned: false,
+    visitGeneration: 0,
   };
 }
 
@@ -195,6 +202,7 @@ export function glossaryPrepareLoad(state, room) {
     generation,
     pendingRoom: nextRoom,
     prefillUnversioned: false,
+    visitGeneration: generation,
   };
 }
 
@@ -247,6 +255,7 @@ export function glossaryApplyLoaded(state, room, generation, terms, version) {
         generation,
         pendingRoom: nextRoom,
         prefillUnversioned: true,
+        visitGeneration: glossaryVisitGeneration(state),
       };
     }
     return {
@@ -260,6 +269,7 @@ export function glossaryApplyLoaded(state, room, generation, terms, version) {
       generation,
       pendingRoom: nextRoom,
       prefillUnversioned: false,
+      visitGeneration: glossaryVisitGeneration(state),
     };
   }
   return {
@@ -273,6 +283,7 @@ export function glossaryApplyLoaded(state, room, generation, terms, version) {
     generation,
     pendingRoom: nextRoom,
     prefillUnversioned: false,
+    visitGeneration: glossaryVisitGeneration(state),
   };
 }
 
@@ -297,6 +308,7 @@ export function glossaryApplyLoadFailure(state, room, generation) {
     generation,
     pendingRoom: nextRoom,
     prefillUnversioned: false,
+    visitGeneration: glossaryVisitGeneration(state),
   };
 }
 
@@ -307,11 +319,11 @@ export function glossarySaveDecision(state, selectorRoom, sessionId) {
   return glossarySaveRequest(state.room, sessionId, state.text, state.version, false);
 }
 
-// A 200 applies only when the box still shows that room. Another room is left
-// untouched, including its text and version. The same room with a newer
-// generation means a reconnect loaded during the POST: remember the posted
-// text, drop the stale version, and reload. Otherwise the next save sends the
-// old if_version and the server answers 409.
+// A 200 applies only to the visit that posted. Another room is left untouched.
+// Returning to the same room starts a new visit (visitGeneration is newer than
+// the save), so that visit's loaded text and version stay. The same visit uses
+// the posted text, not keystrokes typed since, drops the stale version, and
+// reloads. Otherwise the next save sends the old if_version and gets 409.
 function glossaryRememberPosted(state, sentText) {
   const loadedText = sentText == null ? state.text : String(sentText);
   return { ...state, loadedText, version: null, prefillUnversioned: false };
@@ -322,10 +334,10 @@ export function glossarySaveSettlement(state, requestRoom, requestGeneration, se
   if (!state || state.room !== room) {
     return { settle: false, state };
   }
-  if (state.generation !== requestGeneration) {
-    return { settle: true, state: glossaryRememberPosted(state, sentText), reloadRoom: room };
+  if (requestGeneration < glossaryVisitGeneration(state)) {
+    return { settle: false, state };
   }
-  return { settle: true, state: glossaryMarkSaved(state), reloadRoom: room };
+  return { settle: true, state: glossaryRememberPosted(state, sentText), reloadRoom: room };
 }
 
 export function glossaryRefusal(state, reason) {
