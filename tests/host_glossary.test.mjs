@@ -213,9 +213,10 @@ assert.equal(post.includes("ctl.session.roomId"), false);
 assert.equal(post.includes("/api/rooms/"), false);
 assert.equal(/Number\.isInteger\(/.test(post), false);
 assert.match(post, /409/);
-assert.match(post, /glossarySaveSettlement/);
+assert.match(post, /glossarySaveSettlement\(\s*glossaryState,\s*requestRoom,\s*requestGeneration,\s*request\.body\.text\s*\)/);
 assert.equal(post.includes("glossaryMarkSaved"), false);
 assert.ok(post.indexOf("glossarySaveSettlement") < post.indexOf("loadGlossary"));
+assert.ok(post.indexOf("glossaryState = settled.state") < post.indexOf("loadGlossary"));
 assert.equal(post.includes("這頁剛剛讀到"), false);
 assert.match(setup, /loadGlossary/);
 assert.match(listen, /loadGlossary/);
@@ -274,9 +275,16 @@ assert.equal(failed.version, null);
 const saveFailed = glossarySaveDecision(failed, "room-b", "session-from-room-a");
 assert.equal(saveFailed.post, false);
 assert.equal(saveFailed.reason, "room-mismatch");
+assert.match(failed.note, /讀不到這個房間已經存的術語/);
+assert.equal(failed.note.includes("沒有寫入"), false);
+assert.equal(failed.note.includes("沒有儲存"), false);
+assert.equal(failed.note.includes("伺服器"), false);
 const failedHint = glossaryRefusal(failed, saveFailed.reason);
-assert.match(failedHint, /沒有寫入/);
+assert.match(failedHint, /^沒有儲存：/);
+assert.equal(failedHint.includes("沒有寫入"), false);
 assert.equal(failedHint.includes("已儲存"), false);
+assert.equal(glossaryRefusal({ note: "" }, "room-mismatch").startsWith("沒有儲存："), true);
+assert.equal(glossaryRefusal({ note: "" }, "room-mismatch").includes("沒有寫入"), false);
 
 // A reconnect must not wipe unsaved text or adopt a newer version.
 let dirty = glossaryRoomState();
@@ -289,7 +297,32 @@ dirty = glossaryApplyLoaded(dirty, "room-a", dirty.generation, roomA, 9);
 assert.equal(dirty.text, "甲=changed\n乙=b");
 assert.equal(dirty.version, 1);
 assert.match(dirty.note, /還沒儲存/);
+assert.equal(dirty.note.includes("伺服器"), false);
 assert.match(glossaryRefusal(dirty, "room-mismatch"), /還沒儲存|不是這個房間/);
+let missed = glossaryRoomState();
+missed = glossaryPrepareLoad(missed, "room-a");
+missed = glossaryApplyLoaded(missed, "room-a", missed.generation, roomA, 1);
+missed = glossaryEdit(missed, "甲=changed");
+missed = glossaryPrepareLoad(missed, "room-a");
+missed = glossaryApplyLoadFailure(missed, "room-a", missed.generation);
+assert.equal(missed.text, "甲=changed");
+assert.equal(missed.version, 1);
+assert.match(missed.note, /讀不到這個房間已經存的術語/);
+assert.match(missed.note, /還沒儲存的修改還在/);
+assert.equal(missed.note.includes("沒有寫入"), false);
+assert.equal(missed.note.includes("沒有儲存"), false);
+assert.equal(missed.note.includes("伺服器"), false);
+let missedClean = glossaryRoomState();
+missedClean = glossaryPrepareLoad(missedClean, "room-a");
+missedClean = glossaryApplyLoaded(missedClean, "room-a", missedClean.generation, roomA, 1);
+const seen = missedClean.text;
+missedClean = glossaryPrepareLoad(missedClean, "room-a");
+missedClean = glossaryApplyLoadFailure(missedClean, "room-a", missedClean.generation);
+assert.equal(missedClean.text, seen);
+assert.equal(missedClean.version, 1);
+assert.match(missedClean.note, /上次看到的內容/);
+assert.equal(missedClean.note.includes("沒有寫入"), false);
+assert.equal(missedClean.note.includes("伺服器"), false);
 
 function plainTerm(zh, en) {
   return { zh, en, aliases: [], lock: true, note: "", category: "" };
@@ -303,16 +336,25 @@ typedEarly = glossaryApplyLoaded(typedEarly, "room-a", typedEarly.generation, th
 assert.equal(typedEarly.text, "般若=prajna");
 assert.equal(typedEarly.version, null);
 assert.equal(typedEarly.prefillUnversioned, true);
-assert.match(typedEarly.note, /伺服器上有 30 條/);
-assert.match(typedEarly.note, /沒有寫入/);
+assert.match(typedEarly.note, /這個房間已經存了 30 條術語/);
+assert.match(typedEarly.note, /開頁前留下的內容/);
+assert.match(typedEarly.note, /為了不蓋掉那 30 條/);
+assert.match(typedEarly.note, /想留的詞複製起來/);
+assert.equal(typedEarly.note.includes("沒有寫入"), false);
+assert.equal(typedEarly.note.includes("沒有儲存"), false);
+assert.equal(typedEarly.note.includes("伺服器"), false);
+assert.equal(typedEarly.note.includes("N 條"), false);
 const wipe = glossarySaveDecision(typedEarly, "room-a", "s");
 assert.equal(wipe.post, false, "prefilled text must not be posted over unseen server terms");
 assert.equal(wipe.reason, "no-version");
 assert.equal(wipe.body, undefined);
 const wipeHint = glossaryRefusal(typedEarly, wipe.reason);
-assert.match(wipeHint, /30/);
-assert.match(wipeHint, /沒有寫入/);
+assert.match(wipeHint, /^沒有儲存：這個房間已經存了 30 條術語/);
+assert.equal(wipeHint.split("。")[0].startsWith("沒有儲存："), true);
+assert.equal(wipeHint, "沒有儲存：" + typedEarly.note);
+assert.equal(wipeHint.includes("沒有寫入"), false);
 assert.equal(wipeHint.includes("已儲存"), false);
+assert.equal(wipeHint.includes("伺服器"), false);
 
 // An empty server glossary can still take text the host typed before the first load.
 let typedEmpty = glossaryEdit(glossaryRoomState(), "般若=prajna");
@@ -334,12 +376,18 @@ restored = glossaryApplyLoaded(restored, "class", restored.generation, remoteEdi
 assert.equal(restored.text, "般若=prajna");
 assert.equal(restored.version, null);
 assert.notEqual(restored.version, 7);
-assert.match(restored.note, /伺服器上有 2 條/);
+assert.match(restored.note, /這個房間已經存了 2 條術語/);
+assert.equal(restored.note.includes("沒有寫入"), false);
+assert.equal(restored.note.includes("沒有儲存"), false);
+assert.notEqual(restored.note, typedEarly.note);
 const overwrite = glossarySaveDecision(restored, "class", "s");
 assert.equal(overwrite.post, false, "restored text must not be posted with the remote version");
 assert.equal(overwrite.reason, "no-version");
-assert.match(glossaryRefusal(restored, overwrite.reason), /2/);
-assert.match(glossaryRefusal(restored, overwrite.reason), /沒有採用伺服器版本/);
+const overwriteHint = glossaryRefusal(restored, overwrite.reason);
+assert.match(overwriteHint, /^沒有儲存：這個房間已經存了 2 條術語/);
+assert.equal(overwriteHint, "沒有儲存：" + restored.note);
+assert.equal(overwriteHint.includes("沒有寫入"), false);
+assert.equal(overwriteHint.includes("沒有採用伺服器版本"), false);
 
 // A→B→A, with B's response arriving last, keeps A. An older A response is dropped too.
 let ordered = glossaryRoomState();
@@ -380,9 +428,17 @@ inflight = glossaryEdit(inflight, "丙=unsaved");
 const unsavedB = inflight.text;
 const settledLate = glossarySaveSettlement(inflight, saveRoom, saveGen);
 assert.equal(settledLate.settle, false);
+assert.equal(settledLate.reloadRoom, undefined);
+assert.deepEqual(settledLate.state, inflight);
 assert.equal(settledLate.state.room, "room-b");
 assert.equal(settledLate.state.text, unsavedB);
+assert.equal(settledLate.state.loadedText, glossaryBoxText(roomB));
 assert.equal(settledLate.state.version, 1);
+assert.equal(settledLate.state.prefillUnversioned, false);
+const settledOther = glossarySaveSettlement(inflight, saveRoom, saveGen, "甲=A1\n乙=A2");
+assert.equal(settledOther.settle, false);
+assert.equal(settledOther.reloadRoom, undefined);
+assert.deepEqual(settledOther.state, inflight);
 const strayLoad = glossaryBeginLoad(settledLate.state, saveRoom, "room-b");
 assert.equal(strayLoad.started, false);
 assert.equal(strayLoad.state.text, unsavedB);
@@ -406,11 +462,82 @@ assert.equal(appliedSave.state.version, null);
 assert.equal(appliedSave.state.loadedText, quiet.text);
 assert.equal(appliedSave.state.text, quiet.text);
 assert.equal(appliedSave.state.prefillUnversioned, false);
+// Same room, newer generation: a reconnect started a load while the POST was in flight.
+// Drop the stale version and remember the posted text, then the load takes the new
+// version. The next save must not send if_version 1 once the server is already v2.
 const reconnected = glossaryPrepareLoad(quiet, "room-a");
-const raced = glossarySaveSettlement(reconnected, "room-a", quietGen);
-assert.equal(raced.settle, false);
-assert.equal(raced.state.text, quiet.text);
+assert.equal(reconnected.version, 1);
+assert.notEqual(reconnected.generation, quietGen);
+const raced = glossarySaveSettlement(reconnected, "room-a", quietGen, quietSave.body.text);
+assert.equal(raced.settle, true);
+assert.equal(raced.reloadRoom, "room-a");
 assert.equal(raced.state.room, "room-a");
+assert.equal(raced.state.text, quiet.text);
+assert.equal(raced.state.loadedText, quietSave.body.text);
+assert.equal(raced.state.version, null);
+assert.notEqual(raced.state.version, 1);
+const savedTerms = [plainTerm("甲", "A1"), plainTerm("乙", "A2")];
+const racedLoaded = glossaryApplyLoaded(raced.state, "room-a", raced.state.generation, savedTerms, 2);
+assert.equal(racedLoaded.room, "room-a");
+assert.equal(racedLoaded.text, quiet.text);
+assert.equal(racedLoaded.loadedText, quiet.text);
+assert.equal(racedLoaded.version, 2);
+assert.notEqual(racedLoaded.version, 1);
+const racedNext = glossarySaveDecision(racedLoaded, "room-a", "s");
+assert.equal(racedNext.post, true);
+assert.equal(racedNext.body.room_id, "room-a");
+assert.equal(racedNext.body.text, quiet.text);
+assert.equal(racedNext.body.if_version, 2);
+assert.notEqual(racedNext.body.if_version, 1);
+
+// The reconnect load already finished, still dirty and still on v1, before the 200.
+// Settlement drops v1, and the reload the page starts then reads v2.
+let racedLate = glossaryApplyLoaded(reconnected, "room-a", reconnected.generation, roomA, 1);
+assert.equal(racedLate.version, 1);
+assert.equal(racedLate.text, quiet.text);
+assert.notEqual(racedLate.loadedText, quiet.text);
+const racedLateSettled = glossarySaveSettlement(racedLate, "room-a", quietGen, quietSave.body.text);
+assert.equal(racedLateSettled.settle, true);
+assert.equal(racedLateSettled.reloadRoom, "room-a");
+assert.equal(racedLateSettled.state.version, null);
+assert.equal(racedLateSettled.state.loadedText, quiet.text);
+assert.equal(racedLateSettled.state.text, quiet.text);
+assert.notEqual(racedLateSettled.state.version, 1);
+let racedReload = glossaryPrepareLoad(racedLateSettled.state, "room-a");
+racedReload = glossaryApplyLoaded(racedReload, "room-a", racedReload.generation, savedTerms, 2);
+assert.equal(racedReload.version, 2);
+assert.equal(racedReload.text, quiet.text);
+const racedReloadSave = glossarySaveDecision(racedReload, "room-a", "s");
+assert.equal(racedReloadSave.post, true);
+assert.equal(racedReloadSave.body.if_version, 2);
+assert.notEqual(racedReloadSave.body.if_version, 1);
+assert.equal(racedReloadSave.body.text, quiet.text);
+assert.equal(racedReloadSave.body.room_id, "room-a");
+
+// Keystrokes after the POST stay in the box and are not posted over the saved terms.
+const racedExtra = glossarySaveSettlement(
+  glossaryEdit(reconnected, quiet.text + "\n丙=extra"),
+  "room-a",
+  quietGen,
+  quietSave.body.text,
+);
+assert.equal(racedExtra.state.text, quiet.text + "\n丙=extra");
+assert.equal(racedExtra.state.loadedText, quietSave.body.text);
+assert.equal(racedExtra.state.version, null);
+const racedExtraLoaded = glossaryApplyLoaded(
+  racedExtra.state,
+  "room-a",
+  racedExtra.state.generation,
+  savedTerms,
+  2,
+);
+assert.equal(racedExtraLoaded.text, quiet.text + "\n丙=extra");
+assert.notEqual(racedExtraLoaded.text, glossaryBoxText(savedTerms));
+assert.equal(racedExtraLoaded.version, null);
+const racedExtraSave = glossarySaveDecision(racedExtraLoaded, "room-a", "s");
+assert.equal(racedExtraSave.post, false, "unsaved keystrokes must not be posted over the saved glossary");
+assert.equal(racedExtraSave.reason, "no-version");
+assert.equal(racedExtraSave.body, undefined);
 
 // The lock hint names the room on screen and points at a person, not a bare placeholder.
 let named = glossaryRoomState();

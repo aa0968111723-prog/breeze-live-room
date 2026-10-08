@@ -105,7 +105,12 @@ function glossaryEditPlace(room) {
 }
 
 function glossaryPrefillNote(count) {
-  return "伺服器上有 " + count + " 條術語。這個文字框是載入前就有的內容，沒有採用伺服器版本。直接儲存會取代它們，所以沒有寫入。請先清空文字框再重新整理，才會看到伺服器上的詞表。";
+  return "這個房間已經存了 " + count + " 條術語，但文字框裡是開頁前留下的內容，跟已存的不一樣。為了不蓋掉那 " + count + " 條，現在不能儲存。要看已存的詞表：先把文字框裡想留的詞複製起來，清空文字框，再重新整理頁面。";
+}
+
+function glossaryRefused(note) {
+  if (!note || note.startsWith("沒有儲存：")) return note || "";
+  return "沒有儲存：" + note;
 }
 
 export function glossaryLegacyBlock(terms, room) {
@@ -224,7 +229,7 @@ export function glossaryApplyLoaded(state, room, generation, terms, version) {
     }
     return {
       ...state,
-      note: "這個文字框有還沒儲存的修改，沒有用伺服器上的詞表覆蓋。",
+      note: "這個文字框有還沒儲存的修改，沒有用已經存好的詞蓋掉。",
     };
   }
   // First paint can already hold typed or browser-restored text. Pairing that
@@ -250,7 +255,7 @@ export function glossaryApplyLoaded(state, room, generation, terms, version) {
       locked: false,
       text: state.text,
       loadedText: serverText,
-      note: "這個文字框有還沒儲存的修改，沒有用伺服器上的詞表覆蓋。",
+      note: "這個文字框有還沒儲存的修改，沒有用已經存好的詞蓋掉。",
       readOnly: false,
       generation,
       pendingRoom: nextRoom,
@@ -277,8 +282,8 @@ export function glossaryApplyLoadFailure(state, room, generation) {
   const dirty = state.text !== state.loadedText;
   if (state.room === nextRoom || (state.room == null && dirty)) {
     const note = dirty
-      ? "讀不到伺服器上的術語表。文字框裡還沒儲存的修改還在。"
-      : "讀不到伺服器上的術語表，畫面上仍是上次載入的內容。";
+      ? "讀不到這個房間已經存的術語。文字框裡還沒儲存的修改還在。"
+      : "讀不到這個房間已經存的術語，畫面上仍是上次看到的內容。";
     return { ...state, note };
   }
   return {
@@ -287,7 +292,7 @@ export function glossaryApplyLoadFailure(state, room, generation) {
     locked: true,
     text: "",
     loadedText: "",
-    note: "讀不到這個房間的術語表，沒有寫入。",
+    note: "讀不到這個房間已經存的術語，所以這裡先空白。",
     readOnly: true,
     generation,
     pendingRoom: nextRoom,
@@ -302,12 +307,23 @@ export function glossarySaveDecision(state, selectorRoom, sessionId) {
   return glossarySaveRequest(state.room, sessionId, state.text, state.version, false);
 }
 
-// Mark the box saved only when it still shows the room that was posted, and no
-// newer load has started. Otherwise a late 200 would clear the room on screen.
-export function glossarySaveSettlement(state, requestRoom, requestGeneration) {
+// A 200 applies only when the box still shows that room. Another room is left
+// untouched, including its text and version. The same room with a newer
+// generation means a reconnect loaded during the POST: remember the posted
+// text, drop the stale version, and reload. Otherwise the next save sends the
+// old if_version and the server answers 409.
+function glossaryRememberPosted(state, sentText) {
+  const loadedText = sentText == null ? state.text : String(sentText);
+  return { ...state, loadedText, version: null, prefillUnversioned: false };
+}
+
+export function glossarySaveSettlement(state, requestRoom, requestGeneration, sentText) {
   const room = glossaryRoomName(requestRoom);
-  if (!state || state.room !== room || state.generation !== requestGeneration) {
+  if (!state || state.room !== room) {
     return { settle: false, state };
+  }
+  if (state.generation !== requestGeneration) {
+    return { settle: true, state: glossaryRememberPosted(state, sentText), reloadRoom: room };
   }
   return { settle: true, state: glossaryMarkSaved(state), reloadRoom: room };
 }
@@ -317,10 +333,11 @@ export function glossaryRefusal(state, reason) {
     return (state && state.note) || ("這裡只能看、不能改。" + glossaryEditPlace(state && state.room));
   }
   if (reason === "room-mismatch") {
-    return (state && state.note) || "文字框裡的術語不是這個房間的，沒有寫入。";
+    if (state && state.note) return glossaryRefused(state.note);
+    return "沒有儲存：文字框裡的詞不是這個房間的。";
   }
   if (reason === "no-version" && state && state.prefillUnversioned && state.note) {
-    return state.note;
+    return glossaryRefused(state.note);
   }
-  return "讀不到目前的術語表版本，請重新整理頁面後再儲存。";
+  return "還沒讀到這個房間目前存的術語，請重新整理頁面後再儲存。";
 }

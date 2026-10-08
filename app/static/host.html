@@ -300,7 +300,8 @@ async function postGlossary(selectorRoom, sessionId, headers) {
     ? await fetch("/api/glossary", { method: "POST", headers, body: payload })
     : await hostFetch("/api/glossary", { method: "POST", headers: { "content-type": "application/json" }, body: payload });
   if (sent && sent.ok) {
-    const settled = glossarySaveSettlement(glossaryState, requestRoom, requestGeneration);
+    // sent text, not the box: keystrokes during the POST are still unsaved.
+    const settled = glossarySaveSettlement(glossaryState, requestRoom, requestGeneration, request.body.text);
     if (settled.settle) {
       glossaryState = settled.state;
       await loadGlossary(settled.reloadRoom);
