@@ -12,7 +12,9 @@ import pytest
 
 from tests.sim import (
     LOOP_LAG_MAX_MS,
+    LOOP_LAG_MIN_N,
     LOOP_LAG_OVER_MAX,
+    LOOP_LAG_P50_MS,
     SEGMENTS,
     TextAsr,
     _ScaledClock,
@@ -69,16 +71,18 @@ def test_100min_event_loop_real_lag(report, capsys):
 
     A daemon thread samples every 10 ms with call_soon_threadsafe, using the
     perf_counter saved before the scaled clock is installed. asyncio.sleep is
-    not the probe: the scaled clock jumps those timers. GITHUB_ACTIONS=true
-    (CI matrix) prints the line and does not fail. Local runs enforce
-    over-30ms <= 10 and max <= 100 ms so a 70 ms-per-segment stall is red.
+    not the probe: the scaled clock jumps those timers. Each run is judged on
+    its own numbers (no median, no rerun). CI and local share the same hard
+    gates; BREEZE_SIM_LAG_REPORT_ONLY is an explicit opt-in that workflows
+    do not set. p99 and GC/heap holds are printed, not gated.
     """
     line = format_loop_lag_line(report)
     with capsys.disabled():
         print(line, flush=True)
     if not loop_lag_gate_enforced():
         return
-    assert report.loop_lag_n > 0, line
+    assert report.loop_lag_n >= LOOP_LAG_MIN_N, line
+    assert report.loop_lag_p50_ms <= LOOP_LAG_P50_MS, line
     assert report.loop_lag_over_30ms <= LOOP_LAG_OVER_MAX, line
     assert report.loop_lag_max_ms <= LOOP_LAG_MAX_MS, line
 

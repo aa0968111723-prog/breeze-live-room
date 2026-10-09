@@ -123,16 +123,18 @@ LOOP_LAG_SAMPLE_S = 0.010
 LOOP_LAG_OVER_MS = 30.0
 LOOP_LAG_OVER_MAX = 10
 LOOP_LAG_MAX_MS = 100.0
+LOOP_LAG_P50_MS = 5.0
+LOOP_LAG_MIN_N = 100
 
 
 def loop_lag_gate_enforced() -> bool:
-    """Fail the 30 ms / 100 ms lag gates unless this is GitHub Actions.
+    """Fail the lag gates unless BREEZE_SIM_LAG_REPORT_ONLY is an explicit opt-in.
 
-    GITHUB_ACTIONS=true (the four CI matrix jobs) prints the per-run line and
-    does not fail: those runners have no measured lag baseline yet. Local and
-    any other process must fail, so a 70 ms-per-segment loop stall (R1b) is red.
+    CI and local runs use the same hard gates (p50, over-30ms, max, n). GitHub
+    Actions sets GITHUB_ACTIONS but not this variable, so CI cannot report-only.
     """
-    return os.environ.get("GITHUB_ACTIONS") != "true"
+    val = os.environ.get("BREEZE_SIM_LAG_REPORT_ONLY", "")
+    return val.strip().lower() not in {"1", "true", "yes", "on"}
 
 
 def _loadavg():
@@ -158,12 +160,16 @@ def format_loop_lag_line(report: "SimReport") -> str:
         load_s = "n/a"
     else:
         load_s = f"{_fmt_load(load[0])}->{_fmt_load(load[1])}"
-    gate = "enforce" if loop_lag_gate_enforced() else "report-only (GITHUB_ACTIONS)"
+    gate = "enforce" if loop_lag_gate_enforced() else "report-only (BREEZE_SIM_LAG_REPORT_ONLY)"
+    holds = (
+        f"holds={report.loop_lag_hold_n}/{report.loop_lag_hold_sum_ms:.1f}ms/"
+        f"max={report.loop_lag_hold_max_ms:.1f}ms"
+    )
     return (
         f"sim loop lag: n={report.loop_lag_n} p50={report.loop_lag_p50_ms:.3f}ms "
         f"p99={report.loop_lag_p99_ms:.3f}ms max={report.loop_lag_max_ms:.3f}ms "
         f"over{LOOP_LAG_OVER_MS:.0f}={report.loop_lag_over_30ms} load={load_s} "
-        f"gate={gate}"
+        f"{holds} gate={gate}"
     )
 
 
@@ -186,9 +192,12 @@ def _loop_sleeper(loop):
 class _LoopLagProbe:
     """Real event-loop lag via a thread and call_soon_threadsafe.
 
-    lag = real perf_counter at callback minus the value passed in. Only the
-    stable window (first upload through last upload) counts, and samples that
-    overlap a GC / heap hold are dropped.
+    lag is the larger of (1) callback time minus the thread's send time and
+    (2) the extra gap between adjacent loop-side ticks beyond the 10 ms sample
+    period. (2) is what a GIL / C-layer stall looks like: the probe thread
+    cannot take a send timestamp until the GIL is released, so (1) alone
+    under-counts. Only the stable window (first upload through last upload)
+    counts, and samples that overlap a GC / heap hold are dropped.
     """
 
     def __init__(self, real_perf, real_sleep) -> None:
@@ -203,6 +212,7 @@ class _LoopLagProbe:
         self._stable = False
         self._stable_t0: float | None = None
         self._stable_t1: float | None = None
+        self._last_exec_at: float | None = None
         self.load_t0 = None
         self.load_t1 = None
 
@@ -223,6 +233,7 @@ class _LoopLagProbe:
         self._stable_t0 = self._real_perf()
         self.load_t0 = _loadavg()
         self._stable = True
+        self._last_exec_at = None
 
     def leave_stable(self) -> None:
         self._stable_t1 = self._real_perf()
@@ -237,6 +248,8 @@ class _LoopLagProbe:
         self._hold_t0 = None
         if t0 is not None:
             self._holds.append((t0, self._real_perf()))
+        # A hold is not loop stall; the next tick must not inherit that gap.
+        self._last_exec_at = None
 
     def summary_ms(self) -> tuple[int, float, float, float, int]:
         ms = [lag * 1000.0 for lag in self._lags]
@@ -244,6 +257,12 @@ class _LoopLagProbe:
             return 0, 0.0, 0.0, 0.0, 0
         over = sum(1 for item in ms if item > LOOP_LAG_OVER_MS)
         return len(ms), percentile(ms, 0.50), percentile(ms, 0.99), max(ms), over
+
+    def hold_summary_ms(self) -> tuple[int, float, float]:
+        durs = [(end - start) * 1000.0 for start, end in self._holds]
+        if not durs:
+            return 0, 0.0, 0.0
+        return len(durs), sum(durs), max(durs)
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -260,6 +279,8 @@ class _LoopLagProbe:
         if self._stop.is_set():
             return
         exec_at = self._real_perf()
+        last_exec = self._last_exec_at
+        self._last_exec_at = exec_at
         t0 = self._stable_t0
         if t0 is None:
             return
@@ -271,7 +292,15 @@ class _LoopLagProbe:
         for hold0, hold1 in self._holds:
             if sent < hold1 and exec_at > hold0:
                 return
-        self._lags.append(exec_at - sent)
+            if last_exec is not None and last_exec < hold1 and exec_at > hold0:
+                last_exec = None
+        thread_lag = exec_at - sent
+        heartbeat_lag = 0.0
+        if last_exec is not None:
+            heartbeat_lag = exec_at - last_exec - LOOP_LAG_SAMPLE_S
+            if heartbeat_lag < 0.0:
+                heartbeat_lag = 0.0
+        self._lags.append(max(thread_lag, heartbeat_lag))
 
 
 class _ScaledClock:
@@ -281,10 +310,18 @@ class _ScaledClock:
     clock and divided by SCALE (0.01 here, 0.02 on Windows). A few real
     milliseconds of scheduler delay is then several virtual seconds, so a loaded
     interpreter books a recorder pause even though the scripted ASR is 1.5s inside
-    a 6s slice. This clock moves only when a scripted sleep or an asyncio timer
-    asks it to. One unit is still one scaled second, so a 40s translate budget
-    remains ``40 * SCALE`` on the product's monotonic clock. CPU time does not
-    move it, and neither do the scenario thresholds.
+    a 6s slice.
+
+    Two virtual axes share idle jumps (scripted sleep and asyncio timers) but
+    split when a worker is in real work:
+
+    * ``now`` / ``perf_counter``: waiting and host pacing. Advances only on
+      those jumps, so scheduler delay is not multiplied into ``waiting_v_total``.
+    * ``timeout_now`` / ``monotonic``: ``asyncio.timeout`` (decode 40s). Also
+      advances 1:1 with time actually blocked in ``select`` while a worker is
+      busy, so a 45s stuck decode still hits the 40s budget in real time.
+
+    Callback time and the gap between select calls are not 1:1 on either axis.
     """
 
     def __init__(self) -> None:
@@ -296,6 +333,7 @@ class _ScaledClock:
         self._origin_m = self._real_monotonic()
         self._origin_p = self._real_perf()
         self.now = 0.0
+        self.timeout_now = 0.0
         self._waiters: list[tuple[float, threading.Event, threading.Event | None]] = []
         self._pending = 0
         self._parked = 0
@@ -314,7 +352,7 @@ class _ScaledClock:
 
     def monotonic(self) -> float:
         with self._lock:
-            return self._origin_m + self.now
+            return self._origin_m + self.timeout_now
 
     def perf_counter(self) -> float:
         with self._lock:
@@ -391,9 +429,18 @@ class _ScaledClock:
             return
         if delta:
             self.now += delta
+            self.timeout_now += delta
+
+    def _advance_timeout_locked(self, delta: float) -> None:
+        """1:1 real time onto the timeout axis only. Does not move waiting."""
+        if delta < 0:
+            self._went_backward = True
+            return
+        if delta:
+            self.timeout_now += delta
 
     def sync_real(self) -> None:
-        """Drop real time spent outside select (GC / heap holds) so it is not 1:1."""
+        """Holds used to dump elapsed into 1:1 waiting; timeout 1:1 is select-only."""
         self._last_real = self._real_perf()
 
     def install(self) -> None:
@@ -420,28 +467,25 @@ class _ScaledClock:
                 return clock._orig_select(timeout)
             ready = clock._orig_select(0)
             if ready:
-                clock._last_real = clock._real_perf()
                 return ready
             wake: list[threading.Event] = []
             # Never block forever. A worker can park after we drop the lock;
             # an infinite select would then leave both sides waiting.
             poll = 0.02
+            busy = 0
             with clock._lock:
                 wake.extend(clock._take_due_locked())
                 busy = clock._pending - clock._parked
-                now_real = clock._real_perf()
-                elapsed = now_real - clock._last_real
                 if busy > 0:
-                    # Real work is in flight. Advance 1:1 with wall time so
-                    # asyncio.timeout(decode_timeout_s) still fires; a frozen
-                    # clock would accept a 45s decode against a 40s budget.
-                    # Do not skip, and do not spin on the GIL or that worker
-                    # never reaches its sleep.
-                    if elapsed > 0:
-                        clock._advance_locked(elapsed)
-                    wake.extend(clock._take_due_locked())
-                    due_timer = timeout is not None and elapsed >= float(timeout)
-                    poll = 0.0 if due_timer else 0.001
+                    # Real work is in flight. Do not jump scripted time: that
+                    # multiplied scheduler delay into waiting_v_total. Block a
+                    # short real interval and 1:1 only the time spent inside
+                    # select onto the timeout axis so asyncio.timeout still
+                    # fires for a stuck decode.
+                    if timeout is not None and timeout > 0:
+                        poll = min(0.001, float(timeout))
+                    else:
+                        poll = 0.001
                 else:
                     delta = clock._next_delta_locked(timeout)
                     if delta is not None:
@@ -451,9 +495,16 @@ class _ScaledClock:
                         poll = 0.0
                     # delta is None: the loop is waiting on I/O, not a timer.
                     # Do not invent virtual time for that poll.
-                clock._last_real = clock._real_perf()
             for done in wake:
                 done.set()
+            if busy > 0:
+                blocked_t0 = clock._real_perf()
+                result = clock._orig_select(poll)
+                blocked = clock._real_perf() - blocked_t0
+                if blocked > 0:
+                    with clock._lock:
+                        clock._advance_timeout_locked(blocked)
+                return result
             return clock._orig_select(poll)
 
         def wrap_future(future, *, loop=None):
@@ -1104,6 +1155,9 @@ class SimReport:
     loop_lag_max_ms: float = 0.0
     loop_lag_over_30ms: int = 0
     loop_lag_load: tuple | None = None
+    loop_lag_hold_n: int = 0
+    loop_lag_hold_sum_ms: float = 0.0
+    loop_lag_hold_max_ms: float = 0.0
     clock_installed: bool = False
     clock_monotonic_patched: bool = False
     clock_perf_patched: bool = False
@@ -1404,9 +1458,11 @@ async def _run_100min_impl(*, trace: bool) -> SimReport:
             if probe is not None:
                 lag_n, lag_p50, lag_p99, lag_max, lag_over = probe.summary_ms()
                 lag_load = (probe.load_t0, probe.load_t1)
+                hold_n, hold_sum, hold_max = probe.hold_summary_ms()
             else:
                 lag_n, lag_p50, lag_p99, lag_max, lag_over = 0, 0.0, 0.0, 0.0, 0
                 lag_load = None
+                hold_n, hold_sum, hold_max = 0, 0.0, 0.0
             if pending_snaps:
                 await asyncio.gather(*pending_snaps)
             await _snapshot(app, client, token, SEGMENTS, snapshots)
@@ -1488,6 +1544,9 @@ async def _run_100min_impl(*, trace: bool) -> SimReport:
                 loop_lag_max_ms=lag_max,
                 loop_lag_over_30ms=lag_over,
                 loop_lag_load=lag_load,
+                loop_lag_hold_n=hold_n,
+                loop_lag_hold_sum_ms=hold_sum,
+                loop_lag_hold_max_ms=hold_max,
                 clock_installed=clock_installed,
                 clock_monotonic_patched=clock_monotonic_patched,
                 clock_perf_patched=clock_perf_patched,
@@ -1556,7 +1615,7 @@ def run_100min(*, trace: bool = False) -> SimReport:
     trace=True is the memory run: same scale and the same class, plus a heap
     snapshot. It is not the report latency tests read.
     """
-    key = (SEGMENTS, SCALE, "100min-v4", bool(trace))
+    key = (SEGMENTS, SCALE, "100min-v5", bool(trace))
     cached = _RUN_CACHE.get(key)
     if cached is not None:
         return cached
