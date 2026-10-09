@@ -123,7 +123,19 @@ LOOP_LAG_SAMPLE_S = 0.010
 LOOP_LAG_OVER_MS = 30.0
 LOOP_LAG_OVER_MAX = 10
 LOOP_LAG_MAX_MS = 100.0
-LOOP_LAG_P50_MS = 5.0
+# p50 is the Windows tick-gap baseline for this probe, not a stall budget.
+# Attempt 1 at e629b09 (push 37878495452, PR 37878498695) was clean: over30=0,
+# no stall spike. The only miss was p50 > 5:
+#   push win3.11 n=383 p50=5.815 p99=15.006 max=16.519 over30=0
+#   push win3.12 n=346 p50=5.717 p99=15.118 max=16.985 over30=0
+#   pr   win3.12 n=204 p50=5.750 p99=12.060 max=12.178 over30=0
+#   pr   win3.11 n=297 p50=5.731 p99=13.596 max=16.230 over30=0
+# 12 ms is about 2× the 5.815 ms cluster, and 15 ms was the upward cap, but a
+# 20 ms event-loop sleep on this probe measures p50 8.67–8.83 ms with
+# over30<=2 and max<=46. 12 or 15 would pass that stall (over30 and max do
+# not catch it). 8.0 is above every recorded clean Windows p50 and still
+# fails that sleep on p50 alone. over30, max, n, and waiting are unchanged.
+LOOP_LAG_P50_MS = 8.0
 LOOP_LAG_MIN_N = 100
 
 
