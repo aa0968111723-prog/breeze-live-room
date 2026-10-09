@@ -6,9 +6,29 @@ recording ended, converted with SCALE. It is not "virtual now minus ideal t1", w
 would accumulate asyncio delay across 1000 segments.
 """
 
+import time
+
 import pytest
 
-from tests.sim import SEGMENTS, latencies, percentile, run_100min, vlimit
+from tests.sim import (
+    LOOP_LAG_EVENT_MS,
+    LOOP_LAG_JITTER_MS,
+    LOOP_LAG_MIN_N,
+    SEGMENTS,
+    TextAsr,
+    _ScaledClock,
+    copy_decoder,
+    format_loop_lag_line,
+    latencies,
+    loop_lag_gate_enforced,
+    open_room,
+    percentile,
+    post_segment,
+    run_100min,
+    serving,
+    sim_settings,
+    vlimit,
+)
 
 
 @pytest.fixture(scope="module")
@@ -43,6 +63,73 @@ def test_100min_session_never_waits(report):
     assert report.final_metrics["rejected"] == report.storm_rejects
     assert report.missing == 0
     assert [int(row["seq"]) for row in report.export_json] == list(range(1, SEGMENTS + 1))
+
+
+def test_100min_event_loop_real_lag(report, capsys):
+    """Wall-clock event-loop lag during the paced class.
+
+    A daemon thread samples every 10 ms with call_soon_threadsafe, using the
+    perf_counter saved before the scaled clock is installed. asyncio.sleep is
+    not the probe: the scaled clock jumps those timers. Each run is judged on
+    its own numbers (no median, no rerun). CI and local share the same hard
+    gates (n >= 100, stall_event <= 250, stall_jitter <= 1500).
+    BREEZE_SIM_LAG_REPORT_ONLY is an explicit opt-in that workflows do not set.
+    Legacy stall_ms, p50, p99, max, and over30 are printed, not gated.
+    """
+    line = format_loop_lag_line(report)
+    with capsys.disabled():
+        print(line, flush=True)
+    if not loop_lag_gate_enforced():
+        return
+    assert report.loop_lag_n >= LOOP_LAG_MIN_N, line
+    assert report.loop_lag_event_ms <= LOOP_LAG_EVENT_MS, line
+    assert report.loop_lag_jitter_ms <= LOOP_LAG_JITTER_MS, line
+
+
+def test_100min_scaled_clock_self_check(report):
+    """The 100-minute class actually ran under a moving scaled clock."""
+    assert report.clock_installed
+    assert report.clock_monotonic_patched
+    assert report.clock_perf_patched
+    assert not report.clock_went_backward
+    assert report.clock_paced_s == pytest.approx(SEGMENTS * 6.0, abs=1.0)
+    assert report.clock_virtual_s >= SEGMENTS * 6.0 * 0.9
+    assert report.asr_virtual_median_s >= 1.0
+    assert report.asr_clock_sleeps >= SEGMENTS
+
+
+@pytest.mark.anyio
+async def test_scaled_clock_stuck_decode_times_out_in_real_time():
+    """A stuck decode worker must hit decode_timeout_s in real time.
+
+    Same shape as a 45 s stall against the product 40 s budget: virtual time
+    used to freeze while the worker was busy, so asyncio.timeout never fired
+    and the stall was accepted. 0.8 s against 0.5 s must return 408, not wait
+    for the worker to finish.
+    """
+    real_perf = time.perf_counter
+    real_sleep = time.sleep
+
+    def stuck_decoder(src, dest):
+        real_sleep(0.8)
+        return copy_decoder(src, dest)
+
+    async with serving(
+        settings=sim_settings(decode_timeout_s=0.5, translate=False),
+        asr=TextAsr(0),
+        decoder=stuck_decoder,
+    ) as (app, client, token):
+        clock = _ScaledClock()
+        clock.install()
+        try:
+            await open_room(client, token, "class")
+            started = real_perf()
+            resp = await post_segment(client, token, "class", "s", 1, "第1句".encode(), 0, 6000)
+            elapsed = real_perf() - started
+        finally:
+            clock.close()
+    assert resp.status_code == 408, (resp.status_code, resp.text, elapsed)
+    assert elapsed < 0.75, elapsed
 
 
 def report_scale():
@@ -671,3 +758,43 @@ async def test_forced_translation_timeout_makes_the_slow_window_fail():
     # have published at least one timeout, not only backlog skips.
     statuses = {row["translate_status"] for row in memory if 300 <= row["seq"] <= 330}
     assert "timeout" in statuses, statuses
+
+
+def test_split_slice_parks_still_count_as_waiting(capsys):
+    """ASR 7.0v as two 3.5v parks is still a backlog. Runs on every CI job.
+
+    Subtracting every park that fits in one 6v slice books waiting 0 and lets
+    the SRT end check pass. A short class must keep about one virtual second
+    of waiting per segment. The full-class floors (900v / 5000v / sparse SRT)
+    live in the opt-in mutation file; this one is the same bug in a few seconds.
+    """
+    import tests.sim as simmod
+
+    orig = simmod.TextAsr
+    old_n = simmod.SEGMENTS
+    cache_key = (40, simmod.SCALE, "100min-v7", False)
+
+    class _Split(orig):
+        def _parks_v(self, text: str) -> list[float]:
+            del text
+            return [3.5, 3.5]
+
+    simmod.TextAsr = _Split
+    simmod.SEGMENTS = 40
+    simmod._RUN_CACHE.pop(cache_key, None)
+    try:
+        report = simmod.run_100min()
+    finally:
+        simmod.TextAsr = orig
+        simmod.SEGMENTS = old_n
+        simmod._RUN_CACHE.pop(cache_key, None)
+    cues = simmod.parse_srt(report.srt)
+    last_end = cues[-1][2] / 1000.0
+    drift = abs(last_end - 40 * 6)
+    with capsys.disabled():
+        print(
+            f"split7x2 n=40 waiting={report.waiting_v_total:.3f} srt_drift={drift:.3f}",
+            flush=True,
+        )
+    assert report.waiting_v_total >= 30, report.waiting_v_total
+    assert drift > 2, (last_end, drift)
