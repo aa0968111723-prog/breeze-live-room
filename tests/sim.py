@@ -118,18 +118,16 @@ _ACTIVE_CLOCK: "_ScaledClock | None" = None
 # Wall-clock loop-lag probe. Not asyncio.sleep / call_later: the scaled clock
 # jumps those timers and the sample comes back in ~0 ms.
 #
-# Hard gates (r162 / perf recheck2): n >= 100 and stall_ms <= 350.
-# stall_ms is the stable-window sum of max(0, heartbeat_ms - 5). heartbeat is
-# exec_at - last_exec - P, where P is the sender's Event.wait(0.010) median
-# measured in start() before any work (clamped 10-18 ms). Subtracting the
-# actual send interval is wrong: a C-layer GIL stall stretches send and exec
-# together and cancels out.
-#
-# p50 / p99 / max / over30 / events are printed, not gated. p50 is not
-# monotonic in stall length (phase of 10 ms samples vs 5 ms GIL switches).
-# max is report-only because a known win-3.11 single 109 ms pause must not
-# fail the class (main tests/sim.py vlimit docstring); that is a chief-reviewer
-# ruling, not a loosening of a main-branch gate (main had no loop-lag gate).
+# Hard gates (r163): n >= 100, stall_event <= 250 ms, stall_jitter <= 1500 ms.
+# hb_ms = (exec_at - last_exec - P) * 1000. P is the sender's Event.wait(0.010)
+# median measured in start() before any work (clamped 10-18 ms). Subtracting
+# the actual send interval is wrong: a C-layer GIL stall stretches send and
+# exec together and cancels out.
+# stall_event sums (hb - 5) for hb > 30. stall_jitter sums (hb - 5) for
+# 5 < hb <= 30. Legacy stall_ms is those two sums added and is printed, not
+# gated, same as p50 / p99 / max / over30. Gate is 250, not the 300 fallback:
+# clean CI stall_event on fd41376 was 0, so the >125 ms fallback did not fire.
+# A single 109 ms pause stays under 250; three of them do not.
 LOOP_LAG_SAMPLE_S = 0.010
 LOOP_LAG_OVER_MS = 30.0
 LOOP_LAG_OVER_MAX = 10
@@ -139,14 +137,16 @@ LOOP_LAG_MIN_N = 100
 LOOP_LAG_CAL_N = 20
 LOOP_LAG_PERIOD_CAP_S = 0.018
 LOOP_LAG_DEADBAND_MS = 5.0
-LOOP_LAG_STALL_MS = 350.0
+LOOP_LAG_EVENT_MS = 250.0
+LOOP_LAG_JITTER_MS = 1500.0
 
 
 def loop_lag_gate_enforced() -> bool:
     """Fail the lag gates unless BREEZE_SIM_LAG_REPORT_ONLY is an explicit opt-in.
 
-    CI and local runs use the same hard gates (n, stall_ms). GitHub Actions
-    sets GITHUB_ACTIONS but not this variable, so CI cannot report-only.
+    CI and local runs use the same hard gates (n, stall_event, stall_jitter).
+    GitHub Actions sets GITHUB_ACTIONS but not this variable, so CI cannot
+    report-only.
     """
     val = os.environ.get("BREEZE_SIM_LAG_REPORT_ONLY", "")
     return val.strip().lower() not in {"1", "true", "yes", "on"}
@@ -169,7 +169,7 @@ def _loadavg():
 
 
 def format_loop_lag_line(report: "SimReport") -> str:
-    """One line of n / stall (hard) and p50 / p99 / max / over30 / events (report)."""
+    """One line: n / stall_event / stall_jitter are gated; stall / p50 / p99 / max / over30 are not."""
 
     def _fmt_load(item) -> str:
         if item is None:
@@ -187,7 +187,10 @@ def format_loop_lag_line(report: "SimReport") -> str:
         f"max={report.loop_lag_hold_max_ms:.1f}ms"
     )
     return (
-        f"sim loop lag: n={report.loop_lag_n} stall={report.loop_lag_stall_ms:.1f}ms "
+        f"sim loop lag: n={report.loop_lag_n} "
+        f"stall_event={report.loop_lag_event_ms:.1f}ms "
+        f"stall_jitter={report.loop_lag_jitter_ms:.1f}ms "
+        f"stall={report.loop_lag_stall_ms:.1f}ms "
         f"period={report.loop_lag_period_ms:.3f}ms p50={report.loop_lag_p50_ms:.3f}ms "
         f"p99={report.loop_lag_p99_ms:.3f}ms max={report.loop_lag_max_ms:.3f}ms "
         f"over{LOOP_LAG_OVER_MS:.0f}={report.loop_lag_over_30ms} "
@@ -222,10 +225,11 @@ class _LoopLagProbe:
     Only the stable window (first upload through last upload) counts, and
     samples that overlap a GC / heap hold are dropped.
 
-    The hard metric is stall_ms = sum(max(0, heartbeat_ms - 5)) over that
-    window. Queued ticks run back-to-back (gap ~0) so they are not double
-    counted. P is fixed before work starts, so a C-layer GIL that also stalls
-    the sender still accumulates.
+    Hard metrics, each a sum of (heartbeat_ms - 5) over that window:
+    stall_event for heartbeat_ms > 30, stall_jitter for 5 < heartbeat_ms <= 30.
+    Legacy stall_ms is their sum and is not a gate. Queued ticks run
+    back-to-back (gap ~0) so they are not double counted. P is fixed before
+    work starts, so a C-layer GIL that also stalls the sender still accumulates.
     """
 
     def __init__(self, real_perf, real_sleep) -> None:
@@ -237,6 +241,8 @@ class _LoopLagProbe:
         self._lags: list[float] = []
         self._period = LOOP_LAG_SAMPLE_S
         self._stall_ms = 0.0
+        self._stall_event_ms = 0.0
+        self._stall_jitter_ms = 0.0
         self._events = 0
         self._event_max_ms = 0.0
         self._holds: list[tuple[float, float]] = []
@@ -358,9 +364,15 @@ class _LoopLagProbe:
         heartbeat_lag = 0.0
         if last_exec is not None:
             heartbeat_lag = exec_at - last_exec - self._period
-            extra_ms = heartbeat_lag * 1000.0 - LOOP_LAG_DEADBAND_MS
+            hb_ms = heartbeat_lag * 1000.0
+            extra_ms = hb_ms - LOOP_LAG_DEADBAND_MS
             if extra_ms > 0.0:
-                self._stall_ms += extra_ms
+                # += so repeated stalls add. max() would hide a second event.
+                if hb_ms > LOOP_LAG_OVER_MS:
+                    self._stall_event_ms += extra_ms
+                else:
+                    self._stall_jitter_ms += extra_ms
+                self._stall_ms = self._stall_event_ms + self._stall_jitter_ms
             if heartbeat_lag < 0.0:
                 heartbeat_lag = 0.0
         self._lags.append(max(thread_lag, heartbeat_lag))
@@ -397,10 +409,7 @@ class _ScaledClock:
         self._origin_p = self._real_perf()
         self.now = 0.0
         self.timeout_now = 0.0
-        # (deadline, done, cancel, original delay_s). delay_s lets _wait_slot
-        # tell scripted ASR that fits in a 6s slice from a true backlog park.
-        self._waiters: list[tuple[float, threading.Event, threading.Event | None, float]] = []
-        self._released_park_s: list[float] = []
+        self._waiters: list[tuple[float, threading.Event, threading.Event | None]] = []
         self._pending = 0
         self._parked = 0
         self.active = False
@@ -424,6 +433,11 @@ class _ScaledClock:
         with self._lock:
             return self._origin_p + self.now
 
+    def axes(self) -> tuple[float, float]:
+        """Sim-clock ``now`` and timeout-clock ``timeout_now``, one snapshot."""
+        with self._lock:
+            return self.now, self.timeout_now
+
     def pending_inc(self) -> None:
         with self._lock:
             self._pending += 1
@@ -438,7 +452,7 @@ class _ScaledClock:
             return bool(cancel is not None and cancel.is_set())
         done = threading.Event()
         with self._lock:
-            self._waiters.append((self.now + float(delay_s), done, cancel, float(delay_s)))
+            self._waiters.append((self.now + float(delay_s), done, cancel))
             self._parked += 1
         # The loop may already be inside select. Wake it so it observes this
         # waiter. Waiting on the loop thread would deadlock: select never runs.
@@ -467,23 +481,16 @@ class _ScaledClock:
 
     def _take_due_locked(self) -> list[threading.Event]:
         due: list[threading.Event] = []
-        keep: list[tuple[float, threading.Event, threading.Event | None, float]] = []
-        for deadline, done, cancel, delay_s in self._waiters:
+        keep: list[tuple[float, threading.Event, threading.Event | None]] = []
+        for deadline, done, cancel in self._waiters:
             if deadline <= self.now + 1e-9 or (cancel is not None and cancel.is_set()):
                 due.append(done)
-                self._released_park_s.append(delay_s)
             else:
-                keep.append((deadline, done, cancel, delay_s))
+                keep.append((deadline, done, cancel))
         if due:
             self._waiters = keep
             self._parked = max(0, self._parked - len(due))
         return due
-
-    def take_released_parks(self) -> list[float]:
-        with self._lock:
-            out = list(self._released_park_s)
-            self._released_park_s.clear()
-            return out
 
     def _next_delta_locked(self, timeout: float | None) -> float | None:
         waiter_delta = None
@@ -554,20 +561,9 @@ class _ScaledClock:
                     # multiplied scheduler delay into waiting_v_total. Block a
                     # short real interval and 1:1 only the time spent inside
                     # select onto the timeout axis so asyncio.timeout still
-                    # fires for a stuck decode.
-                    # Only slice-fitting parks (ASR 1.5v) may catch up: a 40v
-                    # translate park in the slow window must not move `now`
-                    # while wait_slot is blocked, or waiting_v_total explodes.
-                    slice_s = 6.0 * SCALE
-                    short = [item for item in clock._waiters if item[3] <= slice_s + 1e-12]
-                    if short:
-                        nxt = min(item[0] for item in short)
-                        waiter_delta = max(0.0, nxt - clock.now)
-                        if timeout is not None and timeout > 0:
-                            waiter_delta = min(waiter_delta, float(timeout))
-                        if waiter_delta:
-                            clock._advance_locked(waiter_delta)
-                            wake.extend(clock._take_due_locked())
+                    # fires for a stuck decode. Do not jump `now` here: a
+                    # slice-fitting park released into a slot wait is not
+                    # recorder backlog, and jumping `now` to it overshoots.
                     if timeout is not None and timeout > 0:
                         poll = min(0.001, float(timeout))
                     else:
@@ -648,7 +644,7 @@ class _ScaledClock:
         time.monotonic = self._real_monotonic
         time.perf_counter = self._real_perf
         with self._lock:
-            stranded = [done for _deadline, done, _cancel, _delay in self._waiters]
+            stranded = [done for _deadline, done, _cancel in self._waiters]
             self._waiters.clear()
             self._parked = 0
         for done in stranded:
@@ -705,6 +701,16 @@ class TextAsr:
         self.clock_sleeps = 0
         self.seen: list[str] = []
 
+    def _parks_v(self, text: str) -> list[float]:
+        """Virtual-second parks for one segment. One park is the default.
+
+        A subclass may split a backlog into several parks. Each park is its
+        own scaled sleep, so a long ASR is not one wait and is not hidden by
+        subtracting short parks from the recorder.
+        """
+        del text
+        return [max(0.0, float(self.delay_v))]
+
     def transcribe(self, wav: Path, prompt: str = "") -> AsrResult:
         del prompt
         # The admit slot is still held here. Callers use this to observe pending.
@@ -718,14 +724,17 @@ class TextAsr:
             gate["started"].set()
             if not gate["release"].wait(5):
                 raise TimeoutError("ASR gate was not released")
-        delay_s = max(0.0, self.delay_v) * SCALE
         started = time.monotonic()
         clock = _ACTIVE_CLOCK
         if clock is not None and clock.active:
-            clock.sleep(delay_s)
+            for delay_v in self._parks_v(text):
+                clock.sleep(max(0.0, float(delay_v)) * SCALE)
             self.clock_sleeps += 1
         else:
-            time.sleep(delay_s)
+            for delay_v in self._parks_v(text):
+                delay_s = max(0.0, float(delay_v)) * SCALE
+                if delay_s > 0:
+                    time.sleep(delay_s)
         finished = time.monotonic()
         self.done_at.append(finished)
         self.spent_v.append((finished - started) / SCALE)
@@ -1020,6 +1029,11 @@ class VirtualHost:
         self._all: list[asyncio.Task] = []
         self._active_posts = 0
         self.max_posts = 0
+        # Real seconds the last slice timer ran on the timeout axis but not on
+        # `now`. The next slot wait may subtract this once. A real backlog
+        # (ASR longer than the slice) does not move the timer ahead of `now`,
+        # so the credit stays 0 and waiting is unchanged.
+        self._pace_skew_s = 0.0
 
     def _active_tasks(self) -> set[asyncio.Task]:
         self._tasks = {task for task in self._tasks if not task.done()}
@@ -1087,9 +1101,6 @@ class VirtualHost:
                 return
             if not active:
                 return
-            clock = _ACTIVE_CLOCK
-            if clock is not None:
-                clock.take_released_parks()
             start_ms = self.clock_ms
             # perf_counter, not monotonic: Windows 3.11 monotonic steps by ~15.6 ms.
             real = time.perf_counter()
@@ -1098,16 +1109,14 @@ class VirtualHost:
             # An immediate return (a free slot) never reaches this wait.
             # Round-to-zero is the scheduler, not a pause the clock can see.
             #
-            # Subtract scaled-clock parks that fit in one 6s slice. TextAsr
-            # 1.5v always fits; a loop stall can defer that park until this
-            # wait, which used to book waiting 1.5–3.0 v (exactly ASR delay_v)
-            # and fail waiting_v_total < 1. Parks longer than a slice
-            # (ASR 7.5v / 9v) are a real backlog and still count.
+            # Credit only the slice timer's pace skew (timeout axis ahead of
+            # `now`), and only once: the recorder's asyncio.sleep runs on the
+            # timeout axis, so a loop stall can book the scripted ASR park as
+            # waiting. A real backlog has no skew and is not reduced.
             spent_s = time.perf_counter() - real
-            parks = clock.take_released_parks() if clock is not None else []
-            slice_s = self.period_v * self.scale
-            short_s = sum(delay for delay in parks if delay <= slice_s + 1e-12)
-            spent_ms = int(round(max(0.0, spent_s - short_s) / self.scale * 1000))
+            credit = min(spent_s, self._pace_skew_s)
+            self._pace_skew_s -= credit
+            spent_ms = int(round((spent_s - credit) / self.scale * 1000))
             if spent_ms > 0:
                 self.clock_ms += spent_ms
                 self.waiting.append((start_ms / 1000, self.clock_ms / 1000))
@@ -1132,7 +1141,15 @@ class VirtualHost:
                     await hooked
             await self._wait_slot()
             if pace:
+                clock = _ACTIVE_CLOCK
+                if clock is not None:
+                    now0, timeout0 = clock.axes()
+                else:
+                    now0, timeout0 = 0.0, 0.0
                 await asyncio.sleep(self.period_v * self.scale)
+                if clock is not None:
+                    now1, timeout1 = clock.axes()
+                    self._pace_skew_s = max(0.0, (timeout1 - timeout0) - (now1 - now0))
                 t0 = self.clock_ms
                 self.clock_ms += int(round(self.period_v * 1000))
                 t1 = self.clock_ms
@@ -1254,6 +1271,8 @@ class SimReport:
     loop_lag_max_ms: float = 0.0
     loop_lag_over_30ms: int = 0
     loop_lag_stall_ms: float = 0.0
+    loop_lag_event_ms: float = 0.0
+    loop_lag_jitter_ms: float = 0.0
     loop_lag_period_ms: float = 0.0
     loop_lag_events: int = 0
     loop_lag_event_max_ms: float = 0.0
@@ -1561,6 +1580,8 @@ async def _run_100min_impl(*, trace: bool) -> SimReport:
             if probe is not None:
                 lag_n, lag_p50, lag_p99, lag_max, lag_over = probe.summary_ms()
                 lag_stall = float(probe._stall_ms)
+                lag_event = float(probe._stall_event_ms)
+                lag_jitter = float(probe._stall_jitter_ms)
                 lag_period = float(probe._period) * 1000.0
                 lag_events = int(probe._events)
                 lag_event_max = float(probe._event_max_ms)
@@ -1569,6 +1590,8 @@ async def _run_100min_impl(*, trace: bool) -> SimReport:
             else:
                 lag_n, lag_p50, lag_p99, lag_max, lag_over = 0, 0.0, 0.0, 0.0, 0
                 lag_stall = 0.0
+                lag_event = 0.0
+                lag_jitter = 0.0
                 lag_period = 0.0
                 lag_events = 0
                 lag_event_max = 0.0
@@ -1655,6 +1678,8 @@ async def _run_100min_impl(*, trace: bool) -> SimReport:
                 loop_lag_max_ms=lag_max,
                 loop_lag_over_30ms=lag_over,
                 loop_lag_stall_ms=lag_stall,
+                loop_lag_event_ms=lag_event,
+                loop_lag_jitter_ms=lag_jitter,
                 loop_lag_period_ms=lag_period,
                 loop_lag_events=lag_events,
                 loop_lag_event_max_ms=lag_event_max,
@@ -1730,7 +1755,7 @@ def run_100min(*, trace: bool = False) -> SimReport:
     trace=True is the memory run: same scale and the same class, plus a heap
     snapshot. It is not the report latency tests read.
     """
-    key = (SEGMENTS, SCALE, "100min-v6", bool(trace))
+    key = (SEGMENTS, SCALE, "100min-v7", bool(trace))
     cached = _RUN_CACHE.get(key)
     if cached is not None:
         return cached

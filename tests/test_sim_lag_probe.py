@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 
 from tests.sim import (
     LOOP_LAG_DEADBAND_MS,
+    LOOP_LAG_EVENT_MS,
+    LOOP_LAG_JITTER_MS,
+    LOOP_LAG_OVER_MS,
     LOOP_LAG_SAMPLE_S,
-    LOOP_LAG_STALL_MS,
     _LoopLagProbe,
 )
 
@@ -128,7 +131,10 @@ def test_period_calibration_clamps_to_10_18ms():
     period = min(max(median, LOOP_LAG_SAMPLE_S), 0.018)
     assert abs(period - 0.0156) < 1e-9
     probe._period = period
-    assert LOOP_LAG_STALL_MS == 350.0
+    assert LOOP_LAG_EVENT_MS == 250.0
+    assert LOOP_LAG_JITTER_MS == 1500.0
+    assert LOOP_LAG_OVER_MS == 30.0
+    assert LOOP_LAG_DEADBAND_MS == 5.0
 
 
 def test_start_calibrates_period_before_the_sender_thread():
@@ -147,3 +153,74 @@ def test_start_calibrates_period_before_the_sender_thread():
             assert ms < 12.0, ms
     finally:
         probe.stop()
+
+
+def test_calibration_rejects_a_fixed_10ms_period():
+    """start() measures Event.wait. Pinning P at the 10 ms sample fails this.
+
+    A fake wait of 15.625 ms must come back as P near that tick, not the
+    uncalibrated LOOP_LAG_SAMPLE_S. Cheap: twenty waits, no class.
+    """
+    orig = threading.Condition.wait
+
+    def wait(self, timeout=None):
+        if timeout is not None and timeout > 0:
+            timeout = 0.015625
+        return orig(self, timeout)
+
+    threading.Condition.wait = wait
+    probe = _LoopLagProbe(time.perf_counter, time.sleep)
+
+    class _Loop:
+        def call_soon_threadsafe(self, *a, **k):
+            return None
+
+    try:
+        probe.start(_Loop())
+        ms = probe._period * 1000.0
+        # Fixed P=10 ms lands under 12. A measured 15.625 ms tick does not.
+        assert ms >= 14.0, ms
+        assert ms <= 18.0, ms
+    finally:
+        probe.stop()
+        threading.Condition.wait = orig
+
+
+def test_stall_sums_jitter_and_events_not_max():
+    """40 heartbeats of 15 ms are jitter. Repeated, the sum crosses the jitter gate.
+
+    N heartbeats of 40 ms are events and must add. Replacing += with max keeps
+    a single sample, which stays under both gates, so this test goes red.
+    """
+    one_jitter = 15.0 - LOOP_LAG_DEADBAND_MS
+    probe = _probe(WIN_P)
+    exec_at = 1.0
+    _feed(probe, exec_at, exec_at)
+    batches = 0
+    while probe._stall_jitter_ms <= LOOP_LAG_JITTER_MS:
+        for _ in range(40):
+            exec_at += WIN_P + 0.015
+            _feed(probe, exec_at - 0.0002, exec_at)
+        batches += 1
+        assert batches <= 10, probe._stall_jitter_ms
+    assert batches >= 4, batches
+    assert abs(probe._stall_jitter_ms - batches * 40 * one_jitter) < 1.0
+    assert probe._stall_event_ms == 0.0
+    assert probe._stall_ms == probe._stall_jitter_ms
+    # One batch of 40 is under the gate; only the sum of batches crosses it.
+    assert 40 * one_jitter <= LOOP_LAG_JITTER_MS
+
+    probe_e = _probe(WIN_P)
+    exec_at = 1.0
+    _feed(probe_e, exec_at, exec_at)
+    n_events = 8
+    for _ in range(n_events):
+        exec_at += WIN_P + 0.040
+        _feed(probe_e, exec_at - 0.0002, exec_at)
+    one_event = 40.0 - LOOP_LAG_DEADBAND_MS
+    expect = n_events * one_event
+    assert abs(probe_e._stall_event_ms - expect) < 1.0, probe_e._stall_event_ms
+    assert probe_e._stall_event_ms > LOOP_LAG_EVENT_MS
+    assert probe_e._stall_jitter_ms == 0.0
+    assert one_event <= LOOP_LAG_EVENT_MS
+    assert probe_e._stall_ms == probe_e._stall_event_ms
